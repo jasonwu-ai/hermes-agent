@@ -85,6 +85,27 @@ class TestApplyProfileOverrideHermesHomeGuard:
             f"Expected HERMES_HOME to end with 'coder', got: {result!r}"
         )
 
+    def test_explicit_bare_profile_flag_resolves_unique_numeric_prefix(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_root = tmp_path / ".hermes"
+        profile_dir = hermes_root / "profiles" / "02-builder"
+        profile_dir.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_root))
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["hermes", "-p", "builder", "gateway", "run"],
+        )
+
+        from hermes_cli.main import _apply_profile_override
+
+        _apply_profile_override()
+
+        assert os.environ.get("HERMES_HOME") == str(profile_dir)
+        assert sys.argv == ["hermes", "gateway", "run"]
+
 
     def test_sudo_explicit_profile_resolves_invoking_users_profile(self, tmp_path, monkeypatch):
         """sudo elias ... should resolve `-p elias` under SUDO_USER, not root."""

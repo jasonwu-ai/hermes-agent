@@ -10463,7 +10463,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     if not rows:
         return False
     try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+        # Local import avoids the profiles/kanban import cycle.
+        from hermes_cli.profiles import runtime_profile_exists as profile_exists
     except Exception:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
@@ -10489,7 +10490,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     if not rows:
         return False
     try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+        # Local import avoids the profiles/kanban import cycle.
+        from hermes_cli.profiles import runtime_profile_exists as profile_exists
     except Exception:
         return True
     for row in rows:
@@ -10966,7 +10968,7 @@ def _dispatch_once_locked(
         if not review_rows:
             return False
         try:
-            from hermes_cli.profiles import profile_exists as _rpe
+            from hermes_cli.profiles import runtime_profile_exists as _rpe
         except Exception:
             # Profiles module unavailable (test stubs, exotic envs) —
             # assume spawnable, matching the review loop's own fallback.
@@ -11006,7 +11008,7 @@ def _dispatch_once_locked(
     _default_assignee_resolved = False
     if _default_assignee:
         try:
-            from hermes_cli.profiles import profile_exists as _pe
+            from hermes_cli.profiles import runtime_profile_exists as _pe
             _default_assignee_resolved = bool(_pe(_default_assignee))
         except Exception:
             # Profiles module not importable (test stubs, exotic envs).
@@ -11073,7 +11075,8 @@ def _dispatch_once_locked(
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
         try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+            # Local import avoids the profiles/kanban import cycle.
+            from hermes_cli.profiles import runtime_profile_exists as profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row_assignee):
@@ -11281,7 +11284,7 @@ def _dispatch_once_locked(
             result.skipped_unassigned.append(row["id"])
             continue
         try:
-            from hermes_cli.profiles import profile_exists
+            from hermes_cli.profiles import runtime_profile_exists as profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
@@ -11682,11 +11685,19 @@ def _admit_worker_role_contract(
     """
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
-    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from hermes_cli.profiles import (
+        normalize_profile_name,
+        resolve_profile_env,
+        resolve_profile_reference,
+    )
 
     profile_arg = normalize_profile_name(task.assignee)
     try:
         profile_home = resolve_profile_env(profile_arg)
+        resolved_profile = resolve_profile_reference(
+            profile_arg,
+            profiles_root=Path(profile_home).parent,
+        )
     except FileNotFoundError as exc:
         if task.require_role_contract:
             raise _WorkerRoleContractAdmissionError(
@@ -11694,6 +11705,10 @@ def _admit_worker_role_contract(
             ) from exc
         setattr(task, "_role_contract_admission", None)
         return None
+    except ValueError as exc:
+        raise _WorkerRoleContractAdmissionError(
+            f"profile resolution rejected for {profile_arg!r}: {exc}"
+        ) from exc
 
     configured = _resolve_worker_cli_toolsets(profile_home) or []
     # Resolving toolsets may discover/reload plugins. Import the contract module
@@ -11703,7 +11718,7 @@ def _admit_worker_role_contract(
     try:
         admission = admit_role_contract(
             profile_home,
-            profile_arg,
+            resolved_profile,
             configured,
             task_id=task.id,
             run_id=task.current_run_id,
@@ -11819,9 +11834,14 @@ def _default_spawn(
     # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
-    from hermes_cli.profiles import resolve_profile_env
+    from hermes_cli.profiles import resolve_profile_env, resolve_profile_reference
+    resolved_profile_arg = profile_arg
     try:
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        resolved_profile_arg = resolve_profile_reference(
+            profile_arg,
+            profiles_root=Path(env["HERMES_HOME"]).parent,
+        )
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
@@ -11897,7 +11917,7 @@ def _default_spawn(
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
-    env["HERMES_PROFILE"] = profile_arg
+    env["HERMES_PROFILE"] = resolved_profile_arg
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -11949,7 +11969,7 @@ def _default_spawn(
 
         admission = admit_role_contract(
             env.get("HERMES_HOME") or "",
-            profile_arg,
+            resolved_profile_arg,
             worker_toolsets or [],
             task_id=task.id,
             run_id=task.current_run_id,
