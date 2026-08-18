@@ -20,9 +20,13 @@ import yaml
 
 from hermes_cli import profiles
 from hermes_cli.profiles import (
+    AmbiguousProfileError,
     normalize_profile_name,
     validate_profile_name,
     get_profile_dir,
+    profile_exists,
+    resolve_profile_reference,
+    runtime_profile_exists,
     create_profile,
     delete_profile,
     list_profiles,
@@ -105,6 +109,56 @@ class TestGetProfileDir:
         tmp_path = profile_env
         result = get_profile_dir("default")
         assert result == tmp_path / ".hermes"
+
+    def test_management_path_stays_exact_while_runtime_reference_resolves(self, profile_env):
+        profiles_root = profile_env / ".hermes" / "profiles"
+        (profiles_root / "02-builder").mkdir(parents=True)
+
+        assert get_profile_dir("builder") == profiles_root / "builder"
+        assert profile_exists("builder") is False
+        assert runtime_profile_exists("builder") is True
+        assert resolve_profile_reference("builder") == "02-builder"
+
+
+class TestResolveProfileReference:
+    def test_exact_name_wins_over_numeric_suffix_match(self, profile_env):
+        profiles_root = profile_env / ".hermes" / "profiles"
+        (profiles_root / "builder").mkdir(parents=True)
+        (profiles_root / "02-builder").mkdir()
+
+        assert resolve_profile_reference("builder") == "builder"
+
+    def test_ambiguous_numeric_matches_fail_closed(self, profile_env):
+        profiles_root = profile_env / ".hermes" / "profiles"
+        (profiles_root / "02-builder").mkdir(parents=True)
+        (profiles_root / "07-builder").mkdir()
+
+        with pytest.raises(
+            AmbiguousProfileError,
+            match=r"02-builder, 07-builder",
+        ):
+            resolve_profile_reference("builder")
+        assert runtime_profile_exists("builder") is False
+
+    def test_explicit_numeric_id_never_receives_a_second_prefix(self, profile_env):
+        profiles_root = profile_env / ".hermes" / "profiles"
+        (profiles_root / "07-02-builder").mkdir(parents=True)
+
+        with pytest.raises(FileNotFoundError, match="02-builder"):
+            resolve_profile_reference("02-builder")
+
+    def test_only_two_digit_numeric_prefixes_are_runtime_aliases(self, profile_env):
+        profiles_root = profile_env / ".hermes" / "profiles"
+        (profiles_root / "team-builder").mkdir(parents=True)
+        (profiles_root / "2-builder").mkdir()
+
+        with pytest.raises(FileNotFoundError, match="builder"):
+            resolve_profile_reference("builder")
+
+    @pytest.mark.parametrize("name", ["../builder", "has space", "-builder"])
+    def test_invalid_runtime_reference_is_nonspawnable(self, profile_env, name):
+        assert profile_exists(name) is False
+        assert runtime_profile_exists(name) is False
 
 
 # ===================================================================
@@ -1118,6 +1172,25 @@ class TestResolveProfileEnvSpelling:
         monkeypatch.setenv("HERMES_HOME", str(root))
         with pytest.raises(FileNotFoundError):
             resolve_profile_env("nope")
+
+    def test_prefixed_reference_preserves_profile_shaped_root(self, monkeypatch, tmp_path):
+        root = tmp_path / "configured-root"
+        current = root / "profiles" / "00-cos"
+        expected = root / "profiles" / "02-builder"
+        current.mkdir(parents=True)
+        expected.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(current))
+
+        assert Path(resolve_profile_env("builder")) == expected
+
+    def test_ambiguous_prefixed_reference_raises(self, monkeypatch, tmp_path):
+        root = tmp_path / "configured-root"
+        (root / "profiles" / "02-builder").mkdir(parents=True)
+        (root / "profiles" / "07-builder").mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(root))
+
+        with pytest.raises(AmbiguousProfileError, match="02-builder, 07-builder"):
+            resolve_profile_env("builder")
 
     def test_unset_env_falls_back_to_default_root(self, monkeypatch):
         # No HERMES_HOME: the platform default root applies (existing contract).

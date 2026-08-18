@@ -189,6 +189,52 @@ def test_valid_dispatch_persists_receipt_before_spawn(board):
     assert admitted_events[0].run_id == receipt["run_id"]
 
 
+def test_bare_assignee_resolves_one_prefixed_profile_before_admission(board):
+    profile = _write_profile(board, "02-builder")
+    raw = _write_contract(profile, name="02-builder")
+    observed = {}
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="resolve prefixed builder",
+            assignee="builder",
+            require_role_contract=True,
+        )
+
+        def fake_spawn(task, workspace, **kwargs):
+            observed["admission"] = task._role_contract_admission
+            return 4243
+
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=1)
+        runs = kb.list_runs(conn, task_id)
+
+    assert result.spawned and result.spawned[0][0] == task_id
+    receipt = runs[-1].metadata["role_contract_admission"]
+    assert receipt["profile"] == "02-builder"
+    assert receipt["contract_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert observed["admission"].contract.path.parent == profile
+
+
+def test_ambiguous_bare_assignee_is_nonspawnable(board):
+    _write_profile(board, "02-builder")
+    _write_profile(board, "07-builder")
+    calls = []
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="ambiguous", assignee="builder")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *args, **kwargs: calls.append(True) or 999,
+            max_in_progress=1,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert calls == []
+    assert task is not None and task.status == "ready"
+    assert task_id in result.skipped_nonspawnable
+
+
 def test_contract_drift_after_admission_blocks_before_popen(board, monkeypatch):
     profile = _write_profile(board)
     _write_contract(profile)
@@ -273,6 +319,50 @@ def test_default_spawn_uses_admitted_toolsets_and_receipt_env(board, monkeypatch
     assert captured["env"]["HERMES_ROLE_CONTRACT_SCHEMA"] == "hermes-role-contract/v2"
     assert len(captured["env"]["HERMES_ROLE_CONTRACT_SHA256"]) == 64
     assert len(captured["env"]["HERMES_ROLE_CONTRACT_RECEIPT_ID"]) == 64
+
+
+def test_default_spawn_pins_prefixed_runtime_identity(board, monkeypatch, tmp_path):
+    profile = _write_profile(board, "02-builder")
+    _write_contract(profile, name="02-builder")
+    captured = {}
+
+    class FakeProc:
+        pid = 5151
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    workspace = tmp_path / "prefixed-work"
+    workspace.mkdir()
+    task = kb.Task(
+        id="t_prefixed_direct",
+        title="prefixed direct",
+        body=None,
+        assignee="builder",
+        status="running",
+        priority=0,
+        created_by="test",
+        created_at=1,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="dir",
+        workspace_path=str(workspace),
+        claim_lock="lock",
+        claim_expires=None,
+        tenant=None,
+        current_run_id=4,
+        require_role_contract=True,
+    )
+
+    assert kb._default_spawn(task, str(workspace)) == 5151
+    profile_flag = captured["cmd"].index("-p")
+    assert captured["cmd"][profile_flag + 1] == "builder"
+    assert Path(captured["env"]["HERMES_HOME"]) == profile
+    assert captured["env"]["HERMES_PROFILE"] == "02-builder"
 
 
 def test_optional_card_without_contract_preserves_existing_spawn(board):
