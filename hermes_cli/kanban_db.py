@@ -96,6 +96,10 @@ from toolsets import get_toolset_names
 _log = logging.getLogger(__name__)
 
 
+class _WorkerRoleContractAdmissionError(RuntimeError):
+    """Stable dispatcher-local wrapper across plugin/module reloads."""
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -1142,6 +1146,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # When true, dispatch must admit the assignee profile's exact
+    # ROLE_CONTRACT.md bytes before any worker process is spawned.
+    require_role_contract: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1235,6 +1242,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            require_role_contract=(
+                bool(row["require_role_contract"])
+                if "require_role_contract" in keys and row["require_role_contract"]
+                else False
             ),
         )
 
@@ -1435,7 +1447,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Per-card admission gate. When 1, a valid assignee-owned
+    -- ROLE_CONTRACT.md must be digested and recorded before worker spawn.
+    require_role_contract INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2697,6 +2712,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "require_role_contract" not in cols:
+        # Existing cards remain unchanged. Connected-pipeline materializers
+        # opt individual cards into fail-closed contract admission.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "require_role_contract",
+            "require_role_contract INTEGER NOT NULL DEFAULT 0",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3217,6 +3242,7 @@ def create_task(
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    require_role_contract: bool = False,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -3536,8 +3562,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        require_role_contract
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3563,6 +3590,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        1 if require_role_contract else 0,
                     ),
                 )
                 for pid in parents:
@@ -3591,6 +3619,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "require_role_contract": bool(require_role_contract) or None,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -11106,6 +11135,23 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         try:
+            _admit_worker_role_contract(conn, claimed)
+        except _WorkerRoleContractAdmissionError as exc:
+            blocked = _record_task_failure(
+                conn,
+                claimed.id,
+                f"role_contract_admission: {exc}",
+                outcome="spawn_failed",
+                failure_limit=failure_limit,
+                force_trip=True,
+                release_claim=True,
+                end_run=True,
+                event_payload_extra={"phase": "role_contract_admission"},
+            )
+            if blocked:
+                result.auto_blocked.append(claimed.id)
+            continue
+        try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
@@ -11186,6 +11232,20 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except _WorkerRoleContractAdmissionError as exc:
+            blocked = _record_task_failure(
+                conn,
+                claimed.id,
+                f"role_contract_pre_spawn: {exc}",
+                outcome="spawn_failed",
+                failure_limit=failure_limit,
+                force_trip=True,
+                release_claim=True,
+                end_run=True,
+                event_payload_extra={"phase": "role_contract_pre_spawn"},
+            )
+            if blocked:
+                result.auto_blocked.append(claimed.id)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -11256,6 +11316,23 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         try:
+            _admit_worker_role_contract(conn, claimed)
+        except _WorkerRoleContractAdmissionError as exc:
+            blocked = _record_task_failure(
+                conn,
+                claimed.id,
+                f"role_contract_admission: {exc}",
+                outcome="spawn_failed",
+                failure_limit=failure_limit,
+                force_trip=True,
+                release_claim=True,
+                end_run=True,
+                event_payload_extra={"phase": "role_contract_admission"},
+            )
+            if blocked:
+                result.auto_blocked.append(claimed.id)
+            continue
+        try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
@@ -11306,6 +11383,20 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except _WorkerRoleContractAdmissionError as exc:
+            blocked = _record_task_failure(
+                conn,
+                claimed.id,
+                f"role_contract_pre_spawn: {exc}",
+                outcome="spawn_failed",
+                failure_limit=failure_limit,
+                force_trip=True,
+                release_claim=True,
+                end_run=True,
+                event_payload_extra={"phase": "role_contract_pre_spawn"},
+            )
+            if blocked:
+                result.auto_blocked.append(claimed.id)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -11578,6 +11669,86 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _admit_worker_role_contract(
+    conn: sqlite3.Connection,
+    task: Task,
+) -> Optional[object]:
+    """Admit and durably record a task/run-bound role contract before spawn.
+
+    Contract presence opts an ordinary card into narrowing. The explicit
+    ``require_role_contract`` task flag additionally makes absence fail closed.
+    Private task state carries the admitted immutable values into
+    ``_default_spawn``; authority is never recovered from ambient process state.
+    """
+    if not task.assignee:
+        raise ValueError(f"task {task.id} has no assignee")
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    profile_arg = normalize_profile_name(task.assignee)
+    try:
+        profile_home = resolve_profile_env(profile_arg)
+    except FileNotFoundError as exc:
+        if task.require_role_contract:
+            raise _WorkerRoleContractAdmissionError(
+                f"required role contract profile does not exist: {profile_arg}"
+            ) from exc
+        setattr(task, "_role_contract_admission", None)
+        return None
+
+    configured = _resolve_worker_cli_toolsets(profile_home) or []
+    # Resolving toolsets may discover/reload plugins. Import the contract module
+    # only after that boundary so exception identity is the current module's.
+    from hermes_cli.role_contract import RoleContractError, admit_role_contract
+
+    try:
+        admission = admit_role_contract(
+            profile_home,
+            profile_arg,
+            configured,
+            task_id=task.id,
+            run_id=task.current_run_id,
+            required=bool(task.require_role_contract),
+        )
+    except RoleContractError as exc:
+        raise _WorkerRoleContractAdmissionError(str(exc)) from exc
+    setattr(task, "_role_contract_admission", admission)
+    if admission is None:
+        return None
+
+    receipt = admission.receipt()
+    run_id = task.current_run_id
+    with write_txn(conn):
+        if run_id is None or _current_run_id(conn, task.id) != int(run_id):
+            raise _WorkerRoleContractAdmissionError(
+                f"role contract admission lost active run binding for task {task.id}"
+            )
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(run_id), task.id),
+        ).fetchone()
+        metadata: dict = {}
+        if row and row["metadata"]:
+            try:
+                parsed = json.loads(row["metadata"])
+                if isinstance(parsed, dict):
+                    metadata = parsed
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+        metadata["role_contract_admission"] = receipt
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ? AND task_id = ?",
+            (json.dumps(metadata, ensure_ascii=False), int(run_id), task.id),
+        )
+        _append_event(
+            conn,
+            task.id,
+            "role_contract_admitted",
+            receipt,
+            run_id=int(run_id),
+        )
+    return admission
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -11769,6 +11940,44 @@ def _default_spawn(
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    admission_marker = object()
+    admission = getattr(task, "_role_contract_admission", admission_marker)
+    if admission is admission_marker:
+        # Direct _default_spawn callers (including integrations outside the
+        # built-in dispatch loop) still get the same fail-closed admission.
+        from hermes_cli.role_contract import admit_role_contract
+
+        admission = admit_role_contract(
+            env.get("HERMES_HOME") or "",
+            profile_arg,
+            worker_toolsets or [],
+            task_id=task.id,
+            run_id=task.current_run_id,
+            required=bool(task.require_role_contract),
+        )
+        setattr(task, "_role_contract_admission", admission)
+    if admission is not None:
+        from hermes_cli.role_contract import verify_admission_bytes
+
+        if admission.task_id != task.id or admission.run_id != task.current_run_id:
+            raise _WorkerRoleContractAdmissionError(
+                f"role contract admission binding mismatch for task {task.id}"
+            )
+        # Re-read exact bytes immediately before subprocess creation. The child
+        # receives only the already-admitted effective toolsets and digest, so a
+        # later file mutation cannot widen this run's authority.
+        try:
+            verify_admission_bytes(admission)
+        except Exception as exc:
+            # Keep the dispatcher-facing exception class stable even if plugin
+            # discovery reloaded the contract module between admission and
+            # spawn. No Popen has happened at this point.
+            raise _WorkerRoleContractAdmissionError(str(exc)) from exc
+        worker_toolsets = list(admission.effective_toolsets)
+        env["HERMES_ROLE_CONTRACT_SCHEMA"] = admission.contract.schema
+        env["HERMES_ROLE_CONTRACT_VERSION"] = admission.contract.version
+        env["HERMES_ROLE_CONTRACT_SHA256"] = admission.contract.sha256
+        env["HERMES_ROLE_CONTRACT_RECEIPT_ID"] = admission.receipt_id
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([

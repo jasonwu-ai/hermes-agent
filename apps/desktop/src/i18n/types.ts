@@ -738,6 +738,10 @@ export interface Translations {
       failedLoad: string
       empty: string
     }
+    search: {
+      placeholder: string
+      pill: string
+    }
     profileScope: {
       appliesTo: string
       editsProfile: (profile: string) => string
@@ -1239,6 +1243,7 @@ export interface Translations {
     gatewayStopped: string
     hermesActiveSessions: (version: string, count: number) => string
     restartGateway: string
+    openBrowser: string
     gatewayRestartFailed: string
     updateHermes: string
     reloadWindow: string
@@ -2450,6 +2455,7 @@ export interface Translations {
     web: {
       appFailedToBoot: string
       serverNotFound: string
+      remoteLoopback: string
       failedToLoad: string
       tryAgain: string
       restarting: string

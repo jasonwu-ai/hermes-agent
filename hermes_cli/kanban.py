@@ -81,6 +81,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "require_role_contract": t.require_role_contract,
     }
 
 
@@ -393,6 +394,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--require-role-contract", action="store_true",
+                          help="Fail closed unless the assignee profile has a "
+                               "valid ROLE_CONTRACT.md admitted before worker spawn.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1585,6 +1589,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            require_role_contract=bool(getattr(args, "require_role_contract", False)),
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)

@@ -268,6 +268,7 @@ export const zh: Translations = {
       'view.toggleReview': '切换审查面板',
       'view.toggleStatusbar': '切换状态栏',
       'view.showFiles': '显示文件浏览器',
+      'view.showBrowser': '打开浏览器',
       'view.showTerminal': '显示终端',
       'view.terminalSelection': '将终端选区发送到输入框',
       'view.terminalCopy': '复制终端选区',
@@ -1065,6 +1066,10 @@ export const zh: Translations = {
       failedLoad: 'API 密钥加载失败',
       empty: '此类别暂时没有配置项。'
     },
+    search: {
+      placeholder: '搜索所有设置...',
+      pill: '搜索'
+    },
     profileScope: {
       appliesTo: '应用于',
       editsProfile: profile => `此页面的更改将应用于“${profile}”配置文件。`
@@ -1602,6 +1607,7 @@ export const zh: Translations = {
     gatewayStopped: '消息网关已停止',
     hermesActiveSessions: (version, count) => `Hermes ${version} · 活跃会话 ${count}`,
     restartGateway: '重启网关',
+    openBrowser: '打开浏览器',
     gatewayRestartFailed: '网关重启失败。',
     updateHermes: '更新 Hermes',
     reloadWindow: '重新载入窗口',
@@ -3041,6 +3047,8 @@ export const zh: Translations = {
     web: {
       appFailedToBoot: '预览应用启动失败',
       serverNotFound: '未找到服务器',
+      remoteLoopback:
+        '该地址指向运行代理的那台机器，而不是本机。浏览器面板在本地加载页面，因此远程开发服务器需要端口转发或可访问的主机名。',
       failedToLoad: '预览加载失败',
       tryAgain: '重试',
       restarting: 'Hermes 正在重启...',
