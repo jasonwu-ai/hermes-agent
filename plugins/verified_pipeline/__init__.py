@@ -9,6 +9,12 @@ from .controller import (
     record_decision,
     register_intake,
 )
+from .review import (
+    ReviewCoordinationError,
+    init_review_schema,
+    project_review_outbox,
+    reconcile_review_once,
+)
 
 __all__ = [
     "PipelineControlError",
@@ -18,4 +24,8 @@ __all__ = [
     "project_run",
     "record_decision",
     "register_intake",
+    "ReviewCoordinationError",
+    "init_review_schema",
+    "project_review_outbox",
+    "reconcile_review_once",
 ]
