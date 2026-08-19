@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import importlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 
@@ -12,7 +14,14 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hermes_cli import kanban_db
-from plugins.verified_pipeline import controller, execution, materializer, review, validators
+from plugins.verified_pipeline import (
+    controller,
+    execution,
+    materializer,
+    release,
+    review,
+    validators,
+)
 
 
 FROZEN = {
@@ -42,6 +51,17 @@ AUTHORITY_VERIFIER = {
         )
     ).decode("ascii"),
 }
+AUTHORITY_POLICY = {
+    release.EXECUTION_POLICY_KEY: AUTHORITY_VERIFIER,
+    release.RELEASE_READY_DECISION: AUTHORITY_VERIFIER,
+    release.MERGE_DECISION: AUTHORITY_VERIFIER,
+    release.MERGE_RESULT_DECISION: AUTHORITY_VERIFIER,
+    release.DEPLOY_DECISION: AUTHORITY_VERIFIER,
+}
+os.environ[release.AUTHORITY_POLICY_PIN_ENV] = hashlib.sha256(
+    execution._canonical(AUTHORITY_POLICY).encode("utf-8")
+).hexdigest()
+release = importlib.reload(release)
 
 
 def _setup(tmp_path: Path, *, frozen=FROZEN, authority=None):
@@ -1561,3 +1581,472 @@ def test_execution_rejects_invalid_authority_board_and_dependency_drift(tmp_path
         )
     assert exc.value.code == "EXECUTION_DEPENDENCY_DRIFT"
     assert controller.get_intake(intake["run_id"], db_path=control_db)["run_id"] == intake["run_id"]
+
+
+def _completed_execution(tmp_path: Path):
+    control_db, kanban_path, intake, board, projected, _, intent = _authorized_execution(
+        tmp_path
+    )
+    execution.arm_execution(
+        intent["idempotency_key"],
+        board=board,
+        authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    _complete(kanban_path, projected["task_map"]["build"])
+    _complete(kanban_path, projected["task_map"]["verify"])
+    completion = execution.record_execution_completion(
+        intent["idempotency_key"],
+        board=board,
+        authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    completion.pop("replayed", None)
+    return control_db, kanban_path, intake, board, intent, completion
+
+
+def _persist_release_authority(
+    control_db: Path,
+    execution_key: str,
+    *,
+    decision: str,
+    schema: str,
+    fields: dict,
+    signing_key: Ed25519PrivateKey = AUTHORITY_PRIVATE_KEY,
+) -> dict:
+    release.init_release_schema(control_db, authority_verifiers=AUTHORITY_POLICY)
+    authority_key = f"release-authority:{execution_key}:{decision.lower()}"
+    envelope = {
+        "schema": schema,
+        "authority_key": authority_key,
+        "execution_key": execution_key,
+        "decision": decision,
+        **fields,
+        "issuer": AUTHORITY_VERIFIER["issuer"],
+        "key_id": AUTHORITY_VERIFIER["key_id"],
+    }
+    envelope["signature_b64"] = base64.b64encode(
+        signing_key.sign(execution._signed_bytes(envelope))
+    ).decode("ascii")
+    conn = controller.connect(control_db)
+    try:
+        with controller._write_txn(conn):
+            conn.execute(
+                "INSERT INTO release_authority_receipts "
+                "(authority_key, execution_key, decision, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    authority_key,
+                    execution_key,
+                    decision,
+                    execution._canonical(envelope),
+                    controller._now(),
+                ),
+            )
+    finally:
+        conn.close()
+    return envelope
+
+
+def _release_ready_authority(control_db: Path, execution_key: str, completion: dict):
+    return _persist_release_authority(
+        control_db,
+        execution_key,
+        decision=release.RELEASE_READY_DECISION,
+        schema=release.RELEASE_READY_AUTH_SCHEMA,
+        fields={
+            "completion_sha256": execution._digest(completion),
+            "repository": "jasonwu-ai/hermes-agent",
+            "base_ref": "main",
+            "head_sha": "1" * 40,
+            "evidence_sha256": "2" * 64,
+        },
+    )
+
+
+def test_release_boundary_records_ordered_exact_authority_without_side_effects(tmp_path):
+    control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
+    execution_key = intent["idempotency_key"]
+    ready_authority = _release_ready_authority(control_db, execution_key, completion)
+    ready = release.record_release_ready(
+        execution_key,
+        authority_key=ready_authority["authority_key"],
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    assert ready["status"] == release.RELEASE_READY_STATUS
+    assert "no merge" in ready["boundary"]
+    replay = release.record_release_ready(
+        execution_key,
+        authority_key=ready_authority["authority_key"],
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    assert replay == {**ready, "replayed": True}
+
+    merge_authority = _persist_release_authority(
+        control_db,
+        execution_key,
+        decision=release.MERGE_DECISION,
+        schema=release.MERGE_AUTH_SCHEMA,
+        fields={
+            "release_key": ready["release_key"],
+            "release_ready_sha256": execution._digest(
+                {key: value for key, value in ready.items() if key != "replayed"}
+            ),
+            "repository": ready["repository"],
+            "base_ref": ready["base_ref"],
+            "head_sha": ready["head_sha"],
+            "pull_request": 9,
+            "merge_method": "squash",
+        },
+    )
+    merge = release.record_merge_authorization(
+        execution_key,
+        authority_key=merge_authority["authority_key"],
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    assert merge["status"] == release.MERGE_AUTH_STATUS
+    assert "no executable authority" in merge["boundary"]
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.record_deployment_authorization(
+            execution_key,
+            authority_key="missing-deployment-authority",
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "MERGE_RESULT_REQUIRED"
+
+    merge_result_authority = _persist_release_authority(
+        control_db,
+        execution_key,
+        decision=release.MERGE_RESULT_DECISION,
+        schema=release.MERGE_RESULT_SCHEMA,
+        fields={
+            "merge_key": merge["merge_key"],
+            "merge_authorization_sha256": execution._digest(
+                {key: value for key, value in merge.items() if key != "replayed"}
+            ),
+            "repository": merge["repository"],
+            "base_ref": merge["base_ref"],
+            "head_sha": merge["head_sha"],
+            "pull_request": merge["pull_request"],
+            "merge_method": merge["merge_method"],
+            "merge_commit_sha": "3" * 40,
+            "result": "MERGED",
+        },
+    )
+    merge_result = release.record_merge_result(
+        execution_key,
+        authority_key=merge_result_authority["authority_key"],
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    assert merge_result["status"] == release.MERGE_RESULT_STATUS
+
+    deploy_authority = _persist_release_authority(
+        control_db,
+        execution_key,
+        decision=release.DEPLOY_DECISION,
+        schema=release.DEPLOY_AUTH_SCHEMA,
+        fields={
+            "merge_result_key": merge_result["merge_result_key"],
+            "merge_result_sha256": execution._digest(
+                {key: value for key, value in merge_result.items() if key != "replayed"}
+            ),
+            "merge_commit_sha": merge_result["merge_commit_sha"],
+            "artifact_sha256": "4" * 64,
+            "environment": "disposable-test",
+            "deployment_target": "isolated-sandbox",
+        },
+    )
+    deployment = release.record_deployment_authorization(
+        execution_key,
+        authority_key=deploy_authority["authority_key"],
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    assert deployment["status"] == release.DEPLOY_AUTH_STATUS
+    assert "no executable or live authority" in deployment["boundary"]
+    assert {row["status"] for row in _implementation_rows(kanban_path)} == {"done"}
+
+    conn = controller.connect(control_db)
+    try:
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "release_ready_receipts",
+                "merge_authorization_receipts",
+                "merge_result_receipts",
+                "deployment_authorization_receipts",
+            )
+        }
+        assert counts == {
+            "release_ready_receipts": 1,
+            "merge_authorization_receipts": 1,
+            "merge_result_receipts": 1,
+            "deployment_authorization_receipts": 1,
+        }
+        with pytest.raises(sqlite3.IntegrityError, match="deployment authorization receipt is immutable"):
+            conn.execute(
+                "UPDATE deployment_authorization_receipts SET payload_json = '{}' "
+                "WHERE deployment_key = ?",
+                (deployment["deployment_key"],),
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="release authority receipt is append-only"):
+            conn.execute(
+                "DELETE FROM release_authority_receipts WHERE authority_key = ?",
+                (ready_authority["authority_key"],),
+            )
+    finally:
+        conn.close()
+
+
+def test_release_boundary_rejects_missing_predecessor_and_scope_drift(tmp_path):
+    control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
+    execution_key = intent["idempotency_key"]
+    release.init_release_schema(control_db, authority_verifiers=AUTHORITY_POLICY)
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.record_merge_authorization(
+            execution_key,
+            authority_key="missing-merge-authority",
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "RELEASE_READY_REQUIRED"
+
+    ready_authority = _release_ready_authority(control_db, execution_key, completion)
+    ready = release.record_release_ready(
+        execution_key,
+        authority_key=ready_authority["authority_key"],
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    merge_authority = _persist_release_authority(
+        control_db,
+        execution_key,
+        decision=release.MERGE_DECISION,
+        schema=release.MERGE_AUTH_SCHEMA,
+        fields={
+            "release_key": ready["release_key"],
+            "release_ready_sha256": execution._digest(
+                {key: value for key, value in ready.items() if key != "replayed"}
+            ),
+            "repository": ready["repository"],
+            "base_ref": ready["base_ref"],
+            "head_sha": "9" * 40,
+            "pull_request": 9,
+            "merge_method": "squash",
+        },
+    )
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.record_merge_authorization(
+            execution_key,
+            authority_key=merge_authority["authority_key"],
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "MERGE_AUTHORITY_SCOPE_INVALID"
+
+
+def test_release_boundary_rejects_db_writer_self_signed_readiness(tmp_path):
+    control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
+    execution_key = intent["idempotency_key"]
+    attacker_key = Ed25519PrivateKey.generate()
+    authority = _persist_release_authority(
+        control_db,
+        execution_key,
+        decision=release.RELEASE_READY_DECISION,
+        schema=release.RELEASE_READY_AUTH_SCHEMA,
+        fields={
+            "completion_sha256": execution._digest(completion),
+            "repository": "jasonwu-ai/hermes-agent",
+            "base_ref": "main",
+            "head_sha": "1" * 40,
+            "evidence_sha256": "2" * 64,
+        },
+        signing_key=attacker_key,
+    )
+    attacker_verifier = {
+        **AUTHORITY_VERIFIER,
+        "public_key_b64": base64.b64encode(
+            attacker_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+        ).decode("ascii"),
+    }
+    attacker_policy = {
+        **AUTHORITY_POLICY,
+        release.RELEASE_READY_DECISION: attacker_verifier,
+    }
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.init_release_schema(control_db, authority_verifiers=attacker_policy)
+    assert exc.value.code == "RELEASE_AUTHORITY_POLICY_MISMATCH"
+    conn = controller.connect(control_db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="release identity is immutable"):
+            with controller._write_txn(conn):
+                conn.execute(
+                    "UPDATE release_identity SET authority_policy_json = ? "
+                    "WHERE singleton = 1",
+                    (execution._canonical(attacker_policy),),
+                )
+    finally:
+        conn.close()
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.record_release_ready(
+            execution_key,
+            authority_key=authority["authority_key"],
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "RELEASE_AUTHORITY_SIGNATURE_INVALID"
+    conn = controller.connect(control_db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM release_ready_receipts").fetchone()[0] == 0
+        forged_ready = {
+            "schema": release.RELEASE_CONTROLLER_ID,
+            "release_key": f"{execution_key}:release-ready",
+            "execution_key": execution_key,
+            "completion_sha256": authority["completion_sha256"],
+            "repository": authority["repository"],
+            "base_ref": authority["base_ref"],
+            "head_sha": authority["head_sha"],
+            "evidence_sha256": authority["evidence_sha256"],
+            "authorization_sha256": execution._digest(authority),
+            "status": release.RELEASE_READY_STATUS,
+            "boundary": "release-ready evidence only; no merge, deploy, or live authority",
+        }
+        with controller._write_txn(conn):
+            conn.execute(
+                "INSERT INTO release_ready_receipts "
+                "(release_key, execution_key, authority_key, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    forged_ready["release_key"],
+                    execution_key,
+                    authority["authority_key"],
+                    execution._canonical(forged_ready),
+                    controller._now(),
+                ),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.record_merge_authorization(
+            execution_key,
+            authority_key="missing-merge-authority",
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "RELEASE_AUTHORITY_SIGNATURE_INVALID"
+
+
+def test_release_boundary_rejects_first_writer_and_preinserted_policy(tmp_path):
+    control_db = tmp_path / "control.db"
+    attacker_key = Ed25519PrivateKey.generate()
+    attacker_verifier = {
+        **AUTHORITY_VERIFIER,
+        "public_key_b64": base64.b64encode(
+            attacker_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+        ).decode("ascii"),
+    }
+    attacker_policy = {stage: attacker_verifier for stage in AUTHORITY_POLICY}
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.init_release_schema(control_db, authority_verifiers=attacker_policy)
+    assert exc.value.code == "RELEASE_AUTHORITY_POLICY_PIN_MISMATCH"
+
+    conn = controller.connect(control_db)
+    try:
+        with controller._write_txn(conn):
+            conn.execute(
+                "INSERT INTO release_identity "
+                "(singleton, controller_id, authority_policy_json, created_at) "
+                "VALUES (1, ?, ?, ?)",
+                (
+                    release.RELEASE_CONTROLLER_ID,
+                    execution._canonical(attacker_policy),
+                    controller._now(),
+                ),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.init_release_schema(control_db)
+    assert exc.value.code == "RELEASE_AUTHORITY_POLICY_PIN_MISMATCH"
+
+
+def test_release_boundary_rejects_signed_wrong_completion_predecessor(tmp_path):
+    control_db, kanban_path, _, board, intent, _ = _completed_execution(tmp_path)
+    execution_key = intent["idempotency_key"]
+    authority = _persist_release_authority(
+        control_db,
+        execution_key,
+        decision=release.RELEASE_READY_DECISION,
+        schema=release.RELEASE_READY_AUTH_SCHEMA,
+        fields={
+            "completion_sha256": "f" * 64,
+            "repository": "jasonwu-ai/hermes-agent",
+            "base_ref": "main",
+            "head_sha": "1" * 40,
+            "evidence_sha256": "2" * 64,
+        },
+    )
+    forged_ready = {
+        "schema": release.RELEASE_CONTROLLER_ID,
+        "release_key": f"{execution_key}:release-ready",
+        "execution_key": execution_key,
+        "completion_sha256": authority["completion_sha256"],
+        "repository": authority["repository"],
+        "base_ref": authority["base_ref"],
+        "head_sha": authority["head_sha"],
+        "evidence_sha256": authority["evidence_sha256"],
+        "authorization_sha256": execution._digest(authority),
+        "status": release.RELEASE_READY_STATUS,
+        "boundary": "release-ready evidence only; no merge, deploy, or live authority",
+    }
+    conn = controller.connect(control_db)
+    try:
+        with controller._write_txn(conn):
+            conn.execute(
+                "INSERT INTO release_ready_receipts "
+                "(release_key, execution_key, authority_key, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    forged_ready["release_key"],
+                    execution_key,
+                    authority["authority_key"],
+                    execution._canonical(forged_ready),
+                    controller._now(),
+                ),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(release.ReleaseBoundaryError) as exc:
+        release.record_merge_authorization(
+            execution_key,
+            authority_key="missing-merge-authority",
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "RELEASE_READY_EVIDENCE_INVALID"
