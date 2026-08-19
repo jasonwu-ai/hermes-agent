@@ -454,7 +454,10 @@ class TestDelegationCleanup:
             reset_hermes_home_override,
             set_hermes_home_override,
         )
-        from tools.delegate_tool import _run_single_child
+        from tools.delegate_tool import (
+            _run_single_child,
+            _set_subagent_approval_cb,
+        )
 
         relay_runtime._reset_for_tests()
         profile_home = tmp_path / "profile-timeout"
@@ -472,6 +475,30 @@ class TestDelegationCleanup:
         parent._active_children.append(child)
         relay_host = MagicMock()
         monkeypatch.setattr(relay_runtime, "get_runtime", lambda **_kwargs: relay_host)
+
+        # This test exercises cleanup after the child has established an active
+        # relay turn. Synchronize that precondition before starting the short
+        # hard-timeout clock; otherwise thread startup latency under parallel CI
+        # can win the 0.1s race and test the separate before-first-call path.
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        class StartSynchronizedExecutor(DaemonThreadPoolExecutor):
+            def __init__(self, *args, **kwargs):
+                self._synchronize_child_start = (
+                    kwargs.get("initializer") is _set_subagent_approval_cb
+                )
+                super().__init__(*args, **kwargs)
+
+            def submit(self, fn, /, *args, **kwargs):
+                future = super().submit(fn, *args, **kwargs)
+                if self._synchronize_child_start:
+                    assert child_started.wait(timeout=5), "child worker did not start"
+                return future
+
+        monkeypatch.setattr(
+            "tools.daemon_pool.DaemonThreadPoolExecutor",
+            StartSynchronizedExecutor,
+        )
         monkeypatch.setattr("tools.delegate_tool._get_child_timeout", lambda: 0.1)
 
         def run_conversation(**kwargs):
