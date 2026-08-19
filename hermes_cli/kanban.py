@@ -82,6 +82,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
         "require_role_contract": t.require_role_contract,
+        "expected_role_contract_sha256": t.expected_role_contract_sha256,
     }
 
 

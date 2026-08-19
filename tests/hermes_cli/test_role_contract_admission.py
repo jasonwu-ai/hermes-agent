@@ -166,6 +166,7 @@ def test_valid_dispatch_persists_receipt_before_spawn(board):
             title="admit me",
             assignee="builder",
             require_role_contract=True,
+            expected_role_contract_sha256=hashlib.sha256(raw).hexdigest(),
         )
 
         def fake_spawn(task, workspace, **kwargs):
@@ -187,6 +188,56 @@ def test_valid_dispatch_persists_receipt_before_spawn(board):
     admitted_events = [event for event in events if event.kind == "role_contract_admitted"]
     assert len(admitted_events) == 1
     assert admitted_events[0].run_id == receipt["run_id"]
+
+
+def test_decision_time_contract_digest_mismatch_blocks_before_spawn(board):
+    profile = _write_profile(board)
+    _write_contract(profile)
+    calls = []
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="frozen contract",
+            assignee="builder",
+            require_role_contract=True,
+            expected_role_contract_sha256="0" * 64,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.expected_role_contract_sha256 == "0" * 64
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *args, **kwargs: calls.append(True) or 999,
+            max_in_progress=1,
+        )
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert calls == []
+    assert task is not None and task.status == "blocked"
+    assert task_id in result.auto_blocked
+    assert "decision-time receipt" in (runs[-1].error or "")
+
+
+def test_expected_contract_digest_requires_fail_closed_admission(board):
+    with kb.connect_closing() as conn:
+        with pytest.raises(ValueError, match="requires require_role_contract"):
+            kb.create_task(
+                conn,
+                title="invalid frozen contract",
+                assignee="builder",
+                expected_role_contract_sha256="0" * 64,
+            )
+        with pytest.raises(ValueError, match="64 lowercase hex"):
+            kb.create_task(
+                conn,
+                title="invalid digest",
+                assignee="builder",
+                require_role_contract=True,
+                expected_role_contract_sha256="not-a-digest",
+            )
 
 
 def test_bare_assignee_resolves_one_prefixed_profile_before_admission(board):
@@ -276,9 +327,46 @@ def test_contract_drift_after_admission_blocks_before_popen(board, monkeypatch):
     assert "role_contract_pre_spawn" in (runs[-1].error or "")
 
 
+def test_direct_default_spawn_rejects_frozen_digest_mismatch(board, monkeypatch, tmp_path):
+    _write_contract(_write_profile(board))
+    popen_calls = []
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: popen_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    workspace = tmp_path / "direct-mismatch"
+    workspace.mkdir()
+    task = kb.Task(
+        id="t_direct_mismatch",
+        title="direct mismatch",
+        body=None,
+        assignee="builder",
+        status="running",
+        priority=0,
+        created_by="test",
+        created_at=1,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="dir",
+        workspace_path=str(workspace),
+        claim_lock="lock",
+        claim_expires=None,
+        tenant=None,
+        current_run_id=2,
+        require_role_contract=True,
+        expected_role_contract_sha256="0" * 64,
+    )
+
+    with pytest.raises(kb._WorkerRoleContractAdmissionError, match="decision-time receipt"):
+        kb._default_spawn(task, str(workspace))
+    assert popen_calls == []
+
+
 def test_default_spawn_uses_admitted_toolsets_and_receipt_env(board, monkeypatch, tmp_path):
     profile = _write_profile(board)
-    _write_contract(profile)
+    raw = _write_contract(profile)
     captured = {}
 
     class FakeProc:
@@ -311,6 +399,7 @@ def test_default_spawn_uses_admitted_toolsets_and_receipt_env(board, monkeypatch
         tenant=None,
         current_run_id=3,
         require_role_contract=True,
+        expected_role_contract_sha256=hashlib.sha256(raw).hexdigest(),
     )
 
     assert kb._default_spawn(task, str(workspace)) == 5150
