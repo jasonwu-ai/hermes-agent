@@ -1149,6 +1149,9 @@ class Task:
     # When true, dispatch must admit the assignee profile's exact
     # ROLE_CONTRACT.md bytes before any worker process is spawned.
     require_role_contract: bool = False
+    # Optional decision-time digest. When set, the existing spawn admission
+    # must observe these exact contract bytes or block before process creation.
+    expected_role_contract_sha256: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1247,6 +1250,12 @@ class Task:
                 bool(row["require_role_contract"])
                 if "require_role_contract" in keys and row["require_role_contract"]
                 else False
+            ),
+            expected_role_contract_sha256=(
+                row["expected_role_contract_sha256"]
+                if "expected_role_contract_sha256" in keys
+                and row["expected_role_contract_sha256"]
+                else None
             ),
         )
 
@@ -1450,7 +1459,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_recurrences    INTEGER NOT NULL DEFAULT 0,
     -- Per-card admission gate. When 1, a valid assignee-owned
     -- ROLE_CONTRACT.md must be digested and recorded before worker spawn.
-    require_role_contract INTEGER NOT NULL DEFAULT 0
+    require_role_contract INTEGER NOT NULL DEFAULT 0,
+    -- Optional decision-time role-contract digest. When present, spawn-time
+    -- admission must observe these exact bytes or fail before process creation.
+    expected_role_contract_sha256 TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2722,6 +2734,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "require_role_contract INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "expected_role_contract_sha256" not in cols:
+        # Existing cards have no decision-time digest and preserve prior
+        # admission behavior. Verified connectors opt in per card.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "expected_role_contract_sha256",
+            "expected_role_contract_sha256 TEXT",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3243,6 +3265,7 @@ def create_task(
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     require_role_contract: bool = False,
+    expected_role_contract_sha256: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -3294,6 +3317,18 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    expected_role_contract_sha256 = (
+        str(expected_role_contract_sha256).strip().lower()
+        if expected_role_contract_sha256 is not None
+        else None
+    )
+    if expected_role_contract_sha256:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_role_contract_sha256):
+            raise ValueError("expected_role_contract_sha256 must be 64 lowercase hex characters")
+        if not require_role_contract:
+            raise ValueError("expected_role_contract_sha256 requires require_role_contract=True")
+        if not assignee:
+            raise ValueError("expected_role_contract_sha256 requires an assignee")
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3563,8 +3598,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id,
-                        require_role_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        require_role_contract, expected_role_contract_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3591,6 +3626,7 @@ def create_task(
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
                         1 if require_role_contract else 0,
+                        expected_role_contract_sha256,
                     ),
                 )
                 for pid in parents:
@@ -3620,6 +3656,7 @@ def create_task(
                         "model_override": model_override,
                         "provider_override": provider_override,
                         "require_role_contract": bool(require_role_contract) or None,
+                        "expected_role_contract_sha256": expected_role_contract_sha256,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -11726,6 +11763,14 @@ def _admit_worker_role_contract(
         )
     except RoleContractError as exc:
         raise _WorkerRoleContractAdmissionError(str(exc)) from exc
+    expected_digest = task.expected_role_contract_sha256
+    if expected_digest:
+        observed_digest = admission.contract.sha256 if admission is not None else None
+        if observed_digest != expected_digest:
+            raise _WorkerRoleContractAdmissionError(
+                "role contract digest does not match the decision-time receipt: "
+                f"expected {expected_digest}, observed {observed_digest or 'none'}"
+            )
     setattr(task, "_role_contract_admission", admission)
     if admission is None:
         return None
@@ -11976,6 +12021,14 @@ def _default_spawn(
             required=bool(task.require_role_contract),
         )
         setattr(task, "_role_contract_admission", admission)
+    if task.expected_role_contract_sha256:
+        observed_digest = admission.contract.sha256 if admission is not None else None
+        if observed_digest != task.expected_role_contract_sha256:
+            raise _WorkerRoleContractAdmissionError(
+                "role contract digest does not match the decision-time receipt: "
+                f"expected {task.expected_role_contract_sha256}, "
+                f"observed {observed_digest or 'none'}"
+            )
     if admission is not None:
         from hermes_cli.role_contract import verify_admission_bytes
 
