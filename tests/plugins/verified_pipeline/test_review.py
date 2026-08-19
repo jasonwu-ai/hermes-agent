@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -7,6 +8,8 @@ from pathlib import Path
 import sqlite3
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hermes_cli import kanban_db
 from plugins.verified_pipeline import controller, execution, materializer, review, validators
@@ -28,6 +31,17 @@ FROZEN = {
     )
 }
 ARTIFACT = b"# Exact specification\n\nBuild one bounded, reviewed plan.\n"
+AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+AUTHORITY_VERIFIER = {
+    "issuer": "verified-pipeline-test-auth-adapter",
+    "key_id": "test-ed25519-1",
+    "public_key_b64": base64.b64encode(
+        AUTHORITY_PRIVATE_KEY.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    ).decode("ascii"),
+}
 
 
 def _setup(tmp_path: Path, *, frozen=FROZEN, authority=None):
@@ -1025,6 +1039,51 @@ def test_materializer_rejects_duplicate_semantic_task_identity(tmp_path):
     assert exc.value.code == "DUPLICATE_MATERIALIZED_TASK"
 
 
+def _persist_execution_authority(
+    control_db: Path,
+    intake: dict,
+    materialization: dict,
+    *,
+    signing_key: Ed25519PrivateKey = AUTHORITY_PRIVATE_KEY,
+) -> dict:
+    execution.init_execution_schema(control_db)
+    authority_key = f"authenticated-owner:{intake['run_id']}:execute"
+    authorization = {
+        "schema": execution.AUTHORIZATION_SCHEMA,
+        "authority_key": authority_key,
+        "run_id": intake["run_id"],
+        "materialization_key": materialization["idempotency_key"],
+        "decision": execution.EXECUTION_DECISION,
+        "principal": "owner",
+        "authentication_context_sha256": execution._digest(
+            {"adapter": "isolated-test", "authenticated_principal": "owner"}
+        ),
+        "issuer": AUTHORITY_VERIFIER["issuer"],
+        "key_id": AUTHORITY_VERIFIER["key_id"],
+    }
+    authorization["signature_b64"] = base64.b64encode(
+        signing_key.sign(execution._signed_bytes(authorization))
+    ).decode("ascii")
+    conn = controller.connect(control_db)
+    try:
+        with controller._write_txn(conn):
+            conn.execute(
+                "INSERT INTO execution_authority_receipts "
+                "(authority_key, materialization_key, run_id, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    authority_key,
+                    materialization["idempotency_key"],
+                    intake["run_id"],
+                    execution._canonical(authorization),
+                    controller._now(),
+                ),
+            )
+    finally:
+        conn.close()
+    return authorization
+
+
 def _authorized_execution(tmp_path: Path):
     control_db, kanban_path, intake, _, board, materialization = (
         _approved_materialization(tmp_path)
@@ -1035,17 +1094,11 @@ def _authorized_execution(tmp_path: Path):
         db_path=control_db,
         kanban_db_path=kanban_path,
     )
-    authorization = {
-        "schema": execution.AUTHORIZATION_SCHEMA,
-        "run_id": intake["run_id"],
-        "materialization_key": materialization["idempotency_key"],
-        "decision": execution.EXECUTION_DECISION,
-        "authorized_by": "authenticated-user",
-        "authority_ref": "isolated-test-authorization",
-    }
+    authorization = _persist_execution_authority(control_db, intake, materialization)
     intent = execution.record_execution_authorization(
         materialization_key=materialization["idempotency_key"],
-        authorization=authorization,
+        authority_key=authorization["authority_key"],
+        authority_verifier=AUTHORITY_VERIFIER,
         db_path=control_db,
     )
     return control_db, kanban_path, intake, board, projected, authorization, intent
@@ -1059,11 +1112,107 @@ def test_execution_authorization_is_inert_until_explicit_arm(tmp_path):
     assert {row["status"] for row in _implementation_rows(kanban_path)} == {"blocked"}
     replay = execution.record_execution_authorization(
         materialization_key=authorization["materialization_key"],
-        authorization=authorization,
+        authority_key=authorization["authority_key"],
+        authority_verifier=AUTHORITY_VERIFIER,
         db_path=control_db,
     )
     assert replay == {**intent, "replayed": True}
     assert set(projected["task_map"]) == {"build", "verify"}
+    conn = controller.connect(control_db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="authority receipt is immutable"):
+            conn.execute(
+                "UPDATE execution_authority_receipts SET payload_json = '{}' "
+                "WHERE authority_key = ?",
+                (authorization["authority_key"],),
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="authority receipt is append-only"):
+            conn.execute(
+                "DELETE FROM execution_authority_receipts WHERE authority_key = ?",
+                (authorization["authority_key"],),
+            )
+    finally:
+        conn.close()
+
+
+def test_execution_rejects_db_writer_self_signed_owner_receipt(tmp_path):
+    control_db, kanban_path, intake, _, board, materialization = (
+        _approved_materialization(tmp_path)
+    )
+    projected = materializer.project_materialization(
+        materialization["idempotency_key"],
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    attacker_key = Ed25519PrivateKey.generate()
+    authorization = _persist_execution_authority(
+        control_db, intake, materialization, signing_key=attacker_key
+    )
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_authorization(
+            materialization_key=materialization["idempotency_key"],
+            authority_key=authorization["authority_key"],
+            authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db,
+        )
+    assert exc.value.code == "EXECUTION_AUTHORIZATION_SIGNATURE_INVALID"
+    assert {row["status"] for row in _implementation_rows(kanban_path)} == {"blocked"}
+    conn = controller.connect(control_db)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM execution_outbox").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert set(projected["task_map"]) == {"build", "verify"}
+
+
+def test_execution_normalizes_immutable_custody_conflict(tmp_path):
+    control_db, kanban_path, intake, _, board, materialization = (
+        _approved_materialization(tmp_path)
+    )
+    materializer.project_materialization(
+        materialization["idempotency_key"],
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    authorization = _persist_execution_authority(control_db, intake, materialization)
+    conn = controller.connect(control_db)
+    try:
+        custody = conn.execute(
+            "SELECT * FROM materialization_outbox WHERE idempotency_key = ?",
+            (materialization["idempotency_key"],),
+        ).fetchone()
+        assert custody is not None
+        with controller._write_txn(conn):
+            conn.execute(
+                "INSERT INTO execution_outbox "
+                "(idempotency_key, materialization_key, run_id, source_task_id, "
+                "board, plan_sha256, authorization_sha256, payload_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "conflicting-execution-custody",
+                    custody["idempotency_key"],
+                    custody["run_id"],
+                    custody["source_task_id"],
+                    custody["board"],
+                    custody["plan_sha256"],
+                    "0" * 64,
+                    "{}",
+                    controller._now(),
+                ),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_authorization(
+            materialization_key=materialization["idempotency_key"],
+            authority_key=authorization["authority_key"],
+            authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db,
+        )
+    assert exc.value.code == "EXECUTION_AUTHORIZATION_CONFLICT"
 
 
 def test_execution_arm_preserves_native_dependency_gating(tmp_path):
@@ -1073,6 +1222,7 @@ def test_execution_arm_preserves_native_dependency_gating(tmp_path):
     armed = execution.arm_execution(
         intent["idempotency_key"],
         board=board,
+        authority_verifier=AUTHORITY_VERIFIER,
         db_path=control_db,
         kanban_db_path=kanban_path,
     )
@@ -1091,6 +1241,11 @@ def test_execution_arm_preserves_native_dependency_gating(tmp_path):
             "AND task_id IN (?, ?)",
             (projected["task_map"]["build"], projected["task_map"]["verify"]),
         ).fetchall()
+        arm_receipt = conn.execute(
+            "SELECT payload_json FROM verified_execution_arm_receipts "
+            "WHERE execution_key = ?",
+            (intent["idempotency_key"],),
+        ).fetchone()
     finally:
         conn.close()
     assert statuses == {
@@ -1102,15 +1257,50 @@ def test_execution_arm_preserves_native_dependency_gating(tmp_path):
     assert all(materializer.INERT_BOUNDARY not in row["body"] for row in armed_rows)
     assert all("Do not execute" not in row["body"] for row in armed_rows)
     assert len(events) == 2
+    assert arm_receipt is not None
+    assert json.loads(arm_receipt["payload_json"])["schema"] == (
+        execution.BOARD_ARM_RECEIPT_SCHEMA
+    )
     assert all(
         json.loads(event["payload"])["authority"] == execution.EXECUTION_CONTROLLER_ID
         for event in events
     )
     replay = execution.arm_execution(
-        intent["idempotency_key"], board=board, db_path=control_db,
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
         kanban_db_path=kanban_path,
     )
     assert replay == {**armed, "replayed": True}
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="arm receipt is immutable"):
+            conn.execute(
+                "UPDATE verified_execution_arm_receipts SET payload_json = '{}' "
+                "WHERE execution_key = ?",
+                (intent["idempotency_key"],),
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="arm receipt is append-only"):
+            conn.execute(
+                "DELETE FROM verified_execution_arm_receipts WHERE execution_key = ?",
+                (intent["idempotency_key"],),
+            )
+    finally:
+        conn.close()
+    control_conn = controller.connect(control_db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="invalid execution arm state"):
+            control_conn.execute(
+                "UPDATE execution_arm_state SET state = 'PENDING' WHERE execution_key = ?",
+                (intent["idempotency_key"],),
+            )
+        control_conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError, match="arm state is append-only"):
+            control_conn.execute(
+                "DELETE FROM execution_arm_state WHERE execution_key = ?",
+                (intent["idempotency_key"],),
+            )
+    finally:
+        control_conn.close()
 
 
 def test_execution_crash_window_and_concurrent_replays_converge(tmp_path):
@@ -1121,22 +1311,25 @@ def test_execution_crash_window_and_concurrent_replays_converge(tmp_path):
 
     with pytest.raises(InjectedCrash):
         execution.arm_execution(
-            intent["idempotency_key"], board=board, db_path=control_db,
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
             kanban_db_path=kanban_path,
             _after_graph_armed=lambda: (_ for _ in ()).throw(InjectedCrash()),
         )
     conn = controller.connect(control_db)
     try:
-        assert conn.execute(
-            "SELECT status FROM execution_outbox WHERE idempotency_key = ?",
+        crash_state = conn.execute(
+            "SELECT o.status, s.state FROM execution_outbox AS o "
+            "JOIN execution_arm_state AS s ON s.execution_key = o.idempotency_key "
+            "WHERE o.idempotency_key = ?",
             (intent["idempotency_key"],),
-        ).fetchone()[0] == "PENDING"
+        ).fetchone()
+        assert dict(crash_state) == {"status": "PENDING", "state": execution.ARMING_STATUS}
     finally:
         conn.close()
 
     def arm(_):
         return execution.arm_execution(
-            intent["idempotency_key"], board=board, db_path=control_db,
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
             kanban_db_path=kanban_path,
         )
 
@@ -1152,18 +1345,18 @@ def test_execution_completion_requires_all_bound_tasks_done(tmp_path):
         _authorized_execution(tmp_path)
     )
     execution.arm_execution(
-        intent["idempotency_key"], board=board, db_path=control_db,
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
         kanban_db_path=kanban_path,
     )
     with pytest.raises(execution.ExecutionError) as exc:
         execution.record_execution_completion(
-            intent["idempotency_key"], board=board, db_path=control_db,
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
             kanban_db_path=kanban_path,
         )
     assert exc.value.code == "EXECUTION_TASK_DRIFT"
     _complete(kanban_path, projected["task_map"]["build"])
     progressed_replay = execution.arm_execution(
-        intent["idempotency_key"], board=board, db_path=control_db,
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
         kanban_db_path=kanban_path,
     )
     assert progressed_replay["status"] == "ARMED"
@@ -1171,7 +1364,7 @@ def test_execution_completion_requires_all_bound_tasks_done(tmp_path):
     _complete(kanban_path, projected["task_map"]["verify"])
     def complete_receipt(_):
         return execution.record_execution_completion(
-            intent["idempotency_key"], board=board, db_path=control_db,
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
             kanban_db_path=kanban_path,
         )
 
@@ -1184,26 +1377,109 @@ def test_execution_completion_requires_all_bound_tasks_done(tmp_path):
     assert receipt["final_task_id"] == projected["task_map"]["verify"]
     assert set(receipt["task_results"]) == {"build", "verify"}
     assert execution.record_execution_completion(
-        intent["idempotency_key"], board=board, db_path=control_db,
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
         kanban_db_path=kanban_path,
     ) == {**receipt, "replayed": True}
+
+
+def test_execution_rejects_tampered_arm_receipts_on_replay_and_completion(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(
+        tmp_path
+    )
+    execution.arm_execution(
+        intent["idempotency_key"],
+        board=board,
+        authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    build_id = projected["task_map"]["build"]
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        with kanban_db.write_txn(conn):
+            event = conn.execute(
+                "SELECT id FROM task_events WHERE task_id = ? AND kind = 'unblocked'",
+                (build_id,),
+            ).fetchone()
+            assert event is not None
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (
+                    json.dumps(
+                        {
+                            "status": "todo",
+                            "authority": execution.EXECUTION_CONTROLLER_ID,
+                            "execution_key": intent["idempotency_key"],
+                        }
+                    ),
+                    event["id"],
+                ),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.arm_execution(
+            intent["idempotency_key"],
+            board=board,
+            authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_ARM_RECEIPT_DRIFT"
+
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (
+                    json.dumps(
+                        {
+                            "status": "ready",
+                            "authority": execution.EXECUTION_CONTROLLER_ID,
+                            "execution_key": intent["idempotency_key"],
+                        }
+                    ),
+                    event["id"],
+                ),
+            )
+    finally:
+        conn.close()
+    _complete(kanban_path, build_id)
+    _complete(kanban_path, projected["task_map"]["verify"])
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        with kanban_db.write_txn(conn):
+            conn.execute("DELETE FROM task_events WHERE id = ?", (event["id"],))
+    finally:
+        conn.close()
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"],
+            board=board,
+            authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_ARM_RECEIPT_DRIFT"
 
 
 def test_execution_rejects_invalid_authority_board_and_dependency_drift(tmp_path):
     control_db, kanban_path, intake, board, projected, authorization, intent = (
         _authorized_execution(tmp_path)
     )
-    invalid = {**authorization, "decision": "MERGE_AND_DEPLOY"}
     with pytest.raises(execution.ExecutionError) as exc:
         execution.record_execution_authorization(
             materialization_key=authorization["materialization_key"],
-            authorization=invalid,
+            authority_key="caller-asserted-forged-authority",
+            authority_verifier=AUTHORITY_VERIFIER,
             db_path=control_db,
         )
-    assert exc.value.code == "EXECUTION_AUTHORIZATION_INVALID"
+    assert exc.value.code == "AUTHENTICATED_EXECUTION_AUTHORITY_REQUIRED"
     with pytest.raises(execution.ExecutionError) as exc:
         execution.arm_execution(
-            intent["idempotency_key"], board=board + "-wrong", db_path=control_db,
+            intent["idempotency_key"], board=board + "-wrong",
+            authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
             kanban_db_path=kanban_path,
         )
     assert exc.value.code == "EXECUTION_BOARD_MISMATCH"
@@ -1221,7 +1497,7 @@ def test_execution_rejects_invalid_authority_board_and_dependency_drift(tmp_path
         conn.close()
     with pytest.raises(execution.ExecutionError) as exc:
         execution.arm_execution(
-            intent["idempotency_key"], board=board, db_path=control_db,
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
             kanban_db_path=kanban_path,
         )
     assert exc.value.code == "EXECUTION_TASK_DRIFT"
@@ -1237,7 +1513,7 @@ def test_execution_rejects_invalid_authority_board_and_dependency_drift(tmp_path
         conn.close()
     with pytest.raises(execution.ExecutionError) as exc:
         execution.arm_execution(
-            intent["idempotency_key"], board=board, db_path=control_db,
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
             kanban_db_path=kanban_path,
         )
     assert exc.value.code == "EXECUTION_TASK_IDENTITY_DRIFT"
@@ -1261,7 +1537,7 @@ def test_execution_rejects_invalid_authority_board_and_dependency_drift(tmp_path
         conn.close()
     with pytest.raises(execution.ExecutionError) as exc:
         execution.arm_execution(
-            intent["idempotency_key"], board=board, db_path=control_db,
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
             kanban_db_path=kanban_path,
         )
     assert exc.value.code == "EXECUTION_ARM_RECEIPT_DRIFT"
@@ -1280,7 +1556,7 @@ def test_execution_rejects_invalid_authority_board_and_dependency_drift(tmp_path
         conn.close()
     with pytest.raises(execution.ExecutionError) as exc:
         execution.arm_execution(
-            intent["idempotency_key"], board=board, db_path=control_db,
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
             kanban_db_path=kanban_path,
         )
     assert exc.value.code == "EXECUTION_DEPENDENCY_DRIFT"
