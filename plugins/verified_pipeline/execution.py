@@ -8,22 +8,30 @@ Kanban DAG; normal Kanban dependency gating owns subsequent execution.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Callable, Mapping, Optional
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from plugins.verified_pipeline import controller, materializer
 
 EXECUTION_CONTROLLER_ID = "verified-pipeline/bounded-execution-controller/v1"
-AUTHORIZATION_SCHEMA = "verified-pipeline/execution-authorization/v1"
+AUTHORIZATION_SCHEMA = "verified-pipeline/authenticated-execution-decision/v1"
 EXECUTION_DECISION = "AUTHORIZE_BOUNDED_EXECUTION"
 COMPLETION_STATUS = "IMPLEMENTATION_COMPLETE_PENDING_RELEASE_REVIEW"
+ARMING_STATUS = "ARMING"
+ARMED_STATUS = "ARMED"
 AUTHORIZED_BOUNDARY = (
     "bounded execution authorized; no merge, deploy, or release authority"
 )
+BOARD_ARM_RECEIPT_SCHEMA = "verified-pipeline/board-arm-receipt/v1"
 
 
 class ExecutionError(RuntimeError):
@@ -43,6 +51,41 @@ def _digest(value: Any) -> str:
     return hashlib.sha256((_canonical(value) + "\n").encode("utf-8")).hexdigest()
 
 
+def _signed_bytes(value: Mapping[str, Any]) -> bytes:
+    return (_canonical(value) + "\n").encode("utf-8")
+
+
+def _authority_public_key(verifier: Mapping[str, Any]) -> Ed25519PublicKey:
+    if not isinstance(verifier, Mapping) or set(verifier) != {
+        "issuer",
+        "key_id",
+        "public_key_b64",
+    }:
+        raise ExecutionError(
+            "EXECUTION_AUTHORITY_VERIFIER_INVALID",
+            "authority verifier has missing or unknown fields",
+        )
+    if not all(
+        isinstance(verifier[field], str) and verifier[field]
+        for field in ("issuer", "key_id", "public_key_b64")
+    ):
+        raise ExecutionError(
+            "EXECUTION_AUTHORITY_VERIFIER_INVALID", "authority verifier is malformed"
+        )
+    try:
+        raw = base64.b64decode(verifier["public_key_b64"], validate=True)
+        key = Ed25519PublicKey.from_public_bytes(raw)
+    except (ValueError, TypeError) as exc:
+        raise ExecutionError(
+            "EXECUTION_AUTHORITY_VERIFIER_INVALID", "authority verifier key is invalid"
+        ) from exc
+    if base64.b64encode(raw).decode("ascii") != verifier["public_key_b64"]:
+        raise ExecutionError(
+            "EXECUTION_AUTHORITY_VERIFIER_INVALID", "authority verifier key is non-canonical"
+        )
+    return key
+
+
 def init_execution_schema(
     db_path: Optional[str | os.PathLike[str]] = None,
 ) -> Path:
@@ -54,6 +97,15 @@ def init_execution_schema(
             CREATE TABLE IF NOT EXISTS execution_identity (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 controller_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS execution_authority_receipts (
+                authority_key TEXT PRIMARY KEY,
+                materialization_key TEXT NOT NULL UNIQUE
+                    REFERENCES materialization_outbox(idempotency_key),
+                run_id TEXT NOT NULL UNIQUE REFERENCES intakes(run_id),
+                payload_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
 
@@ -75,6 +127,14 @@ def init_execution_schema(
                 last_error_code TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS execution_arm_state (
+                execution_key TEXT PRIMARY KEY
+                    REFERENCES execution_outbox(idempotency_key),
+                state TEXT NOT NULL CHECK (state IN ('PENDING', 'ARMING', 'ARMED')),
+                prepared_at INTEGER,
+                armed_at INTEGER
+            );
+
             CREATE TABLE IF NOT EXISTS execution_completion_receipts (
                 execution_key TEXT PRIMARY KEY
                     REFERENCES execution_outbox(idempotency_key),
@@ -92,6 +152,14 @@ def init_execution_schema(
             BEFORE DELETE ON execution_identity
             BEGIN SELECT RAISE(ABORT, 'execution identity is immutable'); END;
 
+            CREATE TRIGGER IF NOT EXISTS execution_authority_no_update
+            BEFORE UPDATE ON execution_authority_receipts
+            BEGIN SELECT RAISE(ABORT, 'execution authority receipt is immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS execution_authority_no_delete
+            BEFORE DELETE ON execution_authority_receipts
+            BEGIN SELECT RAISE(ABORT, 'execution authority receipt is append-only'); END;
+
             CREATE TRIGGER IF NOT EXISTS execution_outbox_payload_no_update
             BEFORE UPDATE OF idempotency_key, materialization_key, run_id,
                 source_task_id, board, plan_sha256, authorization_sha256,
@@ -102,6 +170,23 @@ def init_execution_schema(
             CREATE TRIGGER IF NOT EXISTS execution_outbox_no_delete
             BEFORE DELETE ON execution_outbox
             BEGIN SELECT RAISE(ABORT, 'execution outbox is append-only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS execution_arm_state_identity_no_update
+            BEFORE UPDATE OF execution_key ON execution_arm_state
+            BEGIN SELECT RAISE(ABORT, 'execution arm state identity is immutable'); END;
+
+            CREATE TRIGGER IF NOT EXISTS execution_arm_state_no_delete
+            BEFORE DELETE ON execution_arm_state
+            BEGIN SELECT RAISE(ABORT, 'execution arm state is append-only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS execution_arm_state_transition_guard
+            BEFORE UPDATE OF state ON execution_arm_state
+            WHEN NOT (
+                (OLD.state = 'PENDING' AND NEW.state = 'ARMING') OR
+                (OLD.state = 'ARMING' AND NEW.state = 'ARMED') OR
+                OLD.state = NEW.state
+            )
+            BEGIN SELECT RAISE(ABORT, 'invalid execution arm state transition'); END;
 
             CREATE TRIGGER IF NOT EXISTS execution_completion_no_update
             BEFORE UPDATE ON execution_completion_receipts
@@ -117,6 +202,11 @@ def init_execution_schema(
                 "INSERT OR IGNORE INTO execution_identity "
                 "(singleton, controller_id, created_at) VALUES (1, ?, ?)",
                 (EXECUTION_CONTROLLER_ID, controller._now()),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO execution_arm_state "
+                "(execution_key, state, prepared_at, armed_at) "
+                "SELECT idempotency_key, status, NULL, armed_at FROM execution_outbox"
             )
         identity = conn.execute(
             "SELECT controller_id FROM execution_identity WHERE singleton = 1"
@@ -176,56 +266,105 @@ def _load_materialization(
         conn.close()
 
 
-def _validate_authorization(
-    authorization: Mapping[str, Any],
+def _load_authorization_receipt(
+    authority_key: str,
     *,
     materialization_key: str,
     payload: Mapping[str, Any],
-) -> dict[str, str]:
+    authority_verifier: Mapping[str, Any],
+    db_path: Optional[str | os.PathLike[str]],
+) -> dict[str, Any]:
+    """Consume, but never create, one authenticated immutable decision receipt."""
+    conn = controller.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM execution_authority_receipts WHERE authority_key = ?",
+            (authority_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise ExecutionError(
+            "AUTHENTICATED_EXECUTION_AUTHORITY_REQUIRED",
+            "authenticated execution authority receipt was not found",
+        )
+    try:
+        authorization = json.loads(row["payload_json"])
+    except json.JSONDecodeError as exc:
+        raise ExecutionError(
+            "EXECUTION_AUTHORIZATION_INVALID", "authority receipt is malformed"
+        ) from exc
     expected_keys = {
         "schema",
+        "authority_key",
         "run_id",
         "materialization_key",
         "decision",
-        "authorized_by",
-        "authority_ref",
+        "principal",
+        "authentication_context_sha256",
+        "issuer",
+        "key_id",
+        "signature_b64",
     }
     if set(authorization) != expected_keys:
         raise ExecutionError(
             "EXECUTION_AUTHORIZATION_INVALID",
-            "authorization has missing or unknown fields",
+            "authority receipt has missing or unknown fields",
         )
     normalized = dict(authorization)
+    auth_context = normalized["authentication_context_sha256"]
+    unsigned = {key: value for key, value in normalized.items() if key != "signature_b64"}
+    public_key = _authority_public_key(authority_verifier)
     if (
         normalized["schema"] != AUTHORIZATION_SCHEMA
+        or normalized["authority_key"] != authority_key
         or normalized["run_id"] != payload["run_id"]
         or normalized["materialization_key"] != materialization_key
         or normalized["decision"] != EXECUTION_DECISION
-        or not isinstance(normalized["authorized_by"], str)
-        or not normalized["authorized_by"].strip()
-        or not isinstance(normalized["authority_ref"], str)
-        or not normalized["authority_ref"].strip()
+        or normalized["principal"] != "owner"
+        or not isinstance(auth_context, str)
+        or re.fullmatch(r"[0-9a-f]{64}", auth_context) is None
+        or normalized["issuer"] != authority_verifier.get("issuer")
+        or normalized["key_id"] != authority_verifier.get("key_id")
+        or row["materialization_key"] != materialization_key
+        or row["run_id"] != payload["run_id"]
+        or row["payload_json"] != _canonical(normalized)
     ):
         raise ExecutionError(
             "EXECUTION_AUTHORIZATION_INVALID",
-            "authorization identity or decision is invalid",
+            "authenticated authority receipt identity or decision is invalid",
         )
+    try:
+        signature = base64.b64decode(normalized["signature_b64"], validate=True)
+        if base64.b64encode(signature).decode("ascii") != normalized["signature_b64"]:
+            raise ValueError("non-canonical signature")
+        public_key.verify(signature, _signed_bytes(unsigned))
+    except (InvalidSignature, ValueError, TypeError) as exc:
+        raise ExecutionError(
+            "EXECUTION_AUTHORIZATION_SIGNATURE_INVALID",
+            "authority receipt signature is invalid",
+        ) from exc
     return normalized
 
 
 def record_execution_authorization(
     *,
     materialization_key: str,
-    authorization: Mapping[str, Any],
+    authority_key: str,
+    authority_verifier: Mapping[str, Any],
     db_path: Optional[str | os.PathLike[str]] = None,
 ) -> dict[str, Any]:
-    """Commit one immutable authorization for an exact delivered graph."""
+    """Consume an authenticated receipt and commit authorization for one graph."""
     init_execution_schema(db_path)
     row, payload, task_map = _load_materialization(
         materialization_key, db_path=db_path
     )
-    normalized = _validate_authorization(
-        authorization, materialization_key=materialization_key, payload=payload
+    normalized = _load_authorization_receipt(
+        authority_key,
+        materialization_key=materialization_key,
+        payload=payload,
+        authority_verifier=authority_verifier,
+        db_path=db_path,
     )
     execution_key = (
         f"verified-pipeline:{payload['run_id']}:execution:r{payload['plan_revision']}"
@@ -255,28 +394,47 @@ def record_execution_authorization(
                         "EXECUTION_AUTHORIZATION_DRIFT",
                         "existing execution authorization has different immutable bytes",
                     )
+                arm_state = conn.execute(
+                    "SELECT state FROM execution_arm_state WHERE execution_key = ?",
+                    (execution_key,),
+                ).fetchone()
+                if arm_state is None:
+                    raise ExecutionError(
+                        "EXECUTION_STATE_INVALID", "execution arm state is missing"
+                    )
                 return {
                     "idempotency_key": execution_key,
-                    "status": existing["status"],
+                    "status": arm_state["state"],
                     "replayed": True,
                 }
-            conn.execute(
-                "INSERT INTO execution_outbox "
-                "(idempotency_key, materialization_key, run_id, source_task_id, "
-                "board, plan_sha256, authorization_sha256, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    execution_key,
-                    materialization_key,
-                    row["run_id"],
-                    row["source_task_id"],
-                    row["board"],
-                    row["plan_sha256"],
-                    _digest(normalized),
-                    _canonical(intent),
-                    controller._now(),
-                ),
-            )
+            try:
+                conn.execute(
+                    "INSERT INTO execution_outbox "
+                    "(idempotency_key, materialization_key, run_id, source_task_id, "
+                    "board, plan_sha256, authorization_sha256, payload_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        execution_key,
+                        materialization_key,
+                        row["run_id"],
+                        row["source_task_id"],
+                        row["board"],
+                        row["plan_sha256"],
+                        _digest(normalized),
+                        _canonical(intent),
+                        controller._now(),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO execution_arm_state (execution_key, state) "
+                    "VALUES (?, 'PENDING')",
+                    (execution_key,),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ExecutionError(
+                    "EXECUTION_AUTHORIZATION_CONFLICT",
+                    "execution authorization conflicts with existing immutable custody",
+                ) from exc
         return {"idempotency_key": execution_key, "status": "PENDING", "replayed": False}
     finally:
         conn.close()
@@ -285,6 +443,7 @@ def record_execution_authorization(
 def _load_execution(
     execution_key: str,
     *,
+    authority_verifier: Mapping[str, Any],
     db_path: Optional[str | os.PathLike[str]],
 ) -> tuple[sqlite3.Row, dict[str, Any], dict[str, Any]]:
     conn = controller.connect(db_path)
@@ -318,10 +477,17 @@ def _load_execution(
             "authorization": intent.get("authorization"),
             "boundary": "bounded execution only; no merge, deploy, or release authority",
         }
-        normalized = _validate_authorization(
-            intent.get("authorization", {}),
+        authority_key = intent.get("authorization", {}).get("authority_key")
+        if not isinstance(authority_key, str):
+            raise ExecutionError(
+                "EXECUTION_AUTHORIZATION_INVALID", "authority receipt identity is missing"
+            )
+        normalized = _load_authorization_receipt(
+            authority_key,
             materialization_key=row["materialization_key"],
             payload=payload,
+            authority_verifier=authority_verifier,
+            db_path=db_path,
         )
         if (
             intent != expected
@@ -365,14 +531,109 @@ def _authorized_task_body(payload: Mapping[str, Any], task: Mapping[str, Any]) -
     ).replace(expected, authorized, 1)
 
 
+def _init_execution_board_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS verified_execution_arm_receipts (
+            execution_key TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE TRIGGER IF NOT EXISTS verified_execution_arm_receipt_no_update
+        BEFORE UPDATE ON verified_execution_arm_receipts
+        BEGIN SELECT RAISE(ABORT, 'execution arm receipt is immutable'); END;
+
+        CREATE TRIGGER IF NOT EXISTS verified_execution_arm_receipt_no_delete
+        BEFORE DELETE ON verified_execution_arm_receipts
+        BEGIN SELECT RAISE(ABORT, 'execution arm receipt is append-only'); END;
+        """
+    )
+
+
+def _board_arm_receipt(
+    *, intent: Mapping[str, Any], payload: Mapping[str, Any]
+) -> dict[str, Any]:
+    task_map = intent["task_map"]
+    tasks = []
+    for task in materializer._topological_tasks(payload["plan"]):
+        task_contract = {
+            "task_id": task_map[task["id"]],
+            "semantic_key": materializer._task_key(payload, task["id"]),
+            "title": task["title"],
+            "authorized_body": _authorized_task_body(payload, task),
+            "assignee": task["assignee"],
+            "tenant": f"verified:{payload['run_id']}",
+            "created_by": "verified-pipeline-materializer",
+            "workspace_kind": task["workspace"],
+            "max_retries": 0,
+            "max_runtime_seconds": 3600,
+            "role_contract_sha256": payload["frozen_profiles"][task["assignee"]][
+                "sha256"
+            ],
+            "initial_status": _expected_armed_status(task),
+            "parent_task_ids": sorted(
+                task_map[parent] for parent in task["dependencies"]
+            ),
+        }
+        tasks.append(
+            {
+                "plan_task_id": task["id"],
+                "task_id": task_contract["task_id"],
+                "semantic_key": task_contract["semantic_key"],
+                "initial_status": task_contract["initial_status"],
+                "authorized_body_sha256": hashlib.sha256(
+                    task_contract["authorized_body"].encode("utf-8")
+                ).hexdigest(),
+                "parent_task_ids": task_contract["parent_task_ids"],
+                "role_contract_sha256": task_contract["role_contract_sha256"],
+                "task_contract_sha256": _digest(task_contract),
+            }
+        )
+    return {
+        "schema": BOARD_ARM_RECEIPT_SCHEMA,
+        "execution_key": intent["execution_key"],
+        "materialization_key": intent["materialization_key"],
+        "run_id": intent["run_id"],
+        "source_task_id": intent["source_task_id"],
+        "board": intent["board"],
+        "plan_sha256": intent["plan_sha256"],
+        "authorization_sha256": _digest(intent["authorization"]),
+        "tasks": tasks,
+        "boundary": "bounded execution only; no merge, deploy, or release authority",
+    }
+
+
+def _validate_board_arm_receipt(
+    conn: sqlite3.Connection,
+    *,
+    intent: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    expected_count: int = 1,
+) -> None:
+    rows = conn.execute(
+        "SELECT payload_json FROM verified_execution_arm_receipts "
+        "WHERE execution_key = ?",
+        (intent["execution_key"],),
+    ).fetchall()
+    if len(rows) != expected_count or (
+        expected_count == 1
+        and rows[0]["payload_json"] != _canonical(_board_arm_receipt(intent=intent, payload=payload))
+    ):
+        raise ExecutionError(
+            "EXECUTION_BOARD_RECEIPT_DRIFT",
+            "immutable board-side execution receipt is missing or inconsistent",
+        )
+
+
 def _validate_arm_events(
     conn: sqlite3.Connection,
     *,
     execution_key: str,
-    task_ids: list[str],
+    expected_statuses: Mapping[str, str],
     expected_count: int = 1,
 ) -> None:
-    for task_id in task_ids:
+    for task_id, expected_status in expected_statuses.items():
         events = conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'unblocked' "
             "ORDER BY id",
@@ -389,7 +650,14 @@ def _validate_arm_events(
                 and event_payload.get("execution_key") == execution_key
             ):
                 matching.append(event_payload)
-        if len(matching) != expected_count:
+        expected_payload = {
+            "status": expected_status,
+            "authority": EXECUTION_CONTROLLER_ID,
+            "execution_key": execution_key,
+        }
+        if len(matching) != expected_count or (
+            expected_count == 1 and matching[0] != expected_payload
+        ):
             raise ExecutionError(
                 "EXECUTION_ARM_RECEIPT_DRIFT",
                 "task execution authorization event count is inconsistent",
@@ -455,22 +723,52 @@ def arm_execution(
     execution_key: str,
     *,
     board: str,
+    authority_verifier: Mapping[str, Any],
     db_path: Optional[str | os.PathLike[str]],
     kanban_db_path: str | os.PathLike[str],
     _after_graph_armed: Optional[Callable[[], None]] = None,
 ) -> dict[str, Any]:
-    """Atomically arm the exact blocked graph under native parent gating."""
+    """Recoverably arm the graph: control PREPARE, board COMMIT, control ACK."""
     init_execution_schema(db_path)
-    row, intent, payload = _load_execution(execution_key, db_path=db_path)
+    row, intent, payload = _load_execution(
+        execution_key, authority_verifier=authority_verifier, db_path=db_path
+    )
     if board != row["board"] or board != intent["board"]:
         raise ExecutionError(
             "EXECUTION_BOARD_MISMATCH", "requested board does not match execution authority"
         )
-    already_armed = row["status"] == "ARMED"
+    if row["status"] not in {"PENDING", ARMING_STATUS, ARMED_STATUS}:
+        raise ExecutionError(
+            "EXECUTION_STATE_INVALID", "execution is not in an armable control state"
+        )
+    control_conn = controller.connect(db_path)
+    try:
+        with controller._write_txn(control_conn):
+            control_conn.execute(
+                "UPDATE execution_arm_state SET state = ?, prepared_at = COALESCE(prepared_at, ?) "
+                "WHERE execution_key = ? AND state = 'PENDING'",
+                (ARMING_STATUS, controller._now(), execution_key),
+            )
+            control_status = control_conn.execute(
+                "SELECT state FROM execution_arm_state WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+            if control_status is None or control_status["state"] not in {
+                ARMING_STATUS,
+                ARMED_STATUS,
+            }:
+                raise ExecutionError(
+                    "EXECUTION_STATE_INVALID",
+                    "execution could not enter the recoverable arming state",
+                )
+            already_armed = control_status["state"] == ARMED_STATUS
+    finally:
+        control_conn.close()
 
     from hermes_cli import kanban_db
 
     board_conn = kanban_db.connect(db_path=Path(kanban_db_path))
+    _init_execution_board_schema(board_conn)
     graph_already_armed = False
     try:
         with kanban_db.write_txn(board_conn):
@@ -491,18 +789,27 @@ def arm_execution(
             execution_statuses = {
                 "todo", "ready", "running", "review", "done", "blocked", "triage"
             }
-            task_ids = [intent["task_map"][task["id"]] for task in ordered_tasks]
+            expected_statuses = {
+                intent["task_map"][task["id"]]: _expected_armed_status(task)
+                for task in ordered_tasks
+            }
             if graph_already_armed:
+                _validate_board_arm_receipt(
+                    board_conn, intent=intent, payload=payload
+                )
                 _validate_arm_events(
                     board_conn,
                     execution_key=execution_key,
-                    task_ids=task_ids,
+                    expected_statuses=expected_statuses,
                 )
             else:
+                _validate_board_arm_receipt(
+                    board_conn, intent=intent, payload=payload, expected_count=0
+                )
                 _validate_arm_events(
                     board_conn,
                     execution_key=execution_key,
-                    task_ids=task_ids,
+                    expected_statuses=expected_statuses,
                     expected_count=0,
                 )
             _validate_bound_graph(
@@ -541,6 +848,16 @@ def arm_execution(
                         "execution_key": execution_key,
                     },
                 )
+            if not graph_already_armed:
+                board_conn.execute(
+                    "INSERT INTO verified_execution_arm_receipts "
+                    "(execution_key, payload_json, created_at) VALUES (?, ?, ?)",
+                    (
+                        execution_key,
+                        _canonical(_board_arm_receipt(intent=intent, payload=payload)),
+                        controller._now(),
+                    ),
+                )
         if _after_graph_armed is not None:
             _after_graph_armed()
     finally:
@@ -549,20 +866,32 @@ def arm_execution(
     conn = controller.connect(db_path)
     try:
         with controller._write_txn(conn):
+            armed_at = controller._now()
+            conn.execute(
+                "UPDATE execution_arm_state SET state = 'ARMED', "
+                "armed_at = COALESCE(armed_at, ?) "
+                "WHERE execution_key = ? AND state IN ('ARMING', 'ARMED')",
+                (armed_at, execution_key),
+            )
             conn.execute(
                 "UPDATE execution_outbox SET status = 'ARMED', armed_at = ?, "
                 "attempts = attempts + 1, last_error_code = NULL "
                 "WHERE idempotency_key = ? AND status = 'PENDING'",
-                (controller._now(), execution_key),
+                (armed_at, execution_key),
             )
         final = conn.execute(
-            "SELECT status FROM execution_outbox WHERE idempotency_key = ?",
+            "SELECT o.status, s.state FROM execution_outbox AS o "
+            "JOIN execution_arm_state AS s ON s.execution_key = o.idempotency_key "
+            "WHERE o.idempotency_key = ?",
             (execution_key,),
         ).fetchone()
-        assert final is not None
+        if final is None or final["status"] != ARMED_STATUS or final["state"] != ARMED_STATUS:
+            raise ExecutionError(
+                "EXECUTION_STATE_INVALID", "execution arming acknowledgement did not converge"
+            )
         return {
             "idempotency_key": execution_key,
-            "status": final["status"],
+            "status": final["state"],
             "task_map": intent["task_map"],
             "replayed": already_armed or graph_already_armed,
         }
@@ -574,13 +903,28 @@ def record_execution_completion(
     execution_key: str,
     *,
     board: str,
+    authority_verifier: Mapping[str, Any],
     db_path: Optional[str | os.PathLike[str]],
     kanban_db_path: str | os.PathLike[str],
 ) -> dict[str, Any]:
     """Append a release-inert receipt only after every bound task is done."""
     init_execution_schema(db_path)
-    row, intent, payload = _load_execution(execution_key, db_path=db_path)
-    if row["status"] != "ARMED":
+    row, intent, payload = _load_execution(
+        execution_key, authority_verifier=authority_verifier, db_path=db_path
+    )
+    state_conn = controller.connect(db_path)
+    try:
+        arm_state = state_conn.execute(
+            "SELECT state FROM execution_arm_state WHERE execution_key = ?",
+            (execution_key,),
+        ).fetchone()
+    finally:
+        state_conn.close()
+    if (
+        row["status"] != ARMED_STATUS
+        or arm_state is None
+        or arm_state["state"] != ARMED_STATUS
+    ):
         raise ExecutionError("EXECUTION_NOT_ARMED", "execution graph is not armed")
     if board != row["board"]:
         raise ExecutionError(
@@ -590,8 +934,18 @@ def record_execution_completion(
     from hermes_cli import kanban_db
 
     board_conn = kanban_db.connect(db_path=Path(kanban_db_path))
+    _init_execution_board_schema(board_conn)
     try:
         with kanban_db.write_txn(board_conn):
+            _validate_board_arm_receipt(board_conn, intent=intent, payload=payload)
+            _validate_arm_events(
+                board_conn,
+                execution_key=execution_key,
+                expected_statuses={
+                    intent["task_map"][task["id"]]: _expected_armed_status(task)
+                    for task in materializer._topological_tasks(payload["plan"])
+                },
+            )
             _validate_bound_graph(
                 board_conn,
                 intent=intent,
