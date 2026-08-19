@@ -4,11 +4,12 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
 from hermes_cli import kanban_db
-from plugins.verified_pipeline import controller, review, validators
+from plugins.verified_pipeline import controller, materializer, review, validators
 
 
 FROZEN = {
@@ -22,6 +23,8 @@ FROZEN = {
         (controller.PLANNER_PROFILE, "b"),
         (review.DA_PROFILE, "c"),
         (review.CEO_PROFILE, "d"),
+        ("02-researcher", "e"),
+        ("09-test", "f"),
     )
 }
 ARTIFACT = b"# Exact specification\n\nBuild one bounded, reviewed plan.\n"
@@ -150,9 +153,19 @@ def _plan(request: dict, *, dispositions: list[dict] | None = None) -> dict:
                 "deliverable": "A reviewable implementation artifact.",
                 "acceptance_criteria": ["Exact specification behavior is verified."],
                 "workspace": "worktree",
-            }
+            },
+            {
+                "id": "verify",
+                "title": "Verify bounded artifact",
+                "assignee": "09-test",
+                "goal": "Verify only the accepted specification and produced artifact.",
+                "dependencies": ["build"],
+                "deliverable": "A reproducible qualification receipt.",
+                "acceptance_criteria": ["The exact implementation artifact passes qualification."],
+                "workspace": "scratch",
+            },
         ],
-        "final_task_id": "build",
+        "final_task_id": "verify",
         "review_dispositions": dispositions,
     }
 
@@ -727,3 +740,286 @@ def test_plan_validator_rejects_cycle_and_governance_executor(tmp_path):
     plan["tasks"][0]["dependencies"] = ["build"]
     with pytest.raises(validators.ArtifactValidationError, match="depends on itself"):
         validators.validate_plan(plan, request=request)
+
+
+def _approved_materialization(tmp_path: Path, *, frozen=FROZEN):
+    control_db, kanban_path, workspaces, intake, planner_id = _setup(
+        tmp_path, frozen=frozen
+    )
+    _advance_planner(control_db, kanban_path, workspaces, intake, planner_id)
+    da = _latest_task(kanban_path, review.DA_PROFILE)
+    _write_da(Path(da["workspace_path"]), verdict="PASS")
+    _complete(kanban_path, da["id"])
+    review.reconcile_review_once(
+        intake["run_id"],
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+        workspace_root=workspaces,
+    )
+    ceo = _latest_task(kanban_path, review.CEO_PROFILE)
+    _write_ceo(Path(ceo["workspace_path"]), decision="APPROVE")
+    _complete(kanban_path, ceo["id"])
+    terminal = review.reconcile_review_once(
+        intake["run_id"],
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+        workspace_root=workspaces,
+    )
+    assert terminal["advanced"][0]["status"] == "CEO_APPROVED_PENDING_MATERIALIZATION"
+    intent = materializer.record_materialization_intent(
+        run_id=intake["run_id"],
+        source_task_id=ceo["id"],
+        db_path=control_db,
+    )
+    board = (
+        controller.get_intake(intake["run_id"], db_path=control_db)["board"]
+        or kanban_db.DEFAULT_BOARD
+    )
+    return control_db, kanban_path, intake, ceo["id"], board, intent
+
+
+def _implementation_rows(kanban_path: Path):
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        return conn.execute(
+            "SELECT * FROM tasks WHERE created_by = 'verified-pipeline-materializer' "
+            "ORDER BY created_at, id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_materializer_projects_exact_blocked_dag_and_replays(tmp_path):
+    control_db, kanban_path, intake, ceo_id, board, intent = _approved_materialization(
+        tmp_path
+    )
+    result = materializer.project_materialization(
+        intent["idempotency_key"],
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    assert result["status"] == "DELIVERED"
+    assert set(result["task_map"]) == {"build", "verify"}
+    rows = _implementation_rows(kanban_path)
+    assert len(rows) == 2
+    assert {row["status"] for row in rows} == {"blocked"}
+    assert {row["assignee"] for row in rows} == {"02-researcher", "09-test"}
+    assert all(materializer.INERT_BOUNDARY in row["body"] for row in rows)
+    assert all(row["tenant"] == f"verified:{intake['run_id']}" for row in rows)
+    assert all(row["max_retries"] == 0 for row in rows)
+    assert {row["expected_role_contract_sha256"] for row in rows} == {
+        FROZEN["02-researcher"]["sha256"],
+        FROZEN["09-test"]["sha256"],
+    }
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        links = conn.execute(
+            "SELECT parent_id, child_id FROM task_links WHERE child_id IN (?, ?)",
+            (result["task_map"]["build"], result["task_map"]["verify"]),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert [(row["parent_id"], row["child_id"]) for row in links] == [
+        (result["task_map"]["build"], result["task_map"]["verify"])
+    ]
+    assert materializer.record_materialization_intent(
+        run_id=intake["run_id"], source_task_id=ceo_id, db_path=control_db
+    )["replayed"]
+    replay = materializer.project_materialization(
+        intent["idempotency_key"],
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    assert replay == {**result, "replayed": True}
+    assert len(_implementation_rows(kanban_path)) == 2
+
+
+def test_materializer_crash_window_and_concurrency_converge(tmp_path):
+    control_db, kanban_path, _, _, board, intent = _approved_materialization(tmp_path)
+
+    class InjectedCrash(BaseException):
+        pass
+
+    def crash(_mapping):
+        raise InjectedCrash()
+
+    with pytest.raises(InjectedCrash):
+        materializer.project_materialization(
+            intent["idempotency_key"],
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+            _after_graph_created=crash,
+        )
+    assert len(_implementation_rows(kanban_path)) == 2
+    conn = controller.connect(control_db)
+    try:
+        assert conn.execute(
+            "SELECT status FROM materialization_outbox WHERE idempotency_key = ?",
+            (intent["idempotency_key"],),
+        ).fetchone()[0] == "PENDING"
+    finally:
+        conn.close()
+
+    def project(_):
+        return materializer.project_materialization(
+            intent["idempotency_key"],
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(project, range(2)))
+    assert {result["status"] for result in results} == {"DELIVERED"}
+    assert results[0]["task_map"] == results[1]["task_map"]
+    assert len(_implementation_rows(kanban_path)) == 2
+
+
+def test_materializer_rejects_wrong_board_without_partial_graph(tmp_path):
+    control_db, kanban_path, _, _, board, intent = _approved_materialization(tmp_path)
+    with pytest.raises(materializer.MaterializationError) as exc:
+        materializer.project_materialization(
+            intent["idempotency_key"],
+            board=board + "-wrong",
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "MATERIALIZATION_BOARD_MISMATCH"
+    assert _implementation_rows(kanban_path) == []
+
+
+def test_materializer_requires_frozen_implementation_profiles(tmp_path):
+    frozen = {
+        key: value
+        for key, value in FROZEN.items()
+        if key not in {"02-researcher", "09-test"}
+    }
+    control_db, kanban_path, workspaces, intake, planner_id = _setup(
+        tmp_path, frozen=frozen
+    )
+    _advance_planner(control_db, kanban_path, workspaces, intake, planner_id)
+    da = _latest_task(kanban_path, review.DA_PROFILE)
+    _write_da(Path(da["workspace_path"]), verdict="PASS")
+    _complete(kanban_path, da["id"])
+    review.reconcile_review_once(
+        intake["run_id"], db_path=control_db, kanban_db_path=kanban_path,
+        workspace_root=workspaces,
+    )
+    ceo = _latest_task(kanban_path, review.CEO_PROFILE)
+    _write_ceo(Path(ceo["workspace_path"]), decision="APPROVE")
+    _complete(kanban_path, ceo["id"])
+    review.reconcile_review_once(
+        intake["run_id"], db_path=control_db, kanban_db_path=kanban_path,
+        workspace_root=workspaces,
+    )
+    with pytest.raises(materializer.MaterializationError) as exc:
+        materializer.record_materialization_intent(
+            run_id=intake["run_id"], source_task_id=ceo["id"], db_path=control_db
+        )
+    assert exc.value.code == "IMPLEMENTATION_PROFILE_NOT_FROZEN"
+    assert _implementation_rows(kanban_path) == []
+
+
+def test_materializer_replay_rejects_dependency_drift(tmp_path):
+    control_db, kanban_path, _, _, board, intent = _approved_materialization(tmp_path)
+    result = materializer.project_materialization(
+        intent["idempotency_key"], board=board, db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (result["task_map"]["build"], result["task_map"]["verify"]),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(materializer.MaterializationError) as exc:
+        materializer.project_materialization(
+            intent["idempotency_key"], board=board, db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "PLAN_DEPENDENCY_DRIFT"
+
+
+def test_materializer_requires_approved_ceo_terminal_transition(tmp_path):
+    control_db, kanban_path, workspaces, intake, planner_id = _setup(tmp_path)
+    _advance_planner(control_db, kanban_path, workspaces, intake, planner_id)
+    da = _latest_task(kanban_path, review.DA_PROFILE)
+    _write_da(Path(da["workspace_path"]), verdict="PASS")
+    _complete(kanban_path, da["id"])
+    review.reconcile_review_once(
+        intake["run_id"], db_path=control_db, kanban_db_path=kanban_path,
+        workspace_root=workspaces,
+    )
+    ceo = _latest_task(kanban_path, review.CEO_PROFILE)
+    _write_ceo(Path(ceo["workspace_path"]), decision="NEEDS_JASON_DECISION")
+    _complete(kanban_path, ceo["id"])
+    review.reconcile_review_once(
+        intake["run_id"], db_path=control_db, kanban_db_path=kanban_path,
+        workspace_root=workspaces,
+    )
+    with pytest.raises(materializer.MaterializationError) as exc:
+        materializer.record_materialization_intent(
+            run_id=intake["run_id"], source_task_id=ceo["id"], db_path=control_db
+        )
+    assert exc.value.code == "CEO_APPROVAL_REQUIRED"
+    assert _implementation_rows(kanban_path) == []
+
+
+def test_materialization_intent_is_immutable_and_wrong_source_fails(tmp_path):
+    control_db, kanban_path, intake, _, _, intent = _approved_materialization(tmp_path)
+    conn = controller.connect(control_db)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="materialization intent is immutable"):
+            with controller._write_txn(conn):
+                conn.execute(
+                    "UPDATE materialization_outbox SET payload_json = '{}' "
+                    "WHERE idempotency_key = ?",
+                    (intent["idempotency_key"],),
+                )
+    finally:
+        conn.close()
+    da = _latest_task(kanban_path, review.DA_PROFILE)
+    with pytest.raises(materializer.MaterializationError) as exc:
+        materializer.record_materialization_intent(
+            run_id=intake["run_id"], source_task_id=da["id"], db_path=control_db
+        )
+    assert exc.value.code == "CEO_APPROVAL_NOT_FOUND"
+    assert _implementation_rows(kanban_path) == []
+
+
+def test_materializer_rejects_duplicate_semantic_task_identity(tmp_path):
+    control_db, kanban_path, _, _, board, intent = _approved_materialization(tmp_path)
+
+    class InjectedCrash(BaseException):
+        pass
+
+    with pytest.raises(InjectedCrash):
+        materializer.project_materialization(
+            intent["idempotency_key"], board=board, db_path=control_db,
+            kanban_db_path=kanban_path,
+            _after_graph_created=lambda _mapping: (_ for _ in ()).throw(InjectedCrash()),
+        )
+    rows = _implementation_rows(kanban_path)
+    build = next(row for row in rows if row["assignee"] == "02-researcher")
+    planner = _latest_task(kanban_path, controller.PLANNER_PROFILE)
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET idempotency_key = ? WHERE id = ?",
+                (build["idempotency_key"], planner["id"]),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(materializer.MaterializationError) as exc:
+        materializer.project_materialization(
+            intent["idempotency_key"], board=board, db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "DUPLICATE_MATERIALIZED_TASK"
