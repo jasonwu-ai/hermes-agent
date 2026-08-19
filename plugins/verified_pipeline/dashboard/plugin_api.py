@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from hermes_cli import kanban_db
 from hermes_cli.profiles import get_profile_dir
 from hermes_cli.role_contract import load_role_contract
-from plugins.verified_pipeline import controller
+from plugins.verified_pipeline import controller, review, validators
 
 
 router = APIRouter()
@@ -61,7 +61,12 @@ def _actor_fingerprint(request: Request) -> str:
 
 def _frozen_profile_inventory() -> dict[str, dict[str, str]]:
     receipts: dict[str, dict[str, str]] = {}
-    for profile in (controller.REVISION_PROFILE, controller.PLANNER_PROFILE):
+    for profile in (
+        controller.REVISION_PROFILE,
+        controller.PLANNER_PROFILE,
+        review.DA_PROFILE,
+        review.CEO_PROFILE,
+    ):
         contract = load_role_contract(get_profile_dir(profile), profile, required=True)
         assert contract is not None
         receipts[profile] = {
@@ -102,6 +107,8 @@ def health() -> dict[str, Any]:
         "db": str(path),
         "planner_profile": controller.PLANNER_PROFILE,
         "revision_profile": controller.REVISION_PROFILE,
+        "da_profile": review.DA_PROFILE,
+        "ceo_profile": review.CEO_PROFILE,
     }
 
 
@@ -124,7 +131,12 @@ def create_intake(body: IntakeRequest) -> dict[str, Any]:
             revision=body.revision,
             artifact_bytes=body.artifact_text.encode("utf-8"),
             frozen_profiles=frozen_profiles,
-            authority_ceiling=["plan", "revise_specification"],
+            authority_ceiling=[
+                "plan",
+                "revise_specification",
+                "adversarial_review",
+                "strategic_review",
+            ],
             board=normalized_board,
         )
     except controller.PipelineControlError as exc:
@@ -167,3 +179,22 @@ def reconcile(run_id: str) -> dict[str, Any]:
         return {"projection": controller.project_run(run_id)}
     except controller.PipelineControlError as exc:
         _raise_control(exc)
+
+
+@router.post("/intakes/{run_id}/review/reconcile")
+def reconcile_review(run_id: str) -> dict[str, Any]:
+    """Advance only admitted terminal Planner, DA, and CEO review stages."""
+    try:
+        return review.reconcile_review_once(run_id)
+    except controller.PipelineControlError as exc:
+        _raise_control(exc)
+    except review.ReviewCoordinationError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    except validators.ArtifactValidationError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "REVIEW_ARTIFACT_INVALID", "message": str(exc)},
+        ) from exc

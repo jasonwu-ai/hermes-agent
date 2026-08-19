@@ -95,9 +95,17 @@ def connect(db_path: Optional[str | os.PathLike[str]] = None) -> sqlite3.Connect
         check_same_thread=False,
     )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=30000")
+    for attempt in range(30):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == 29:
+                conn.close()
+                raise
+            time.sleep(min(0.01 * (attempt + 1), 0.1))
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
@@ -250,11 +258,16 @@ def _validate_frozen_profiles(value: Mapping[str, Mapping[str, Any]]) -> str:
 
 def _validate_authority_ceiling(value: list[str] | tuple[str, ...]) -> str:
     normalized = sorted({str(item).strip() for item in value if str(item).strip()})
-    allowed = {"plan", "revise_specification"}
+    allowed = {
+        "plan",
+        "revise_specification",
+        "adversarial_review",
+        "strategic_review",
+    }
     if not normalized or not set(normalized).issubset(allowed):
         raise PipelineControlError(
             "INVALID_AUTHORITY_CEILING",
-            "authority ceiling may contain only plan and revise_specification",
+            "authority ceiling contains an unsupported verified-pipeline capability",
         )
     return _canonical_json(normalized)
 
@@ -606,7 +619,10 @@ def _task_body(payload: Mapping[str, Any], artifact_path: Path) -> str:
     if payload["action"] == "approve":
         instruction = (
             "Produce a bounded implementation plan from the exact specification. "
-            "Do not create downstream tasks, dispatch workers, merge, deploy, or release."
+            "Read `planner-request.json`, write only `plan.md` and `plan.json`, then run "
+            "`python3 verified_pipeline_validators.py plan plan.json --request "
+            "planner-request.json > validation.md`. Do not create downstream tasks, "
+            "dispatch workers, merge, deploy, or release."
         )
     else:
         instruction = (
@@ -753,6 +769,14 @@ def project_outbox(
             artifact_bytes=artifact_bytes,
             artifact_sha256=payload["artifact_sha256"],
         )
+        if payload["action"] == "approve":
+            from plugins.verified_pipeline import review
+
+            review.prepare_initial_planner_workspace(
+                workspace=workspace,
+                artifact_path=artifact_path,
+                payload=payload,
+            )
     finally:
         control.close()
 

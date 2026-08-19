@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db
-from plugins.verified_pipeline import controller
+from plugins.verified_pipeline import controller, review
 from plugins.verified_pipeline.dashboard.plugin_api import router
 
 
@@ -39,6 +39,8 @@ def test_authenticated_surface_freezes_profiles_and_projects_one_task(tmp_path, 
     home = tmp_path / "hermes-home"
     _write_contract(home, controller.REVISION_PROFILE)
     _write_contract(home, controller.PLANNER_PROFILE)
+    _write_contract(home, review.DA_PROFILE)
+    _write_contract(home, review.CEO_PROFILE)
     kanban_path = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_path))
@@ -85,11 +87,20 @@ def test_authenticated_surface_freezes_profiles_and_projects_one_task(tmp_path, 
     )
     assert created.status_code == 200
     intake = created.json()
-    assert sorted(intake["frozen_profiles"]) == [
-        controller.REVISION_PROFILE,
-        controller.PLANNER_PROFILE,
+    assert sorted(intake["frozen_profiles"]) == sorted(
+        [
+            controller.REVISION_PROFILE,
+            controller.PLANNER_PROFILE,
+            review.DA_PROFILE,
+            review.CEO_PROFILE,
+        ]
+    )
+    assert intake["authority_ceiling"] == [
+        "adversarial_review",
+        "plan",
+        "revise_specification",
+        "strategic_review",
     ]
-    assert intake["authority_ceiling"] == ["plan", "revise_specification"]
     assert intake["board"] == kanban_db.DEFAULT_BOARD
 
     readback = client.get(f"/api/plugins/verified-pipeline/intakes/{intake['run_id']}")
@@ -116,6 +127,13 @@ def test_authenticated_surface_freezes_profiles_and_projects_one_task(tmp_path, 
     assert reconciled.status_code == 200
     assert reconciled.json()["projection"]["status"] == "DELIVERED"
     assert reconciled.json()["projection"]["task_id"] == payload["projection"]["task_id"]
+
+    review_idle = client.post(
+        f"/api/plugins/verified-pipeline/intakes/{intake['run_id']}/review/reconcile"
+    )
+    assert review_idle.status_code == 200
+    assert review_idle.json()["advanced"] == []
+    assert review_idle.json()["delivered"] == []
 
     kconn = kanban_db.connect(db_path=kanban_path)
     try:
