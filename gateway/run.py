@@ -8534,6 +8534,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         sat in _background_tasks. Fly's coarse autostop used to mask this;
         with the gateway owning the suspend it became load-bearing.
         """
+        try:
+            if max(0, int(getattr(self, "_kanban_notification_work_count", 0))) > 0:
+                return True
+        except (TypeError, ValueError):
+            # A corrupt/unreadable work source must fail awake, never suspend.
+            return True
         if any(
             not t.done() and not getattr(t, "_hermes_supervised_watcher", False)
             for t in self._background_tasks

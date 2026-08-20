@@ -176,6 +176,22 @@ class GatewayKanbanWatchersMixin:
         self._kanban_dispatcher_lock_handle = None
         _release_singleton_lock(handle)
 
+    async def _await_kanban_notification_work(self, awaitable):
+        """Keep scale-to-zero awake while one notification operation is awaited."""
+        try:
+            current = max(0, int(getattr(self, "_kanban_notification_work_count", 0)))
+        except (TypeError, ValueError):
+            current = 0
+        self._kanban_notification_work_count = current + 1
+        try:
+            return await awaitable
+        finally:
+            try:
+                current = max(0, int(getattr(self, "_kanban_notification_work_count", 1)))
+            except (TypeError, ValueError):
+                current = 1
+            self._kanban_notification_work_count = max(0, current - 1)
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -668,8 +684,8 @@ class GatewayKanbanWatchersMixin:
                             # outcome there, not by skipping the send here.
                             continue
                         try:
-                            _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                            _send_res = await self._await_kanban_notification_work(
+                                adapter.send(sub["chat_id"], msg, metadata=metadata)
                             )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
@@ -698,12 +714,14 @@ class GatewayKanbanWatchersMixin:
                             # we never spam attachments on retries.
                             if kind == "completed":
                                 try:
-                                    await self._deliver_kanban_artifacts(
-                                        adapter=adapter,
-                                        chat_id=sub["chat_id"],
-                                        metadata=metadata,
-                                        event_payload=getattr(ev, "payload", None),
-                                        task=task,
+                                    await self._await_kanban_notification_work(
+                                        self._deliver_kanban_artifacts(
+                                            adapter=adapter,
+                                            chat_id=sub["chat_id"],
+                                            metadata=metadata,
+                                            event_payload=getattr(ev, "payload", None),
+                                            task=task,
+                                        )
                                     )
                                 except Exception as art_exc:
                                     logger.debug(

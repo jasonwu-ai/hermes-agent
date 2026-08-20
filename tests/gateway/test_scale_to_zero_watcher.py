@@ -83,6 +83,36 @@ def test_bg_work_blocks_idle_via_background_tasks(monkeypatch):
         loop.close()
 
 
+@pytest.mark.asyncio
+async def test_kanban_notification_await_blocks_idle_and_cleans_up():
+    """A send/upload await must keep scale-to-zero awake, including cancellation."""
+    r = GatewayRunner.__new__(GatewayRunner)
+    r._background_tasks = set()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _delivery():
+        started.set()
+        await release.wait()
+
+    task = asyncio.create_task(r._await_kanban_notification_work(_delivery()))
+    await started.wait()
+    assert r._kanban_notification_work_count == 1
+    assert r._scale_to_zero_has_live_background_work() is True
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert r._kanban_notification_work_count == 0
+
+
+def test_malformed_kanban_notification_count_fails_awake():
+    r = GatewayRunner.__new__(GatewayRunner)
+    r._background_tasks = set()
+    r._kanban_notification_work_count = object()
+    assert r._scale_to_zero_has_live_background_work() is True
+
+
 def test_real_inbound_after_dormancy_restores_running_status(monkeypatch):
     """Once a dormant gateway receives real inbound after wake, the runtime
     lifecycle must not remain stuck in the watcher-written `draining` state."""
