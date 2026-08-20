@@ -15,11 +15,12 @@ import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import sqlite3
 import sys
 import time
 from typing import Any
+
+import psutil
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -172,26 +173,36 @@ def _terminate_worker_groups(db_path: Path) -> None:
         pid = row.get("worker_pid")
         if not pid or row["status"] not in {"running", "ready"}:
             continue
+        _terminate_process_tree(int(pid))
+
+
+def _terminate_process_tree(pid: int) -> None:
+    try:
+        process = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+    targets = process.children(recursive=True) + [process]
+    for target in targets:
         try:
-            os.killpg(int(pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+            target.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    _, alive = psutil.wait_procs(targets, timeout=5)
+    for target in alive:
+        try:
+            target.kill()
+        except psutil.NoSuchProcess:
             pass
 
 
 def _pid_alive(pid: int) -> bool:
-    stat_path = Path(f"/proc/{pid}/stat")
     try:
-        if stat_path.read_text(encoding="utf-8").split()[2] == "Z":
-            return False
-    except (FileNotFoundError, IndexError, OSError):
-        pass
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        process = psutil.Process(pid)
+        return process.status() != psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:
         return False
-    except PermissionError:
+    except psutil.AccessDenied:
         return True
-    return True
 
 
 def _drain_worker_process(pid: int | None, *, timeout_seconds: int = 30) -> None:
@@ -202,10 +213,7 @@ def _drain_worker_process(pid: int | None, *, timeout_seconds: int = 30) -> None
         if not _pid_alive(pid):
             return
         time.sleep(0.25)
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return
+    _terminate_process_tree(pid)
     raise TimeoutError(f"worker process did not exit after task completion: {pid}")
 
 
@@ -392,7 +400,9 @@ def main() -> int:
         if len(rows) != 1 or rows[0]["assignee"] != controller.PLANNER_PROFILE:
             raise RuntimeError("preflight expected exactly one Planner card")
         planner_workspace = Path(rows[0]["workspace_path"])
-        request = json.loads((planner_workspace / "planner-request.json").read_text())
+        request = json.loads(
+            (planner_workspace / "planner-request.json").read_text(encoding="utf-8")
+        )
         validators.validate_plan_request(request)
         if json.loads(rows[0]["skills"]) != [controller.PLANNER_SKILL]:
             raise RuntimeError("Planner forced skill drifted")

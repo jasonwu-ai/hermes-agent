@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 import subprocess
 import sys
+
+import psutil
 
 from scripts import run_verified_pipeline_live_governance_canary as runner
 
@@ -28,8 +29,6 @@ def test_worker_drain_waits_for_process_exit() -> None:
         runner._drain_worker_process(process.pid, timeout_seconds=3)
         assert not runner._pid_alive(process.pid)
     finally:
-        try:
-            os.killpg(process.pid, 15)
-        except ProcessLookupError:
-            pass
+        if psutil.pid_exists(process.pid):
+            psutil.Process(process.pid).terminate()
         process.wait(timeout=3)
