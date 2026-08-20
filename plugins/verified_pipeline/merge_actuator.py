@@ -82,8 +82,14 @@ def _regular_absolute_path(value: str | os.PathLike[str], *, code: str) -> Path:
 
 def _trusted_ledger_path(value: str | os.PathLike[str]) -> Path:
     path = _regular_absolute_path(value, code="ACTUATOR_DB_PATH_INVALID")
+    effective_uid = getattr(os, "geteuid", None)
+    if effective_uid is None:
+        raise MergeActuatorError(
+            "ACTUATOR_PLATFORM_UNSUPPORTED",
+            "trusted actuator ledger ownership cannot be verified on this platform",
+        )
     stat = path.stat()
-    if stat.st_uid != os.geteuid() or stat.st_nlink != 1 or stat.st_mode & 0o077:
+    if stat.st_uid != effective_uid() or stat.st_nlink != 1 or stat.st_mode & 0o077:
         raise MergeActuatorError(
             "ACTUATOR_DB_TRUST_INVALID",
             "actuator ledger must be owner-only, singly linked, and owned by this process",

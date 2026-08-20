@@ -228,6 +228,16 @@ def test_hardlinked_actuator_ledger_is_rejected_before_adapter(tmp_path):
     assert adapter.calls == []
 
 
+def test_platform_without_posix_owner_check_fails_closed(tmp_path, monkeypatch):
+    control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
+    monkeypatch.delattr(actuator.os, "geteuid")
+    adapter = FakeAdapter()
+    with pytest.raises(actuator.MergeActuatorError) as exc:
+        _consume(control_db, kanban_path, board, execution_key, scope, adapter)
+    assert exc.value.code == "ACTUATOR_PLATFORM_UNSUPPORTED"
+    assert adapter.calls == []
+
+
 def test_public_entrypoint_is_disabled_before_actuator_schema_or_adapter(tmp_path, monkeypatch):
     control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
 
