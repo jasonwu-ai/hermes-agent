@@ -213,6 +213,38 @@ def test_malformed_startup_scope_pin_rejects_before_adapter(tmp_path, monkeypatc
     assert exc.value.code == "MERGE_SCOPE_PIN_REQUIRED"
 
 
+def test_exact_startup_pins_reach_only_fake_adapter(tmp_path, monkeypatch):
+    control_db, kanban_path, board, execution_key, _ = _merge_authorized(tmp_path)
+    scope = actuator._read_untrusted_scope(
+        execution_key,
+        board=board,
+        control_db_path=control_db.resolve(),
+        kanban_db_path=kanban_path.resolve(),
+    )
+    fake_gh = tmp_path / "gh"
+    fake_gh.write_bytes(b"qualified fake gh bytes")
+    adapter = FakeAdapter()
+    monkeypatch.setattr(actuator, "GH_BINARY", fake_gh)
+    monkeypatch.setattr(actuator, "_STARTUP_ENABLE", actuator.ENABLE_TOKEN)
+    monkeypatch.setattr(actuator, "_STARTUP_SCOPE_SHA256", actuator._digest(scope))
+    monkeypatch.setattr(
+        actuator,
+        "_STARTUP_GH_SHA256",
+        actuator.hashlib.sha256(fake_gh.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setenv("GH_TOKEN", "test-only-placeholder")
+    monkeypatch.setattr(actuator, "GitHubCLIAdapter", lambda: adapter)
+
+    result = actuator.consume_exact_merge(
+        execution_key,
+        board=board,
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+    )
+    assert result["status"] == "MERGE_OBSERVED_PENDING_SIGNED_RESULT_ATTESTATION"
+    assert adapter.calls == [scope]
+
+
 def test_scope_drift_rejects_before_intent_and_adapter(tmp_path):
     control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
     drifted = {**scope, "head_sha": "9" * 40}
@@ -352,6 +384,83 @@ def test_github_adapter_constructs_exact_conditional_commands(monkeypatch):
         "merge_method=squash",
     ]
     assert result["merge_commit_sha"] == "4" * 40
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("number", 10),
+        ("state", "CLOSED"),
+        ("headRefOid", "2" * 40),
+        ("baseRefName", "release"),
+        ("mergeCommit", {"oid": "4" * 40}),
+    ],
+)
+def test_github_preflight_drift_never_reaches_merge_endpoint(monkeypatch, field, value):
+    scope = {
+        "repository": "jasonwu-ai/hermes-agent",
+        "base_ref": "main",
+        "head_sha": "1" * 40,
+        "pull_request": 9,
+        "merge_method": "squash",
+    }
+    before = {
+        "number": 9,
+        "state": "OPEN",
+        "headRefOid": "1" * 40,
+        "baseRefName": "main",
+        "mergeCommit": None,
+    }
+    before[field] = value
+    calls = []
+
+    def fake_run(self, args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, json.dumps(before), "")
+
+    monkeypatch.setattr(actuator.GitHubCLIAdapter, "_run", fake_run)
+    with pytest.raises(actuator.MergeActuatorError) as exc:
+        actuator.GitHubCLIAdapter().merge(scope)
+    assert exc.value.code == "GITHUB_PR_SCOPE_MISMATCH"
+    assert len(calls) == 1
+    assert calls[0][:2] == ["pr", "view"]
+
+
+def test_github_rest_and_postflight_commit_mismatch_fails_closed(monkeypatch):
+    scope = {
+        "repository": "jasonwu-ai/hermes-agent",
+        "base_ref": "main",
+        "head_sha": "1" * 40,
+        "pull_request": 9,
+        "merge_method": "squash",
+    }
+    responses = iter(
+        [
+            {
+                "number": 9,
+                "state": "OPEN",
+                "headRefOid": "1" * 40,
+                "baseRefName": "main",
+                "mergeCommit": None,
+            },
+            {"merged": True, "sha": "4" * 40},
+            {
+                "number": 9,
+                "state": "MERGED",
+                "headRefOid": "1" * 40,
+                "baseRefName": "main",
+                "mergeCommit": {"oid": "5" * 40},
+            },
+        ]
+    )
+
+    def fake_run(self, args):
+        return subprocess.CompletedProcess(args, 0, json.dumps(next(responses)), "")
+
+    monkeypatch.setattr(actuator.GitHubCLIAdapter, "_run", fake_run)
+    with pytest.raises(actuator.MergeActuatorError) as exc:
+        actuator.GitHubCLIAdapter().merge(scope)
+    assert exc.value.code == "GITHUB_MERGE_NOT_OBSERVED"
 
 
 def test_cli_fails_disabled_without_schema_or_external_call(tmp_path):
