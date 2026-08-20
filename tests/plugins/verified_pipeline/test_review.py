@@ -325,6 +325,7 @@ def test_straight_through_review_stops_after_ceo_approval_and_replays(tmp_path):
     assert first["advanced"][0]["status"] == "DA_REVIEW_QUEUED"
     da = _latest_task(kanban_path, review.DA_PROFILE)
     assert da["expected_role_contract_sha256"] == FROZEN[review.DA_PROFILE]["sha256"]
+    assert json.loads(da["skills"]) == [review.DA_SKILL]
 
     _write_da(Path(da["workspace_path"]), verdict="PASS")
     _complete(kanban_path, da["id"])
@@ -337,6 +338,7 @@ def test_straight_through_review_stops_after_ceo_approval_and_replays(tmp_path):
     assert second["advanced"][0]["status"] == "CEO_REVIEW_QUEUED"
     ceo = _latest_task(kanban_path, review.CEO_PROFILE)
     assert ceo["expected_role_contract_sha256"] == FROZEN[review.CEO_PROFILE]["sha256"]
+    assert json.loads(ceo["skills"]) == [review.CEO_SKILL]
 
     _write_ceo(Path(ceo["workspace_path"]), decision="APPROVE")
     _complete(kanban_path, ceo["id"])

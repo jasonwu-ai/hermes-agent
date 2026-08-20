@@ -35,13 +35,18 @@ SCHEMA_VERSION = 1
 CONTROLLER_ID = "verified-pipeline/decision-outbox/v1"
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 PLANNER_PROFILE = "07-planner"
+PLANNER_SKILL = "ordinary-planner-r3"
 REVISION_PROFILE = "00-cos"
-IMPLEMENTATION_PROFILES = (
+MANDATORY_IMPLEMENTATION_PROFILES = (
     "02-builder",
     "09-test",
-    "10-validator",
     "06-integration",
     "08-release",
+)
+OPTIONAL_IMPLEMENTATION_PROFILES = ("10-validator",)
+IMPLEMENTATION_PROFILES = (
+    *MANDATORY_IMPLEMENTATION_PROFILES,
+    *OPTIONAL_IMPLEMENTATION_PROFILES,
 )
 VALID_ACTIONS = frozenset({"approve", "request_changes"})
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -254,7 +259,7 @@ def _validate_frozen_profiles(value: Mapping[str, Mapping[str, Any]]) -> str:
         if not _SHA256_RE.fullmatch(digest) or not schema or not version:
             raise PipelineControlError("INVALID_PROFILE_INVENTORY", "profile receipt is incomplete")
         normalized[name] = {"schema": schema, "version": version, "sha256": digest}
-    for required in (PLANNER_PROFILE, REVISION_PROFILE):
+    for required in (PLANNER_PROFILE,):
         if required not in normalized:
             raise PipelineControlError(
                 "INVALID_PROFILE_INVENTORY",
@@ -491,6 +496,16 @@ def record_decision(
             decision_id = "decision_" + request_sha[:24]
             kind = "planner_intake" if action == "approve" else "specifier_revision"
             assignee = PLANNER_PROFILE if action == "approve" else REVISION_PROFILE
+            required_authority = (
+                "plan" if action == "approve" else "revise_specification"
+            )
+            frozen_profiles = json.loads(intake["frozen_profiles_json"])
+            authority_ceiling = json.loads(intake["authority_ceiling_json"])
+            if required_authority not in authority_ceiling or assignee not in frozen_profiles:
+                raise PipelineControlError(
+                    "DECISION_AUTHORITY_UNAVAILABLE",
+                    f"{action} is not admitted by this intake's frozen authority",
+                )
             idempotency_key = f"verified-pipeline:{decision_id}:{kind}"
             payload = {
                 "schema": CONTROLLER_ID,
@@ -500,8 +515,8 @@ def record_decision(
                 "specification_id": intake["specification_id"],
                 "revision": intake["revision"],
                 "artifact_sha256": intake["artifact_sha256"],
-                "frozen_profiles": json.loads(intake["frozen_profiles_json"]),
-                "authority_ceiling": json.loads(intake["authority_ceiling_json"]),
+                "frozen_profiles": frozen_profiles,
+                "authority_ceiling": authority_ceiling,
                 "board": intake["board"],
                 "assignee": assignee,
                 "feedback": feedback,
@@ -825,6 +840,7 @@ def project_outbox(
                         idempotency_key=idempotency_key,
                         max_runtime_seconds=3600,
                         max_retries=0,
+                        skills=[PLANNER_SKILL],
                         require_role_contract=True,
                         expected_role_contract_sha256=payload["frozen_profiles"][expected[1]]["sha256"],
                     )

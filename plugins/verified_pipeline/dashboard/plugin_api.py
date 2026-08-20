@@ -62,14 +62,25 @@ def _actor_fingerprint(request: Request) -> str:
 def _frozen_profile_inventory() -> dict[str, dict[str, str]]:
     receipts: dict[str, dict[str, str]] = {}
     for profile in (
-        controller.REVISION_PROFILE,
         controller.PLANNER_PROFILE,
         review.DA_PROFILE,
         review.CEO_PROFILE,
-        *controller.IMPLEMENTATION_PROFILES,
+        *controller.MANDATORY_IMPLEMENTATION_PROFILES,
     ):
         contract = load_role_contract(get_profile_dir(profile), profile, required=True)
         assert contract is not None
+        receipts[profile] = {
+            "schema": contract.schema,
+            "version": contract.version,
+            "sha256": contract.sha256,
+        }
+    for profile in (
+        controller.REVISION_PROFILE,
+        *controller.OPTIONAL_IMPLEMENTATION_PROFILES,
+    ):
+        contract = load_role_contract(get_profile_dir(profile), profile, required=False)
+        if contract is None:
+            continue
         receipts[profile] = {
             "schema": contract.schema,
             "version": contract.version,
@@ -134,9 +145,13 @@ def create_intake(body: IntakeRequest) -> dict[str, Any]:
             frozen_profiles=frozen_profiles,
             authority_ceiling=[
                 "plan",
-                "revise_specification",
                 "adversarial_review",
                 "strategic_review",
+                *(
+                    ["revise_specification"]
+                    if controller.REVISION_PROFILE in frozen_profiles
+                    else []
+                ),
             ],
             board=normalized_board,
         )

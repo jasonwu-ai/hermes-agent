@@ -89,6 +89,7 @@ def test_approve_projects_exactly_one_bounded_planner_task_and_replays(tmp_path)
     assert row["require_role_contract"] == 1
     assert row["expected_role_contract_sha256"] == FROZEN[controller.PLANNER_PROFILE]["sha256"]
     assert row["max_retries"] == 0
+    assert json.loads(row["skills"]) == [controller.PLANNER_SKILL]
     assert row["idempotency_key"] == decision["idempotency_key"]
     assert "Do not create downstream tasks" in row["body"]
     artifact_path = workspaces / intake["run_id"] / "specification.md"

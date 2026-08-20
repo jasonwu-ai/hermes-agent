@@ -22,6 +22,8 @@ from plugins.verified_pipeline import validators
 REVIEW_CONTROLLER_ID = "verified-pipeline/automatic-plan-review/v1"
 DA_PROFILE = "11-devils-advocate"
 CEO_PROFILE = "01-ceo"
+DA_SKILL = "premortem-r3"
+CEO_SKILL = "ceo-decision-r3"
 MAX_PLAN_REVISION = 3
 REVIEW_KINDS = frozenset({"planner_revision", "da_review", "ceo_review"})
 _WORKSPACE_RE = re.compile(r"^review_[0-9a-f]{24}$")
@@ -1259,6 +1261,9 @@ def project_review_outbox(
                         idempotency_key=idempotency_key,
                         max_runtime_seconds=3600,
                         max_retries=0,
+                        skills=[
+                            DA_SKILL if payload["kind"] == "da_review" else CEO_SKILL
+                        ],
                         require_role_contract=True,
                         expected_role_contract_sha256=(
                             intake["frozen_profiles"][payload["assignee"]]["sha256"]
