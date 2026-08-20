@@ -66,6 +66,7 @@ def _frozen_profile_inventory() -> dict[str, dict[str, str]]:
         controller.PLANNER_PROFILE,
         review.DA_PROFILE,
         review.CEO_PROFILE,
+        *controller.IMPLEMENTATION_PROFILES,
     ):
         contract = load_role_contract(get_profile_dir(profile), profile, required=True)
         assert contract is not None
