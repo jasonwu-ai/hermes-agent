@@ -20,6 +20,17 @@ def test_runner_uses_controller_canonical_review_workspace_root(tmp_path: Path) 
     )
 
 
+def test_runner_uses_controller_canonical_control_db_path(tmp_path: Path) -> None:
+    class Controller:
+        @staticmethod
+        def _default_db_path() -> Path:
+            return tmp_path / "plugin-data" / "verified_pipeline" / "pipeline-control.db"
+
+    assert runner._canonical_control_db_path(Controller) == (
+        tmp_path / "plugin-data" / "verified_pipeline" / "pipeline-control.db"
+    )
+
+
 def test_worker_drain_waits_for_process_exit() -> None:
     process = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(0.2)"],

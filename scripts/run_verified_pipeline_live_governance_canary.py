@@ -300,6 +300,10 @@ def _canonical_review_workspace_root(controller_module: Any) -> Path:
     return Path(controller_module._default_workspace_root())
 
 
+def _canonical_control_db_path(controller_module: Any) -> Path:
+    return Path(controller_module._default_db_path())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -356,6 +360,7 @@ def main() -> int:
         from plugins.verified_pipeline.dashboard.plugin_api import router
 
         review_root = _canonical_review_workspace_root(controller)
+        control_db_path = _canonical_control_db_path(controller)
 
         app = FastAPI()
         app.include_router(router, prefix="/api/plugins/verified-pipeline")
@@ -422,7 +427,7 @@ def main() -> int:
                 rows = _task_rows(kanban_path)
                 active = [row for row in rows if row["status"] in {"ready", "running"} and row["id"] not in processed]
                 if not active:
-                    outcome = _latest_review_outcome(controller._db_path(None), intake["run_id"])
+                    outcome = _latest_review_outcome(control_db_path, intake["run_id"])
                     if outcome in FINAL_REVIEW_STATUSES:
                         break
                     raise RuntimeError(f"controller reached quiescence without final governance outcome: {outcome}")
@@ -484,7 +489,7 @@ def main() -> int:
         if report.get("final_review_status") != "CEO_APPROVED_PENDING_MATERIALIZATION":
             raise RuntimeError(
                 "governance canary did not reach bounded CEO approval: "
-                f"{report.get('final_review_status') or _latest_review_outcome(controller._db_path(None), intake['run_id'])}"
+                f"{report.get('final_review_status') or _latest_review_outcome(control_db_path, intake['run_id'])}"
             )
         report["receipts"] = _receipt_files(output)
         report["materialized_implementation_tasks"] = 0
