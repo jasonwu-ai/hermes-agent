@@ -212,6 +212,22 @@ def test_intake_allows_optional_revision_and_validator_contracts_to_be_absent(
     )
     assert denied_revision.status_code == 409
     assert denied_revision.json()["detail"]["code"] == "DECISION_AUTHORITY_UNAVAILABLE"
+    approved = TestClient(app).post(
+        f"/api/plugins/verified-pipeline/intakes/{created.json()['run_id']}/decision",
+        headers={"user-agent": "verified-pipeline-test"},
+        json={
+            "request_id": "approval-without-optional-contracts",
+            "action": "approve",
+            "decision_nonce": created.json()["decision_nonce"],
+            "artifact_sha256": created.json()["artifact_sha256"],
+        },
+    )
+    assert approved.status_code == 200
+    review_idle = TestClient(app).post(
+        f"/api/plugins/verified-pipeline/intakes/{created.json()['run_id']}/review/reconcile"
+    )
+    assert review_idle.status_code == 200
+    assert review_idle.json()["advanced"] == []
 
 
 def test_dashboard_manifest_declares_bounded_plugin_surface():

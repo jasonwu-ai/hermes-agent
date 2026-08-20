@@ -153,7 +153,6 @@ def _intake(run_id: str, db_path: Optional[str | os.PathLike[str]]) -> dict[str,
     controller = _controller()
     intake = controller.get_intake(run_id, include_artifact=True, db_path=db_path)
     required = {
-        controller.REVISION_PROFILE,
         controller.PLANNER_PROFILE,
         DA_PROFILE,
         CEO_PROFILE,
