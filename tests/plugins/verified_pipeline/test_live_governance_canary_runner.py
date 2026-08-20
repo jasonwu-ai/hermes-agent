@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import subprocess
 import sys
 
 import psutil
+import pytest
 
 from scripts import run_verified_pipeline_live_governance_canary as runner
 
@@ -29,6 +31,33 @@ def test_runner_uses_controller_canonical_control_db_path(tmp_path: Path) -> Non
     assert runner._canonical_control_db_path(Controller) == (
         tmp_path / "plugin-data" / "verified_pipeline" / "pipeline-control.db"
     )
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX ownership and mode contract")
+def test_credential_source_requires_owner_only_regular_file(tmp_path: Path) -> None:
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text("{}", encoding="utf-8")
+    auth_path.chmod(0o600)
+
+    assert runner._validated_credential_auth(tmp_path) == auth_path
+
+    auth_path.chmod(0o640)
+    with pytest.raises(RuntimeError, match="owner-only"):
+        runner._validated_credential_auth(tmp_path)
+
+
+@pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX ownership and mode contract")
+def test_credential_source_rejects_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    auth_path = source / "auth.json"
+    auth_path.write_text("{}", encoding="utf-8")
+    auth_path.chmod(0o600)
+    linked = tmp_path / "linked"
+    os.symlink(source, linked)
+
+    with pytest.raises(RuntimeError, match="must not be a symlink"):
+        runner._validated_credential_auth(linked)
 
 
 def test_worker_drain_waits_for_process_exit() -> None:

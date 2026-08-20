@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import sys
 import time
 from typing import Any
@@ -92,7 +93,31 @@ def _copy_file(source: Path, destination: Path) -> None:
     destination.chmod(0o600)
 
 
-def _snapshot_profiles(runtime_home: Path) -> dict[str, Any]:
+def _validated_credential_auth(source_home: Path) -> Path:
+    if source_home.is_symlink():
+        raise RuntimeError("credential source home must not be a symlink")
+    auth_path = source_home / "auth.json"
+    if auth_path.is_symlink():
+        raise RuntimeError("credential source auth.json must not be a symlink")
+    try:
+        auth_stat = auth_path.stat()
+    except FileNotFoundError as exc:
+        raise RuntimeError("credential source auth.json is missing") from exc
+    if not stat.S_ISREG(auth_stat.st_mode):
+        raise RuntimeError("credential source auth.json must be a regular file")
+    if auth_stat.st_nlink != 1:
+        raise RuntimeError("credential source auth.json must have exactly one hardlink")
+    if stat.S_IMODE(auth_stat.st_mode) & 0o077:
+        raise RuntimeError("credential source auth.json must be owner-only")
+    if hasattr(os, "getuid") and auth_stat.st_uid != os.getuid():
+        raise RuntimeError("credential source auth.json must be owned by the current user")
+    return auth_path
+
+
+def _snapshot_profiles(
+    runtime_home: Path,
+    credential_auth: Path | None = None,
+) -> dict[str, Any]:
     profiles_root = runtime_home / "profiles"
     profiles_root.mkdir(parents=True, mode=0o700)
     manifest: dict[str, Any] = {"profiles": {}, "credential_files": []}
@@ -107,6 +132,11 @@ def _snapshot_profiles(runtime_home: Path) -> dict[str, Any]:
                 _copy_file(source, target / name)
                 if name in {".env", "auth.json"}:
                     manifest["credential_files"].append(str(target / name))
+        if credential_auth is not None:
+            _copy_file(credential_auth, target / "auth.json")
+            auth_target = str(target / "auth.json")
+            if auth_target not in manifest["credential_files"]:
+                manifest["credential_files"].append(auth_target)
         overlay = OVERLAYS / profile
         _copy_file(overlay / "ROLE_CONTRACT.md", target / "ROLE_CONTRACT.md")
         shutil.copytree(overlay / "skills", target / "skills")
@@ -310,6 +340,7 @@ def main() -> int:
     parser.add_argument("--task-timeout", type=int, default=900)
     parser.add_argument("--max-tasks", type=int, default=9)
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--credential-source-home", type=Path)
     args = parser.parse_args()
     output = args.output_dir.resolve()
     if output.exists() and any(output.iterdir()):
@@ -337,7 +368,15 @@ def main() -> int:
     }
     exit_code = 1
     try:
-        report["profile_snapshot"] = _snapshot_profiles(runtime_home)
+        credential_auth = None
+        if args.credential_source_home is not None:
+            source_home = args.credential_source_home.expanduser().absolute()
+            credential_auth = _validated_credential_auth(source_home)
+            report["credential_source_sha256"] = _sha256(credential_auth)
+        report["profile_snapshot"] = _snapshot_profiles(
+            runtime_home,
+            credential_auth=credential_auth,
+        )
         os.environ.update(
             {
                 "HERMES_HOME": str(runtime_home),
