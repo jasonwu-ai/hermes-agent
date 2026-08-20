@@ -190,6 +190,50 @@ def test_valid_dispatch_persists_receipt_before_spawn(board):
     assert admitted_events[0].run_id == receipt["run_id"]
 
 
+def test_completion_preserves_spawn_owned_admission_receipt(board):
+    profile = _write_profile(board)
+    raw = _write_contract(profile)
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="preserve admission",
+            assignee="builder",
+            require_role_contract=True,
+            expected_role_contract_sha256=hashlib.sha256(raw).hexdigest(),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: 4244,
+            max_in_progress=1,
+        )
+        assert result.spawned and result.spawned[0][0] == task_id
+        active = kb.get_task(conn, task_id)
+        assert active is not None and active.current_run_id is not None
+        run_id = active.current_run_id
+        admitted = kb.list_runs(conn, task_id)[-1].metadata["role_contract_admission"]
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="completed",
+            metadata={
+                "role_contract_admission": {"receipt_id": "forged"},
+                "worker_note": "preserved",
+            },
+            expected_run_id=run_id,
+        )
+        closed = kb.list_runs(conn, task_id)[-1]
+        events = kb.list_events(conn, task_id)
+
+    assert closed.outcome == "completed"
+    assert closed.metadata["role_contract_admission"] == admitted
+    assert closed.metadata["worker_note"] == "preserved"
+    assert closed.metadata["role_contract_admission"]["receipt_id"] != "forged"
+    admitted_event = next(event for event in events if event.kind == "role_contract_admitted")
+    completed_event = next(event for event in events if event.kind == "completed")
+    assert admitted_event.run_id == completed_event.run_id == run_id
+
+
 def test_decision_time_contract_digest_mismatch_blocks_before_spawn(board):
     profile = _write_profile(board)
     _write_contract(profile)

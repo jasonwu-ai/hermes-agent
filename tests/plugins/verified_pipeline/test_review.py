@@ -134,13 +134,71 @@ def _latest_task(kanban_path: Path, assignee: str):
     return max(rows, key=lambda row: (revision(row), row["id"]))
 
 
+def _admit_fixture_run(conn, task_id: str) -> tuple[object, int]:
+    task = kanban_db.claim_task(conn, task_id, claimer="review-test")
+    assert task is not None and task.current_run_id is not None
+    if task.workspace_kind == "worktree" and not task.workspace_path:
+        # Unit fixtures do not need to materialize a Git branch; completion
+        # custody only requires the same persisted absolute workspace identity.
+        workspace_path = kanban_db.workspaces_root() / task.id
+        workspace_path.mkdir(parents=True, exist_ok=True)
+    else:
+        workspace_path = kanban_db.resolve_workspace(task)
+    kanban_db.set_workspace_path(conn, task.id, workspace_path)
+    task = kanban_db.get_task(conn, task.id)
+    assert task is not None
+    run_id = int(task.current_run_id)
+    workspace = str(Path(task.workspace_path).resolve()) if task.workspace_path else None
+    basis = {
+        "schema": "hermes-role-contract/v2",
+        "profile": task.assignee,
+        "version": "1.0.0",
+        "contract_sha256": task.expected_role_contract_sha256,
+        "configured_toolsets": [],
+        "allowed_toolsets": [],
+        "allowed_tools": [],
+        "workspace_only": False,
+        "mandatory_toolsets": ["kanban"],
+        "effective_toolsets": ["kanban"],
+        "task_id": task.id,
+        "run_id": run_id,
+        "workspace_path": workspace,
+    }
+    receipt = {
+        **basis,
+        "contract_size": 1,
+        "contract_path": f"/fixture/{task.assignee}/ROLE_CONTRACT.md",
+        "receipt_id": hashlib.sha256(
+            json.dumps(basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+    with kanban_db.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ? AND task_id = ?",
+            (json.dumps({"role_contract_admission": receipt}), run_id, task.id),
+        )
+        kanban_db._append_event(
+            conn,
+            task.id,
+            "role_contract_admitted",
+            receipt,
+            run_id=run_id,
+        )
+    return task, run_id
+
+
 def _complete(kanban_path: Path, task_id: str) -> None:
     conn = kanban_db.connect(db_path=kanban_path)
     try:
+        task_row, run_id = _admit_fixture_run(conn, task_id)
+        artifact = Path(task_row.workspace_path) / "stage-output.txt"
+        artifact.write_text(f"verified stage output for {task_id}\n", encoding="utf-8")
         assert kanban_db.complete_task(
             conn,
             task_id,
             result="task-local review artifacts complete",
+            metadata={"artifacts": [str(artifact)]},
+            expected_run_id=run_id,
             fire_lifecycle_hook=False,
         )
     finally:
@@ -150,11 +208,13 @@ def _complete(kanban_path: Path, task_id: str) -> None:
 def _block(kanban_path: Path, task_id: str) -> None:
     conn = kanban_db.connect(db_path=kanban_path)
     try:
+        _task_row, run_id = _admit_fixture_run(conn, task_id)
         assert kanban_db.block_task(
             conn,
             task_id,
             reason="typed DA verdict requires bounded revision",
             kind="needs_input",
+            expected_run_id=run_id,
         )
     finally:
         conn.close()
@@ -325,6 +385,7 @@ def test_straight_through_review_stops_after_ceo_approval_and_replays(tmp_path):
     assert first["advanced"][0]["status"] == "DA_REVIEW_QUEUED"
     da = _latest_task(kanban_path, review.DA_PROFILE)
     assert da["expected_role_contract_sha256"] == FROZEN[review.DA_PROFILE]["sha256"]
+    assert json.loads(da["skills"]) == [review.DA_SKILL]
 
     _write_da(Path(da["workspace_path"]), verdict="PASS")
     _complete(kanban_path, da["id"])
@@ -337,6 +398,7 @@ def test_straight_through_review_stops_after_ceo_approval_and_replays(tmp_path):
     assert second["advanced"][0]["status"] == "CEO_REVIEW_QUEUED"
     ceo = _latest_task(kanban_path, review.CEO_PROFILE)
     assert ceo["expected_role_contract_sha256"] == FROZEN[review.CEO_PROFILE]["sha256"]
+    assert json.loads(ceo["skills"]) == [review.CEO_SKILL]
 
     _write_ceo(Path(ceo["workspace_path"]), decision="APPROVE")
     _complete(kanban_path, ceo["id"])
@@ -385,6 +447,7 @@ def test_da_revise_projects_one_bounded_planner_correction(tmp_path):
     assert correction["expected_role_contract_sha256"] == FROZEN[
         controller.PLANNER_PROFILE
     ]["sha256"]
+    assert json.loads(correction["skills"]) == [controller.PLANNER_SKILL]
     correction_workspace = Path(correction["workspace_path"])
     request = json.loads(
         (correction_workspace / "planner-request.json").read_text(encoding="utf-8")
@@ -649,6 +712,68 @@ def test_task_workspace_drift_blocks_admission_before_successor(tmp_path):
     assert not [row for row in _tasks(kanban_path) if row["assignee"] == review.CEO_PROFILE]
 
 
+def test_missing_terminal_admission_receipt_blocks_governance_successor(tmp_path):
+    control_db, kanban_path, workspaces, intake, planner_id = _setup(tmp_path)
+    planner = _task(kanban_path, planner_id)
+    assert planner is not None
+    _write_plan(Path(planner.workspace_path))
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        assert kanban_db.complete_task(
+            conn,
+            planner_id,
+            result="manual completion without admitted run",
+            fire_lifecycle_hook=False,
+        )
+    finally:
+        conn.close()
+
+    with pytest.raises(review.ReviewCoordinationError) as exc:
+        review.submit_planner_completion(
+            run_id=intake["run_id"],
+            task_id=planner_id,
+            kind="planner_intake",
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+            workspace_root=workspaces,
+        )
+    assert exc.value.code == "REVIEW_RUN_IDENTITY_MISMATCH"
+
+
+def test_tampered_terminal_admission_receipt_blocks_governance_successor(tmp_path):
+    control_db, kanban_path, workspaces, intake, planner_id = _setup(tmp_path)
+    planner = _task(kanban_path, planner_id)
+    assert planner is not None
+    _write_plan(Path(planner.workspace_path))
+    _complete(kanban_path, planner_id)
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        run = conn.execute(
+            "SELECT id, metadata FROM task_runs WHERE task_id = ? AND outcome = 'completed'",
+            (planner_id,),
+        ).fetchone()
+        metadata = json.loads(run["metadata"])
+        metadata["role_contract_admission"]["workspace_path"] = str(tmp_path / "escaped")
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata), run["id"]),
+            )
+    finally:
+        conn.close()
+
+    with pytest.raises(review.ReviewCoordinationError) as exc:
+        review.submit_planner_completion(
+            run_id=intake["run_id"],
+            task_id=planner_id,
+            kind="planner_intake",
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+            workspace_root=workspaces,
+        )
+    assert exc.value.code == "REVIEW_RUN_RECEIPT_MISMATCH"
+
+
 def test_review_projection_stays_on_frozen_board_without_explicit_db_path(
     tmp_path, monkeypatch
 ):
@@ -696,10 +821,12 @@ def test_review_projection_stays_on_frozen_board_without_explicit_db_path(
         task = kanban_db.get_task(frozen, projected["task_id"])
         assert task is not None
         _write_plan(Path(task.workspace_path))
+        _task_row, run_id = _admit_fixture_run(frozen, task.id)
         assert kanban_db.complete_task(
             frozen,
             task.id,
             result="bounded plan complete",
+            expected_run_id=run_id,
             fire_lifecycle_hook=False,
         )
     finally:
@@ -1396,10 +1523,100 @@ def test_execution_completion_requires_all_bound_tasks_done(tmp_path):
     assert receipt["run_id"] == intake["run_id"]
     assert receipt["final_task_id"] == projected["task_map"]["verify"]
     assert set(receipt["task_results"]) == {"build", "verify"}
+    for stage in receipt["task_results"].values():
+        stage_receipt = stage["stage_receipt"]
+        assert stage_receipt["task_id"] == stage["task_id"]
+        assert stage_receipt["run_id"] > 0
+        assert len(stage_receipt["role_contract_sha256"]) == 64
+        assert len(stage_receipt["admission_receipt_id"]) == 64
+        assert stage_receipt["artifacts"]
+        for artifact in stage_receipt["artifacts"]:
+            assert artifact["source_run_id"] == stage_receipt["run_id"]
+            assert len(artifact["sha256"]) == 64
+            assert artifact["size"] > 0
     assert execution.record_execution_completion(
         intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
         kanban_db_path=kanban_path,
     ) == {**receipt, "replayed": True}
+
+
+def test_execution_completion_rejects_missing_stage_receipt(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    _complete(kanban_path, projected["task_map"]["build"])
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        assert kanban_db.complete_task(
+            conn,
+            projected["task_map"]["verify"],
+            result="unadmitted direct completion",
+            fire_lifecycle_hook=False,
+        )
+    finally:
+        conn.close()
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db, kanban_db_path=kanban_path,
+        )
+    assert exc.value.code in {
+        "EXECUTION_STAGE_RUN_MISMATCH",
+        "EXECUTION_STAGE_RECEIPT_MISSING",
+    }
+
+
+def test_execution_completion_rejects_artifact_byte_drift(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    _complete(kanban_path, projected["task_map"]["build"])
+    _complete(kanban_path, projected["task_map"]["verify"])
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        attachment = conn.execute(
+            "SELECT stored_path FROM task_attachments WHERE task_id = ? AND source_run_id IS NOT NULL",
+            (projected["task_map"]["build"],),
+        ).fetchone()
+        assert attachment is not None
+    finally:
+        conn.close()
+    Path(attachment["stored_path"]).write_bytes(b"tampered after custody\n")
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db, kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_ARTIFACT_DRIFT"
+
+
+def test_execution_completion_rejects_terminal_profile_drift(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    _complete(kanban_path, projected["task_map"]["build"])
+    _complete(kanban_path, projected["task_map"]["verify"])
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET profile = 'attacker' WHERE task_id = ? AND status = 'done'",
+                (projected["task_map"]["build"],),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db, kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_STAGE_RUN_MISMATCH"
 
 
 def test_execution_rejects_tampered_arm_receipts_on_replay_and_completion(tmp_path):
@@ -1993,6 +2210,27 @@ def test_release_boundary_rejects_first_writer_and_preinserted_policy(tmp_path):
     with pytest.raises(release.ReleaseBoundaryError) as exc:
         release.init_release_schema(control_db)
     assert exc.value.code == "RELEASE_AUTHORITY_POLICY_PIN_MISMATCH"
+
+
+def test_safe_file_rejects_inode_swap_between_lstat_and_open(tmp_path, monkeypatch):
+    artifact = tmp_path / "artifact.json"
+    replacement = tmp_path / "replacement.json"
+    artifact.write_bytes(b"authoritative")
+    replacement.write_bytes(b"replacement")
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == artifact and not swapped:
+            swapped = True
+            os.replace(replacement, artifact)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(review.os, "open", swapping_open)
+    with pytest.raises(review.ReviewCoordinationError) as exc:
+        review._safe_file(artifact, "test artifact")
+    assert exc.value.code == "REVIEW_ARTIFACT_CUSTODY_MISMATCH"
 
 
 def test_release_boundary_rejects_signed_wrong_completion_predecessor(tmp_path):

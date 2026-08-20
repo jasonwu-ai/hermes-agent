@@ -48,10 +48,29 @@ from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
+    extract_persisted_path,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
+    """Tell the stall guards where a persisted result's full content lives.
+
+    When a large result is spilled to disk (<persisted-output> preview), a
+    later result-reference stub pointing at that first occurrence must carry
+    the spillover file path so the reference can't dangle. Best-effort: never
+    lets bookkeeping break tool execution.
+    """
+    try:
+        if not isinstance(function_result, str):
+            return
+        path = extract_persisted_path(function_result)
+        if path:
+            agent._tool_guardrails.record_persisted_result(tool_call_id, path)
+    except Exception as exc:
+        logger.debug("persisted-path record for result stub failed: %s", exc)
 
 
 def _ensure_file_checkpoint(
@@ -159,6 +178,70 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
         },
         ensure_ascii=False,
     )
+
+
+def _role_contract_tool_block(function_name: str, function_args: dict) -> Optional[str]:
+    """Enforce receipt-pinned per-tool, task, and workspace authority."""
+    raw_allowed = os.environ.get("HERMES_ROLE_CONTRACT_ALLOWED_TOOLS")
+    if not raw_allowed:
+        return None
+    try:
+        allowed = json.loads(raw_allowed)
+    except json.JSONDecodeError:
+        return "role-contract allowed-tools policy is malformed"
+    if not isinstance(allowed, list) or not all(isinstance(item, str) for item in allowed):
+        return "role-contract allowed-tools policy is malformed"
+    if function_name not in allowed:
+        return f"tool {function_name!r} is outside the admitted role contract"
+
+    current_task = os.environ.get("HERMES_KANBAN_TASK")
+    if function_name.startswith("kanban_") and current_task:
+        requested_task = function_args.get("task_id")
+        if requested_task is not None and str(requested_task) != current_task:
+            return "role-contract Kanban action is limited to the current task"
+        current_board = os.environ.get("HERMES_KANBAN_BOARD")
+        requested_board = function_args.get("board")
+        if (
+            current_board
+            and requested_board is not None
+            and str(requested_board) != current_board
+        ):
+            return "role-contract Kanban action is limited to the admitted board"
+
+    if os.environ.get("HERMES_ROLE_CONTRACT_WORKSPACE_ONLY") != "1":
+        return None
+    workspace_text = os.environ.get("HERMES_ROLE_CONTRACT_WORKSPACE_PATH")
+    if not workspace_text:
+        return "workspace-only role contract has no admitted workspace"
+    workspace = Path(workspace_text).expanduser().resolve()
+    if function_name == "patch" and function_args.get("mode") == "patch":
+        return "workspace-only role contracts do not admit multi-file patch payloads"
+    path_values: list[str] = []
+    for key in ("path", "workdir", "output_path"):
+        value = function_args.get(key)
+        if isinstance(value, str) and value.strip():
+            path_values.append(value)
+    artifacts = function_args.get("artifacts")
+    if isinstance(artifacts, str):
+        path_values.append(artifacts)
+    elif isinstance(artifacts, (list, tuple)):
+        path_values.extend(str(value) for value in artifacts)
+    metadata = function_args.get("metadata")
+    if isinstance(metadata, dict):
+        nested_artifacts = metadata.get("artifacts")
+        if isinstance(nested_artifacts, str):
+            path_values.append(nested_artifacts)
+        elif isinstance(nested_artifacts, (list, tuple)):
+            path_values.extend(str(value) for value in nested_artifacts)
+    for value in path_values:
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        try:
+            candidate.resolve().relative_to(workspace)
+        except (OSError, ValueError):
+            return f"path {value!r} escapes the admitted role-contract workspace"
+    return None
 
 
 def _resolve_concurrent_tool_timeout() -> float | None:
@@ -600,6 +683,10 @@ def _run_agent_tool_execution_middleware(
         block_message = scope_block
         block_error_type = "tool_scope_block"
         if block_message is None:
+            block_message = _role_contract_tool_block(function_name, final_args)
+            if block_message is not None:
+                block_error_type = "role_contract_block"
+        if block_message is None:
             block_error_type = "plugin_block"
 
             def _resolve_pre_tool_block():
@@ -630,6 +717,11 @@ def _run_agent_tool_execution_middleware(
                 if authorization_gate is None
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
+
+        if block_message is None:
+            block_message = _role_contract_tool_block(function_name, final_args)
+            if block_message is not None:
+                block_error_type = "role_contract_block"
 
         guardrail_decision = None
         if block_message is None:
@@ -690,6 +782,9 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
+            final_block = _role_contract_tool_block(function_name, final_args)
+            if final_block is not None:
+                return json.dumps({"error": final_block}, ensure_ascii=False)
             return execute(final_args)
         finally:
             _hb_stop.set()
@@ -1733,6 +1828,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     function_args,
                     function_result,
                     failed=is_error,
+                    tool_call_id=getattr(tc, "id", "") or "",
                 )
 
             if is_error:
@@ -1767,6 +1863,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             env=get_active_env(effective_task_id),
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
+        _record_persisted_path_for_stub(agent, tc.id, function_result)
 
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
         if subdir_hints:
@@ -2181,6 +2278,57 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_preview', function_args, tool_duration, result=function_result)}")
+        elif function_name == "drive_preview":
+            def _execute(next_args: dict) -> Any:
+                from tools.drive_preview_tool import drive_preview_tool as _drive_preview_tool
+                return _drive_preview_tool(
+                    action=next_args.get("action", ""),
+                    ref=next_args.get("ref"),
+                    selector=next_args.get("selector"),
+                    text=next_args.get("text"),
+                    key=next_args.get("key"),
+                    submit=next_args.get("submit"),
+                    amount=next_args.get("amount"),
+                    to=next_args.get("to"),
+                    limit=next_args.get("max"),
+                    callback=getattr(agent, "drive_preview_callback", None),
+                )
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('drive_preview', function_args, tool_duration, result=function_result)}")
+        elif function_name == "annotate_preview":
+            def _execute(next_args: dict) -> Any:
+                from tools.annotate_preview_tool import annotate_preview_tool as _annotate_preview_tool
+                return _annotate_preview_tool(
+                    action=next_args.get("action", "add"),
+                    ref=next_args.get("ref"),
+                    selector=next_args.get("selector"),
+                    label=next_args.get("label"),
+                    callback=getattr(agent, "drive_preview_callback", None),
+                )
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+                scope_block=_ts_scope_block,
+                display_index=i,
+            ))
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('annotate_preview', function_args, tool_duration, result=function_result)}")
         elif function_name == "read_window_below":
             def _execute(next_args: dict) -> Any:
                 from tools.read_window_tool import read_window_below_tool as _read_window_below_tool
@@ -2572,6 +2720,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_args,
                 function_result,
                 failed=_is_error_result,
+                tool_call_id=getattr(tool_call, "id", "") or "",
             )
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -2610,6 +2759,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             env=get_active_env(effective_task_id),
             config=_tool_budget,
         ) if not _is_multimodal_tool_result(function_result) else function_result
+        _record_persisted_path_for_stub(agent, tool_call.id, function_result)
 
         # Discover subdirectory context files from tool arguments
         subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)

@@ -133,6 +133,45 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_rejects_nested_metadata_artifacts(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(
+        kt._handle_complete({
+            "summary": "attempt trusted-reader escape",
+            "metadata": {"artifacts": ["/tmp/outside-workspace-secret"]},
+        })
+    )
+    assert "metadata.artifacts is not accepted" in out["error"]
+
+
+def test_role_contract_completion_stamps_restricted_delivery_event(
+    worker_env, monkeypatch
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_ROLE_CONTRACT_ALLOWED_TOOLS", '["kanban_complete"]')
+    out = json.loads(
+        kt._handle_complete({
+            "summary": "completed /tmp/outside-summary.txt",
+            "result": "/tmp/outside-result.txt",
+        })
+    )
+    assert out["ok"] is True
+
+    conn = kb.connect()
+    try:
+        completed = [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "completed"
+        ]
+        assert len(completed) == 1
+        assert completed[0].payload["restricted_artifact_delivery"] is True
+    finally:
+        conn.close()
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the

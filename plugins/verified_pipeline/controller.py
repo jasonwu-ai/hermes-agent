@@ -35,13 +35,18 @@ SCHEMA_VERSION = 1
 CONTROLLER_ID = "verified-pipeline/decision-outbox/v1"
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 PLANNER_PROFILE = "07-planner"
+PLANNER_SKILL = "ordinary-planner-r3"
 REVISION_PROFILE = "00-cos"
-IMPLEMENTATION_PROFILES = (
+MANDATORY_IMPLEMENTATION_PROFILES = (
     "02-builder",
     "09-test",
-    "10-validator",
     "06-integration",
     "08-release",
+)
+OPTIONAL_IMPLEMENTATION_PROFILES = ("10-validator",)
+IMPLEMENTATION_PROFILES = (
+    *MANDATORY_IMPLEMENTATION_PROFILES,
+    *OPTIONAL_IMPLEMENTATION_PROFILES,
 )
 VALID_ACTIONS = frozenset({"approve", "request_changes"})
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -254,7 +259,7 @@ def _validate_frozen_profiles(value: Mapping[str, Mapping[str, Any]]) -> str:
         if not _SHA256_RE.fullmatch(digest) or not schema or not version:
             raise PipelineControlError("INVALID_PROFILE_INVENTORY", "profile receipt is incomplete")
         normalized[name] = {"schema": schema, "version": version, "sha256": digest}
-    for required in (PLANNER_PROFILE, REVISION_PROFILE):
+    for required in (PLANNER_PROFILE,):
         if required not in normalized:
             raise PipelineControlError(
                 "INVALID_PROFILE_INVENTORY",
@@ -491,6 +496,16 @@ def record_decision(
             decision_id = "decision_" + request_sha[:24]
             kind = "planner_intake" if action == "approve" else "specifier_revision"
             assignee = PLANNER_PROFILE if action == "approve" else REVISION_PROFILE
+            required_authority = (
+                "plan" if action == "approve" else "revise_specification"
+            )
+            frozen_profiles = json.loads(intake["frozen_profiles_json"])
+            authority_ceiling = json.loads(intake["authority_ceiling_json"])
+            if required_authority not in authority_ceiling or assignee not in frozen_profiles:
+                raise PipelineControlError(
+                    "DECISION_AUTHORITY_UNAVAILABLE",
+                    f"{action} is not admitted by this intake's frozen authority",
+                )
             idempotency_key = f"verified-pipeline:{decision_id}:{kind}"
             payload = {
                 "schema": CONTROLLER_ID,
@@ -500,8 +515,8 @@ def record_decision(
                 "specification_id": intake["specification_id"],
                 "revision": intake["revision"],
                 "artifact_sha256": intake["artifact_sha256"],
-                "frozen_profiles": json.loads(intake["frozen_profiles_json"]),
-                "authority_ceiling": json.loads(intake["authority_ceiling_json"]),
+                "frozen_profiles": frozen_profiles,
+                "authority_ceiling": authority_ceiling,
                 "board": intake["board"],
                 "assignee": assignee,
                 "feedback": feedback,
@@ -566,7 +581,50 @@ def _read_custodied_file(path: Path) -> bytes:
             "ARTIFACT_CUSTODY_MISMATCH",
             "materialized specification must not be group/world-writable",
         )
-    return path.read_bytes()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise PipelineControlError(
+            "ARTIFACT_CUSTODY_MISMATCH",
+            "materialized specification could not be opened safely",
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise PipelineControlError(
+                "ARTIFACT_CUSTODY_MISMATCH",
+                "materialized specification changed type while opening",
+            )
+        if opened.st_mode & 0o022:
+            raise PipelineControlError(
+                "ARTIFACT_CUSTODY_MISMATCH",
+                "materialized specification became group/world-writable while opening",
+            )
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise PipelineControlError(
+                "ARTIFACT_CUSTODY_MISMATCH",
+                "materialized specification changed while opening",
+            )
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(raw) != opened.st_size:
+        raise PipelineControlError(
+            "ARTIFACT_CUSTODY_MISMATCH",
+            "materialized specification changed while reading",
+        )
+    return raw
 
 
 def _safe_workspace(
@@ -606,7 +664,15 @@ def _safe_workspace(
                     handle.write(artifact_bytes)
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.replace(tmp, artifact_path)
+                try:
+                    os.link(tmp, artifact_path, follow_symlinks=False)
+                except FileExistsError:
+                    existing = _read_custodied_file(artifact_path)
+                    if _sha256(existing) != artifact_sha256:
+                        raise PipelineControlError(
+                            "ARTIFACT_CUSTODY_MISMATCH",
+                            "concurrent specification custody bytes do not match the decision",
+                        )
             finally:
                 if tmp.exists():
                     tmp.unlink()
@@ -825,6 +891,7 @@ def project_outbox(
                         idempotency_key=idempotency_key,
                         max_runtime_seconds=3600,
                         max_retries=0,
+                        skills=[PLANNER_SKILL],
                         require_role_contract=True,
                         expected_role_contract_sha256=payload["frozen_profiles"][expected[1]]["sha256"],
                     )

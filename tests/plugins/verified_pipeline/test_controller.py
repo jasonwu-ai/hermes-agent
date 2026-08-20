@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -89,6 +91,7 @@ def test_approve_projects_exactly_one_bounded_planner_task_and_replays(tmp_path)
     assert row["require_role_contract"] == 1
     assert row["expected_role_contract_sha256"] == FROZEN[controller.PLANNER_PROFILE]["sha256"]
     assert row["max_retries"] == 0
+    assert json.loads(row["skills"]) == [controller.PLANNER_SKILL]
     assert row["idempotency_key"] == decision["idempotency_key"]
     assert "Do not create downstream tasks" in row["body"]
     artifact_path = workspaces / intake["run_id"] / "specification.md"
@@ -186,6 +189,29 @@ def test_concurrent_projection_creates_exactly_one_task(tmp_path):
     assert {item["status"] for item in receipts} == {"DELIVERED"}
     assert len({item["task_id"] for item in receipts}) == 1
     assert len(_tasks(kanban_path)) == 1
+
+
+def test_concurrent_specification_custody_installs_without_overwrite(tmp_path):
+    root = tmp_path / "workspaces"
+    digest = hashlib.sha256(ARTIFACT).hexdigest()
+
+    def publish(_):
+        return controller._safe_workspace(
+            workspace_root=root,
+            run_id="run_0123456789abcdef01234567",
+            artifact_bytes=ARTIFACT,
+            artifact_sha256=digest,
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(pool.map(publish, range(24)))
+
+    artifact_paths = {artifact for _, artifact in results}
+    assert len(artifact_paths) == 1
+    artifact_path = artifact_paths.pop()
+    assert artifact_path.read_bytes() == ARTIFACT
+    assert artifact_path.stat().st_nlink == 1
+    assert not list(artifact_path.parent.glob(".specification.*.tmp"))
 
 
 def test_programming_error_is_not_hidden_as_replayable_outage(tmp_path, monkeypatch):
@@ -410,3 +436,24 @@ def test_preexisting_workspace_bytes_must_match_canonical_artifact(tmp_path):
         )
     assert exc.value.code == "ARTIFACT_CUSTODY_MISMATCH"
     assert not (tmp_path / "kanban.db").exists()
+
+
+def test_custodied_file_rejects_inode_swap_between_lstat_and_open(tmp_path, monkeypatch):
+    artifact = tmp_path / "specification.md"
+    replacement = tmp_path / "replacement.md"
+    artifact.write_bytes(ARTIFACT)
+    replacement.write_bytes(b"replacement")
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == artifact and not swapped:
+            swapped = True
+            os.replace(replacement, artifact)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(controller.os, "open", swapping_open)
+    with pytest.raises(controller.PipelineControlError) as exc:
+        controller._read_custodied_file(artifact)
+    assert exc.value.code == "ARTIFACT_CUSTODY_MISMATCH"

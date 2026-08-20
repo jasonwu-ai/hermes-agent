@@ -635,6 +635,54 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+def test_complete_task_persists_worktree_artifacts_with_run_lineage(
+    kanban_home, tmp_path
+):
+    workspace = tmp_path / "implementation-worktree"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="build candidate",
+            workspace_kind="worktree",
+            workspace_path=str(workspace),
+        )
+        artifact = workspace / "candidate.bin"
+        artifact.write_bytes(b"candidate-bytes")
+        claimed = kb.claim_task(conn, task_id, claimer="builder")
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="candidate complete",
+            metadata={"artifacts": [str(artifact)]},
+            expected_run_id=run_id,
+            fire_lifecycle_hook=False,
+        )
+        attachment = kb.list_attachments(conn, task_id)[0]
+        completed = [
+            event for event in kb.list_events(conn, task_id) if event.kind == "completed"
+        ][-1]
+
+    persisted = Path(attachment.stored_path)
+    assert persisted.read_bytes() == b"candidate-bytes"
+    assert attachment.sha256 == hashlib.sha256(b"candidate-bytes").hexdigest()
+    assert attachment.source_run_id == run_id
+    assert completed.run_id == run_id
+    assert completed.payload["artifact_manifest"] == [
+        {
+            "filename": attachment.filename,
+            "size": attachment.size,
+            "sha256": attachment.sha256,
+            "source_run_id": run_id,
+            "artifact_role": "candidate.bin",
+            "capture_key": attachment.capture_key,
+        }
+    ]
+
+
 def _complete_parent_output(conn, filename="candidate.html", payload=b"candidate"):
     parent_id = kb.create_task(conn, title="builder output", workspace_kind="scratch")
     parent = kb.get_task(conn, parent_id)

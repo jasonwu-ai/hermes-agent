@@ -22,6 +22,8 @@ from plugins.verified_pipeline import validators
 REVIEW_CONTROLLER_ID = "verified-pipeline/automatic-plan-review/v1"
 DA_PROFILE = "11-devils-advocate"
 CEO_PROFILE = "01-ceo"
+DA_SKILL = "premortem-r3"
+CEO_SKILL = "ceo-decision-r3"
 MAX_PLAN_REVISION = 3
 REVIEW_KINDS = frozenset({"planner_revision", "da_review", "ceo_review"})
 _WORKSPACE_RE = re.compile(r"^review_[0-9a-f]{24}$")
@@ -151,7 +153,6 @@ def _intake(run_id: str, db_path: Optional[str | os.PathLike[str]]) -> dict[str,
     controller = _controller()
     intake = controller.get_intake(run_id, include_artifact=True, db_path=db_path)
     required = {
-        controller.REVISION_PROFILE,
         controller.PLANNER_PROFILE,
         DA_PROFILE,
         CEO_PROFILE,
@@ -187,7 +188,50 @@ def _safe_file(path: Path, label: str) -> bytes:
             "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
             f"{label} must not be group/world-writable",
         )
-    return path.read_bytes()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ReviewCoordinationError(
+            "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
+            f"{label} could not be opened safely",
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ReviewCoordinationError(
+                "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
+                f"{label} changed type while opening",
+            )
+        if opened.st_mode & 0o022:
+            raise ReviewCoordinationError(
+                "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
+                f"{label} became group/world-writable while opening",
+            )
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ReviewCoordinationError(
+                "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
+                f"{label} changed while opening",
+            )
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(raw) != opened.st_size:
+        raise ReviewCoordinationError(
+            "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
+            f"{label} changed while reading",
+        )
+    return raw
 
 
 def _write_exact(path: Path, raw: bytes, label: str) -> None:
@@ -205,7 +249,12 @@ def _write_exact(path: Path, raw: bytes, label: str) -> None:
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        try:
+            # Install only if absent. Unlike os.replace(), this never swaps the
+            # inode beneath a concurrent custody reader.
+            os.link(tmp, path, follow_symlinks=False)
+        except FileExistsError:
+            pass
     finally:
         if tmp.exists():
             tmp.unlink()
@@ -473,6 +522,101 @@ def _verify_task(
     return task
 
 
+def _verify_terminal_run(
+    *,
+    task_id: str,
+    expected_assignee: str,
+    expected_workspace: Path,
+    expected_contract: Mapping[str, Any],
+    terminal_status: str,
+    kanban_db_path: Optional[str | os.PathLike[str]],
+    board_name: Optional[str],
+) -> dict[str, Any]:
+    event_kind = "completed" if terminal_status == "done" else "blocked"
+    expected_outcome = "completed" if terminal_status == "done" else "blocked"
+    conn = _kanban_connection(kanban_db_path, board_name)
+    try:
+        events = conn.execute(
+            "SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id DESC LIMIT 2",
+            (task_id, event_kind),
+        ).fetchall()
+        if len(events) != 1 or events[0]["run_id"] is None:
+            raise ReviewCoordinationError(
+                "REVIEW_RUN_RECEIPT_MISSING",
+                "governance task has no unambiguous terminal run receipt",
+            )
+        run_id = int(events[0]["run_id"])
+        run = conn.execute(
+            "SELECT profile, status, outcome, ended_at, metadata FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        admitted_events = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'role_contract_admitted' ORDER BY id",
+            (task_id, run_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    if (
+        run is None
+        or run["profile"] != expected_assignee
+        or run["status"] != terminal_status
+        or run["outcome"] != expected_outcome
+        or run["ended_at"] is None
+    ):
+        raise ReviewCoordinationError(
+            "REVIEW_RUN_IDENTITY_MISMATCH",
+            "terminal run does not match the admitted governance stage",
+        )
+    try:
+        metadata = json.loads(run["metadata"] or "{}")
+        receipt = metadata["role_contract_admission"]
+        admitted_receipt = json.loads(admitted_events[0]["payload"])
+        basis = {
+            "schema": receipt["schema"],
+            "profile": receipt["profile"],
+            "version": receipt["version"],
+            "contract_sha256": receipt["contract_sha256"],
+            "configured_toolsets": receipt["configured_toolsets"],
+            "allowed_toolsets": receipt["allowed_toolsets"],
+            "allowed_tools": receipt["allowed_tools"],
+            "workspace_only": receipt["workspace_only"],
+            "mandatory_toolsets": receipt["mandatory_toolsets"],
+            "effective_toolsets": receipt["effective_toolsets"],
+            "task_id": receipt["task_id"],
+            "run_id": receipt["run_id"],
+            "workspace_path": receipt["workspace_path"],
+        }
+        computed_receipt_id = hashlib.sha256(
+            json.dumps(basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ReviewCoordinationError(
+            "REVIEW_RUN_RECEIPT_INVALID",
+            "terminal run admission receipt is missing or malformed",
+        ) from exc
+    expected_workspace_text = str(expected_workspace)
+    if (
+        len(admitted_events) != 1
+        or admitted_receipt != receipt
+        or receipt.get("receipt_id") != computed_receipt_id
+        or receipt.get("task_id") != task_id
+        or receipt.get("run_id") != run_id
+        or receipt.get("profile") != expected_assignee
+        or receipt.get("workspace_path") != expected_workspace_text
+        or receipt.get("schema") != expected_contract.get("schema")
+        or receipt.get("version") != expected_contract.get("version")
+        or receipt.get("contract_sha256") != expected_contract.get("sha256")
+    ):
+        raise ReviewCoordinationError(
+            "REVIEW_RUN_RECEIPT_MISMATCH",
+            "terminal run admission receipt does not match the frozen governance identity",
+        )
+    return receipt
+
+
 def submit_planner_completion(
     *,
     run_id: str,
@@ -508,6 +652,15 @@ def submit_planner_completion(
         kanban_db_path=kanban_db_path,
         board_name=intake["board"],
     )
+    _verify_terminal_run(
+        task_id=task_id,
+        expected_assignee=controller.PLANNER_PROFILE,
+        expected_workspace=expected,
+        expected_contract=intake["frozen_profiles"][controller.PLANNER_PROFILE],
+        terminal_status=task.status,
+        kanban_db_path=kanban_db_path,
+        board_name=intake["board"],
+    )
     request = (
         _initial_planner_request(run_id=run_id, intake=intake, workspace=expected)
         if kind == "planner_intake"
@@ -532,10 +685,7 @@ def submit_planner_completion(
         plan, plan_raw = _load_json_file(expected / "plan.json", "plan.json")
         validators.validate_plan(plan, request=request)
         expected_receipt = f"VALID: {_digest(_canonical_bytes(plan))}\n".encode("utf-8")
-        if _safe_file(expected / "validation.md", "validation.md") != expected_receipt:
-            raise validators.ArtifactValidationError(
-                "validation.md does not bind the canonical plan digest"
-            )
+        _write_exact(expected / "validation.md", expected_receipt, "validation.md")
     except validators.ArtifactValidationError as exc:
         findings = str(exc)
     key = f"planner-completion:{task_id}"
@@ -697,6 +847,15 @@ def submit_da_completion(
         expected_assignee=DA_PROFILE,
         expected_workspace=workspace,
         allowed_statuses={"done", "blocked", "triage"},
+        kanban_db_path=kanban_db_path,
+        board_name=intake["board"],
+    )
+    _verify_terminal_run(
+        task_id=task_id,
+        expected_assignee=DA_PROFILE,
+        expected_workspace=workspace,
+        expected_contract=intake["frozen_profiles"][DA_PROFILE],
+        terminal_status=task.status,
         kanban_db_path=kanban_db_path,
         board_name=intake["board"],
     )
@@ -887,6 +1046,15 @@ def submit_ceo_completion(
         expected_assignee=CEO_PROFILE,
         expected_workspace=workspace,
         allowed_statuses={"done"},
+        kanban_db_path=kanban_db_path,
+        board_name=intake["board"],
+    )
+    _verify_terminal_run(
+        task_id=task_id,
+        expected_assignee=CEO_PROFILE,
+        expected_workspace=workspace,
+        expected_contract=intake["frozen_profiles"][CEO_PROFILE],
+        terminal_status=task.status,
         kanban_db_path=kanban_db_path,
         board_name=intake["board"],
     )
@@ -1259,6 +1427,13 @@ def project_review_outbox(
                         idempotency_key=idempotency_key,
                         max_runtime_seconds=3600,
                         max_retries=0,
+                        skills=[
+                            {
+                                "planner_revision": controller.PLANNER_SKILL,
+                                "da_review": DA_SKILL,
+                                "ceo_review": CEO_SKILL,
+                            }[payload["kind"]]
+                        ],
                         require_role_contract=True,
                         expected_role_contract_sha256=(
                             intake["frozen_profiles"][payload["assignee"]]["sha256"]

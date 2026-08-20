@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
+from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.profiles import get_profile_dir
 from hermes_cli.role_contract import load_role_contract
 from plugins.verified_pipeline import controller, review, validators
@@ -51,25 +51,60 @@ def _raise_control(exc: controller.PipelineControlError) -> None:
     ) from exc
 
 
-def _actor_fingerprint(request: Request) -> str:
-    """Bind the decision to authenticated request context, not browser input."""
-    peer = request.client.host if request.client is not None else "unknown"
-    user_agent = request.headers.get("user-agent", "")[:512]
-    basis = f"{peer}\n{user_agent}".encode("utf-8", errors="replace")
-    return "dashboard-session:" + hashlib.sha256(basis).hexdigest()[:24]
+def _authenticated_actor(request: Request) -> str:
+    """Return the verified interactive dashboard principal or fail closed."""
+    session = getattr(request.state, "session", None)
+    if not isinstance(session, Session):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "AUTHENTICATED_HUMAN_REQUIRED",
+                "message": "pipeline decisions require a verified host dashboard session",
+            },
+        )
+    provider = str(getattr(session, "provider", "")).strip()
+    user_id = str(getattr(session, "user_id", "")).strip()
+    if not provider or not user_id:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "AUTHENTICATED_HUMAN_REQUIRED",
+                "message": "pipeline decisions require a verified interactive dashboard session",
+            },
+        )
+    if len(provider) > 128 or len(user_id) > 256:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "AUTHENTICATED_HUMAN_REQUIRED",
+                "message": "verified dashboard identity is malformed",
+            },
+        )
+    return f"dashboard-session:{provider}:{user_id}"
 
 
 def _frozen_profile_inventory() -> dict[str, dict[str, str]]:
     receipts: dict[str, dict[str, str]] = {}
     for profile in (
-        controller.REVISION_PROFILE,
         controller.PLANNER_PROFILE,
         review.DA_PROFILE,
         review.CEO_PROFILE,
-        *controller.IMPLEMENTATION_PROFILES,
+        *controller.MANDATORY_IMPLEMENTATION_PROFILES,
     ):
         contract = load_role_contract(get_profile_dir(profile), profile, required=True)
         assert contract is not None
+        receipts[profile] = {
+            "schema": contract.schema,
+            "version": contract.version,
+            "sha256": contract.sha256,
+        }
+    for profile in (
+        controller.REVISION_PROFILE,
+        *controller.OPTIONAL_IMPLEMENTATION_PROFILES,
+    ):
+        contract = load_role_contract(get_profile_dir(profile), profile, required=False)
+        if contract is None:
+            continue
         receipts[profile] = {
             "schema": contract.schema,
             "version": contract.version,
@@ -134,9 +169,13 @@ def create_intake(body: IntakeRequest) -> dict[str, Any]:
             frozen_profiles=frozen_profiles,
             authority_ceiling=[
                 "plan",
-                "revise_specification",
                 "adversarial_review",
                 "strategic_review",
+                *(
+                    ["revise_specification"]
+                    if controller.REVISION_PROFILE in frozen_profiles
+                    else []
+                ),
             ],
             board=normalized_board,
         )
@@ -162,7 +201,7 @@ def decide(run_id: str, body: DecisionRequest, request: Request) -> dict[str, An
             run_id=run_id,
             request_id=body.request_id,
             action=body.action,
-            actor=_actor_fingerprint(request),
+            actor=_authenticated_actor(request),
             decision_nonce=body.decision_nonce,
             artifact_sha256=body.artifact_sha256,
             feedback=body.feedback,
