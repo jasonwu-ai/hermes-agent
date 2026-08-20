@@ -3,15 +3,17 @@
 This module is an operational capability boundary.  It is intentionally not
 imported by the plugin package, dashboard, reconciler, dispatcher, gateway, or
 any service startup path.  The public entry point is usable only in a separate
-trusted process with three startup pins:
+trusted process with three startup pins plus one trusted-ledger boundary:
 
 * an exact enable token;
-* the SHA-256 of the canonical one-shot actuation scope; and
-* the SHA-256 of the fixed ``/usr/bin/gh`` executable.
+* the SHA-256 of the canonical one-shot actuation scope;
+* the SHA-256 of the fixed ``/usr/bin/gh`` executable; and
+* a dedicated owner-only actuator ledger outside the adversarial Kanban DB.
 
-The persisted custody and Kanban databases are adversarial.  Signed authority,
+The persisted control and Kanban databases are adversarial.  Signed authority,
 full execution completion, exact board state, and candidate scope are
-revalidated at consumption.  A durable DISPATCHED event is committed before
+revalidated at consumption.  Actuator intent/events live only in the dedicated
+trusted ledger.  A durable DISPATCHED event is committed there before
 calling GitHub.  If the process loses the result after dispatch, replay stops at
 OUTCOME_UNKNOWN; it never retries the merge.  A successful local observation
 is not a signed merge-result attestation and grants no deployment/live authority.
@@ -78,6 +80,17 @@ def _regular_absolute_path(value: str | os.PathLike[str], *, code: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _trusted_ledger_path(value: str | os.PathLike[str]) -> Path:
+    path = _regular_absolute_path(value, code="ACTUATOR_DB_PATH_INVALID")
+    stat = path.stat()
+    if stat.st_uid != os.geteuid() or stat.st_nlink != 1 or stat.st_mode & 0o077:
+        raise MergeActuatorError(
+            "ACTUATOR_DB_TRUST_INVALID",
+            "actuator ledger must be owner-only, singly linked, and owned by this process",
+        )
+    return path
+
+
 def _scope_from_receipt(
     receipt: Mapping[str, Any],
     *,
@@ -85,6 +98,7 @@ def _scope_from_receipt(
     board: str,
     control_db_path: Path,
     kanban_db_path: Path,
+    actuator_db_path: Path,
 ) -> dict[str, Any]:
     immutable_receipt = {key: value for key, value in receipt.items() if key != "replayed"}
     return {
@@ -94,6 +108,7 @@ def _scope_from_receipt(
         "board": board,
         "control_db_path": str(control_db_path),
         "kanban_db_path": str(kanban_db_path),
+        "actuator_db_path": str(actuator_db_path),
         "merge_key": receipt["merge_key"],
         "merge_authorization_sha256": _digest(immutable_receipt),
         "repository": receipt["repository"],
@@ -110,6 +125,7 @@ def _read_untrusted_scope(
     board: str,
     control_db_path: Path,
     kanban_db_path: Path,
+    actuator_db_path: Path,
 ) -> dict[str, Any]:
     """Read only enough untrusted custody to compare with the startup scope pin."""
     try:
@@ -144,6 +160,7 @@ def _read_untrusted_scope(
             board=board,
             control_db_path=control_db_path,
             kanban_db_path=kanban_db_path,
+            actuator_db_path=actuator_db_path,
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise MergeActuatorError("MERGE_SCOPE_INVALID", "merge scope is malformed") from exc
@@ -209,7 +226,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         BEGIN SELECT RAISE(ABORT, 'merge actuator event is append-only'); END;
         """
     )
-    with kanban_db.write_txn(conn):
+    with controller._write_txn(conn):
         conn.execute(
             "INSERT OR IGNORE INTO merge_actuator_identity "
             "(singleton, actuator_id, created_at) VALUES (1, ?, ?)",
@@ -228,6 +245,7 @@ def _validated_scope(
     board: str,
     control_db_path: Path,
     kanban_db_path: Path,
+    actuator_db_path: Path,
 ) -> dict[str, Any]:
     try:
         receipt = release._validated_merge_authorization(
@@ -246,6 +264,7 @@ def _validated_scope(
         board=board,
         control_db_path=control_db_path,
         kanban_db_path=kanban_db_path,
+        actuator_db_path=actuator_db_path,
     )
 
 
@@ -280,6 +299,7 @@ def _refresh_exact_scope(
     board: str,
     control_db_path: Path,
     kanban_db_path: Path,
+    actuator_db_path: Path,
     expected_scope: Mapping[str, Any],
 ) -> dict[str, Any]:
     scope = _validated_scope(
@@ -287,6 +307,7 @@ def _refresh_exact_scope(
         board=board,
         control_db_path=control_db_path,
         kanban_db_path=kanban_db_path,
+        actuator_db_path=actuator_db_path,
     )
     if _canonical(scope) != _canonical(expected_scope):
         raise MergeActuatorError("MERGE_SCOPE_DRIFT", "validated merge scope changed")
@@ -378,65 +399,74 @@ def _consume_exact_merge(
     board: str,
     db_path: str | os.PathLike[str],
     kanban_db_path: str | os.PathLike[str],
+    actuator_db_path: str | os.PathLike[str],
     expected_scope: Mapping[str, Any],
     adapter: MergeAdapter,
 ) -> dict[str, Any]:
     """Private core used by the dedicated process and disposable tests."""
     control_path = _regular_absolute_path(db_path, code="CONTROL_DB_PATH_INVALID")
     board_path = _regular_absolute_path(kanban_db_path, code="KANBAN_DB_PATH_INVALID")
+    actuator_path = _trusted_ledger_path(actuator_db_path)
     scope = _refresh_exact_scope(
         execution_key,
         board=board,
         control_db_path=control_path,
         kanban_db_path=board_path,
+        actuator_db_path=actuator_path,
         expected_scope=expected_scope,
     )
-    conn = kanban_db.connect(db_path=board_path)
+    board_conn = kanban_db.connect(db_path=board_path)
+    ledger_conn = controller.connect(actuator_path)
     try:
-        _init_schema(conn)
+        _init_schema(ledger_conn)
         consumption_key = f"{execution_key}:merge-actuation"
-        with kanban_db.write_txn(conn):
+        with kanban_db.write_txn(board_conn):
             _locked_completion_revalidation(
                 execution_key,
                 board=board,
                 control_db_path=control_path,
-                board_conn=conn,
+                board_conn=board_conn,
             )
-            consumption_key = _admit_intent(conn, execution_key=execution_key, scope=scope)
-            succeeded = _event(conn, consumption_key, "SUCCEEDED")
-            if succeeded is not None:
-                return {**succeeded, "replayed": True}
-            if _event(conn, consumption_key, "DISPATCHED") is not None:
-                raise MergeActuatorError(
-                    "MERGE_OUTCOME_UNKNOWN",
-                    "merge was dispatched without a durable success observation; do not retry",
+            with controller._write_txn(ledger_conn):
+                consumption_key = _admit_intent(
+                    ledger_conn, execution_key=execution_key, scope=scope
                 )
+                succeeded = _event(ledger_conn, consumption_key, "SUCCEEDED")
+                if succeeded is not None:
+                    return {**succeeded, "replayed": True}
+                if _event(ledger_conn, consumption_key, "DISPATCHED") is not None:
+                    raise MergeActuatorError(
+                        "MERGE_OUTCOME_UNKNOWN",
+                        "merge was dispatched without a durable success observation; do not retry",
+                    )
 
         scope = _refresh_exact_scope(
             execution_key,
             board=board,
             control_db_path=control_path,
             kanban_db_path=board_path,
+            actuator_db_path=actuator_path,
             expected_scope=expected_scope,
         )
-        with kanban_db.write_txn(conn):
+        with kanban_db.write_txn(board_conn):
             _locked_completion_revalidation(
                 execution_key,
                 board=board,
                 control_db_path=control_path,
-                board_conn=conn,
+                board_conn=board_conn,
             )
-            created = _insert_event(
-                conn,
-                consumption_key=consumption_key,
-                kind="DISPATCHED",
-                payload={
-                    "schema": ACTUATOR_ID,
-                    "consumption_key": consumption_key,
-                    "scope_sha256": _digest(scope),
-                    "status": "DISPATCHED_OUTCOME_UNKNOWN_UNTIL_OBSERVED",
-                },
-            )
+            with controller._write_txn(ledger_conn):
+                created = _insert_event(
+                    ledger_conn,
+                    consumption_key=consumption_key,
+                    kind="DISPATCHED",
+                    payload={
+                        "schema": ACTUATOR_ID,
+                        "consumption_key": consumption_key,
+                        "scope_sha256": _digest(scope),
+                        "status": "DISPATCHED_OUTCOME_UNKNOWN_UNTIL_OBSERVED",
+                    },
+                )
         if not created:
             raise MergeActuatorError(
                 "MERGE_OUTCOME_UNKNOWN", "another process already dispatched this exact merge"
@@ -447,15 +477,16 @@ def _consume_exact_merge(
             board=board,
             control_db_path=control_path,
             kanban_db_path=board_path,
+            actuator_db_path=actuator_path,
             expected_scope=expected_scope,
         )
         try:
-            with kanban_db.write_txn(conn):
+            with kanban_db.write_txn(board_conn):
                 _locked_completion_revalidation(
                     execution_key,
                     board=board,
                     control_db_path=control_path,
-                    board_conn=conn,
+                    board_conn=board_conn,
                 )
                 observed = _validate_adapter_result(adapter.merge(scope), scope)
                 receipt = {
@@ -467,12 +498,13 @@ def _consume_exact_merge(
                     "status": "MERGE_OBSERVED_PENDING_SIGNED_RESULT_ATTESTATION",
                     "boundary": "local observation only; no deployment or live authority",
                 }
-                _insert_event(
-                    conn,
-                    consumption_key=consumption_key,
-                    kind="SUCCEEDED",
-                    payload=receipt,
-                )
+                with controller._write_txn(ledger_conn):
+                    _insert_event(
+                        ledger_conn,
+                        consumption_key=consumption_key,
+                        kind="SUCCEEDED",
+                        payload=receipt,
+                    )
                 return {**receipt, "replayed": False}
         except MergeActuatorError:
             raise
@@ -482,7 +514,8 @@ def _consume_exact_merge(
                 "adapter returned no durably admitted result; do not retry automatically",
             ) from exc
     finally:
-        conn.close()
+        ledger_conn.close()
+        board_conn.close()
 
 
 class GitHubCLIAdapter:
@@ -597,15 +630,18 @@ def consume_exact_merge(
     board: str,
     db_path: str | os.PathLike[str],
     kanban_db_path: str | os.PathLike[str],
+    actuator_db_path: str | os.PathLike[str],
 ) -> dict[str, Any]:
     """Consume one externally pinned signed merge authorization."""
     control_path = _regular_absolute_path(db_path, code="CONTROL_DB_PATH_INVALID")
     board_path = _regular_absolute_path(kanban_db_path, code="KANBAN_DB_PATH_INVALID")
+    actuator_path = _trusted_ledger_path(actuator_db_path)
     untrusted_scope = _read_untrusted_scope(
         execution_key,
         board=board,
         control_db_path=control_path,
         kanban_db_path=board_path,
+        actuator_db_path=actuator_path,
     )
     _validate_startup_gate(untrusted_scope)
     return _consume_exact_merge(
@@ -613,6 +649,7 @@ def consume_exact_merge(
         board=board,
         db_path=control_path,
         kanban_db_path=board_path,
+        actuator_db_path=actuator_path,
         expected_scope=untrusted_scope,
         adapter=GitHubCLIAdapter(),
     )
@@ -624,6 +661,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--board", required=True)
     parser.add_argument("--control-db", required=True)
     parser.add_argument("--kanban-db", required=True)
+    parser.add_argument("--actuator-db", required=True)
     args = parser.parse_args(argv)
     try:
         result = consume_exact_merge(
@@ -631,6 +669,7 @@ def main(argv: list[str] | None = None) -> int:
             board=args.board,
             db_path=args.control_db,
             kanban_db_path=args.kanban_db,
+            actuator_db_path=args.actuator_db,
         )
     except MergeActuatorError as exc:
         print(_canonical({"error": exc.code, "message": exc.message}), file=sys.stderr)

@@ -83,12 +83,16 @@ def _merge_authorized(tmp_path: Path):
         db_path=control_db,
         kanban_db_path=kanban_path,
     )
+    actuator_path = tmp_path / "actuator.db"
+    actuator_path.touch(mode=0o600)
+    actuator_path.chmod(0o600)
     scope = actuator._scope_from_receipt(
         merge,
         execution_key=execution_key,
         board=board,
         control_db_path=control_db.resolve(),
         kanban_db_path=kanban_path.resolve(),
+        actuator_db_path=actuator_path.resolve(),
     )
     return control_db, kanban_path, board, execution_key, scope
 
@@ -99,13 +103,14 @@ def _consume(control_db, kanban_path, board, execution_key, scope, adapter):
         board=board,
         db_path=control_db,
         kanban_db_path=kanban_path,
+        actuator_db_path=scope["actuator_db_path"],
         expected_scope=scope,
         adapter=adapter,
     )
 
 
 def _events(kanban_path: Path):
-    conn = kanban_db.connect(db_path=kanban_path)
+    conn = review_tests.controller.connect(kanban_path.parent / "actuator.db")
     try:
         return [
             (row["kind"], json.loads(row["payload_json"]))
@@ -143,8 +148,88 @@ def test_exact_merge_success_is_observation_only_and_replays(tmp_path):
         conn.close()
 
 
+def test_adversarial_kanban_forgery_cannot_seed_trusted_actuator_success(tmp_path):
+    control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
+    consumption_key = f"{execution_key}:merge-actuation"
+    forged = {
+        "schema": actuator.ACTUATOR_ID,
+        "consumption_key": consumption_key,
+        "execution_key": execution_key,
+        "scope_sha256": actuator._digest(scope),
+        "merge_commit_sha": "f" * 40,
+        "status": "MERGE_OBSERVED_PENDING_SIGNED_RESULT_ATTESTATION",
+        "boundary": "local observation only; no deployment or live authority",
+    }
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        conn.executescript(
+            "CREATE TABLE merge_actuator_intents "
+            "(consumption_key TEXT PRIMARY KEY, execution_key TEXT, scope_json TEXT, "
+            "scope_sha256 TEXT, created_at INTEGER);"
+            "CREATE TABLE merge_actuator_events "
+            "(event_key TEXT PRIMARY KEY, consumption_key TEXT, kind TEXT, "
+            "payload_json TEXT, created_at INTEGER);"
+        )
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "INSERT INTO merge_actuator_intents VALUES (?, ?, ?, ?, 1)",
+                (
+                    consumption_key,
+                    execution_key,
+                    actuator._canonical(scope),
+                    actuator._digest(scope),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO merge_actuator_events VALUES (?, ?, 'SUCCEEDED', ?, 1)",
+                (
+                    f"{consumption_key}:succeeded",
+                    consumption_key,
+                    actuator._canonical(forged),
+                ),
+            )
+    finally:
+        conn.close()
+
+    adapter = FakeAdapter()
+    result = _consume(control_db, kanban_path, board, execution_key, scope, adapter)
+    assert result["merge_commit_sha"] == "4" * 40
+    assert result["replayed"] is False
+    assert adapter.calls == [scope]
+
+
+def test_actuator_ledger_must_be_owner_only_before_adapter(tmp_path):
+    control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
+    Path(scope["actuator_db_path"]).chmod(0o644)
+    adapter = FakeAdapter()
+    with pytest.raises(actuator.MergeActuatorError) as exc:
+        _consume(control_db, kanban_path, board, execution_key, scope, adapter)
+    assert exc.value.code == "ACTUATOR_DB_TRUST_INVALID"
+    assert adapter.calls == []
+
+
+def test_hardlinked_actuator_ledger_is_rejected_before_adapter(tmp_path):
+    control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
+    original = Path(scope["actuator_db_path"])
+    hardlink = tmp_path / "actuator-hardlink.db"
+    hardlink.hardlink_to(original)
+    adapter = FakeAdapter()
+    with pytest.raises(actuator.MergeActuatorError) as exc:
+        actuator._consume_exact_merge(
+            execution_key,
+            board=board,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+            actuator_db_path=hardlink,
+            expected_scope=scope,
+            adapter=adapter,
+        )
+    assert exc.value.code == "ACTUATOR_DB_TRUST_INVALID"
+    assert adapter.calls == []
+
+
 def test_public_entrypoint_is_disabled_before_actuator_schema_or_adapter(tmp_path, monkeypatch):
-    control_db, kanban_path, board, execution_key, _ = _merge_authorized(tmp_path)
+    control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
 
     class ForbiddenAdapter:
         def __init__(self):
@@ -157,9 +242,10 @@ def test_public_entrypoint_is_disabled_before_actuator_schema_or_adapter(tmp_pat
             board=board,
             db_path=control_db,
             kanban_db_path=kanban_path,
+            actuator_db_path=scope["actuator_db_path"],
         )
     assert exc.value.code == "MERGE_ACTUATOR_DISABLED"
-    conn = kanban_db.connect(db_path=kanban_path)
+    conn = review_tests.controller.connect(scope["actuator_db_path"])
     try:
         assert (
             conn.execute(
@@ -173,7 +259,7 @@ def test_public_entrypoint_is_disabled_before_actuator_schema_or_adapter(tmp_pat
 
 
 def test_runtime_environment_change_cannot_enable_or_construct_adapter(tmp_path, monkeypatch):
-    control_db, kanban_path, board, execution_key, _ = _merge_authorized(tmp_path)
+    control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
     monkeypatch.setenv(actuator.ENABLE_ENV, actuator.ENABLE_TOKEN)
     monkeypatch.setenv(actuator.SCOPE_PIN_ENV, "0" * 64)
     monkeypatch.setenv(actuator.GH_PIN_ENV, "0" * 64)
@@ -189,12 +275,13 @@ def test_runtime_environment_change_cannot_enable_or_construct_adapter(tmp_path,
             board=board,
             db_path=control_db,
             kanban_db_path=kanban_path,
+            actuator_db_path=scope["actuator_db_path"],
         )
     assert exc.value.code == "MERGE_ACTUATOR_DISABLED"
 
 
 def test_malformed_startup_scope_pin_rejects_before_adapter(tmp_path, monkeypatch):
-    control_db, kanban_path, board, execution_key, _ = _merge_authorized(tmp_path)
+    control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
     monkeypatch.setattr(actuator, "_STARTUP_ENABLE", actuator.ENABLE_TOKEN)
     monkeypatch.setattr(actuator, "_STARTUP_SCOPE_SHA256", "not-a-digest")
 
@@ -209,17 +296,19 @@ def test_malformed_startup_scope_pin_rejects_before_adapter(tmp_path, monkeypatc
             board=board,
             db_path=control_db,
             kanban_db_path=kanban_path,
+            actuator_db_path=scope["actuator_db_path"],
         )
     assert exc.value.code == "MERGE_SCOPE_PIN_REQUIRED"
 
 
 def test_exact_startup_pins_reach_only_fake_adapter(tmp_path, monkeypatch):
-    control_db, kanban_path, board, execution_key, _ = _merge_authorized(tmp_path)
+    control_db, kanban_path, board, execution_key, initial_scope = _merge_authorized(tmp_path)
     scope = actuator._read_untrusted_scope(
         execution_key,
         board=board,
         control_db_path=control_db.resolve(),
         kanban_db_path=kanban_path.resolve(),
+        actuator_db_path=Path(initial_scope["actuator_db_path"]),
     )
     fake_gh = tmp_path / "gh"
     fake_gh.write_bytes(b"qualified fake gh bytes")
@@ -240,6 +329,7 @@ def test_exact_startup_pins_reach_only_fake_adapter(tmp_path, monkeypatch):
         board=board,
         db_path=control_db,
         kanban_db_path=kanban_path,
+        actuator_db_path=scope["actuator_db_path"],
     )
     assert result["status"] == "MERGE_OBSERVED_PENDING_SIGNED_RESULT_ATTESTATION"
     assert adapter.calls == [scope]
@@ -464,7 +554,7 @@ def test_github_rest_and_postflight_commit_mismatch_fails_closed(monkeypatch):
 
 
 def test_cli_fails_disabled_without_schema_or_external_call(tmp_path):
-    control_db, kanban_path, board, execution_key, _ = _merge_authorized(tmp_path)
+    control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
     env = {key: value for key, value in review_tests.os.environ.items() if key != actuator.ENABLE_ENV}
     completed = subprocess.run(
         [
@@ -479,6 +569,8 @@ def test_cli_fails_disabled_without_schema_or_external_call(tmp_path):
             str(control_db),
             "--kanban-db",
             str(kanban_path),
+            "--actuator-db",
+            scope["actuator_db_path"],
         ],
         cwd=Path(__file__).resolve().parents[3],
         env=env,
@@ -493,7 +585,7 @@ def test_cli_fails_disabled_without_schema_or_external_call(tmp_path):
 def test_actuator_custody_is_immutable(tmp_path):
     control_db, kanban_path, board, execution_key, scope = _merge_authorized(tmp_path)
     _consume(control_db, kanban_path, board, execution_key, scope, FakeAdapter())
-    conn = kanban_db.connect(db_path=kanban_path)
+    conn = review_tests.controller.connect(scope["actuator_db_path"])
     try:
         for statement in (
             "UPDATE merge_actuator_identity SET actuator_id = 'forged' WHERE singleton = 1",
@@ -501,7 +593,7 @@ def test_actuator_custody_is_immutable(tmp_path):
             "UPDATE merge_actuator_events SET kind = 'FORGED'",
         ):
             with pytest.raises(sqlite3.IntegrityError):
-                with kanban_db.write_txn(conn):
+                with review_tests.controller._write_txn(conn):
                     conn.execute(statement)
     finally:
         conn.close()
