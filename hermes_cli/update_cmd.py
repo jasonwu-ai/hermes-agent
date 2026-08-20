@@ -2714,6 +2714,49 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
     _log_only_write(result.stdout or "")
     return result
 
+def _classify_fetch_failure(stderr: str) -> str:
+    """Map git-fetch stderr to a one-line, user-facing diagnosis.
+
+    Order matters: curl surfaces HTTP failures as
+    ``fatal: unable to access '<url>': The requested URL returned error: 429``,
+    so the rate-limit/outage checks must run BEFORE the generic
+    "unable to access" network check or a GitHub 429/5xx gets misreported as a
+    local network problem. The caller always prints the first raw stderr line
+    alongside this diagnosis — the friendly message adds guidance, it never
+    replaces the wire error.
+    """
+
+    def _has_http_code(*codes: str) -> bool:
+        return any(
+            f"HTTP {code}" in stderr or f"returned error: {code}" in stderr
+            for code in codes
+        )
+
+    if _has_http_code("429") or "rate limit" in stderr.lower():
+        return (
+            "✗ GitHub is rate limiting requests or having an outage (HTTP 429)"
+            " — try again in 5 minutes."
+        )
+    if _has_http_code("500", "502", "503", "504"):
+        return (
+            "✗ GitHub appears to be having an outage — try again in a few"
+            " minutes (https://www.githubstatus.com)."
+        )
+    if "Could not resolve host" in stderr or "unable to access" in stderr:
+        return "✗ Network error — cannot reach the remote repository."
+    if "Authentication failed" in stderr or "could not read Username" in stderr:
+        return "✗ Authentication failed — check your git credentials or SSH key."
+    return "✗ Failed to fetch updates from origin."
+
+
+def _print_fetch_failure(stderr: str) -> None:
+    """Print the classified diagnosis plus the first raw stderr line."""
+    stderr = (stderr or "").strip()
+    print(_classify_fetch_failure(stderr))
+    if stderr:
+        print(f"  {stderr.splitlines()[0]}")
+
+
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -2835,15 +2878,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         compare_branch = f"origin/{branch}"
 
     if fetch_result.returncode != 0:
-        stderr = fetch_result.stderr.strip()
-        if "Could not resolve host" in stderr or "unable to access" in stderr:
-            print("✗ Network error — cannot reach the remote repository.")
-        elif "Authentication failed" in stderr or "could not read Username" in stderr:
-            print("✗ Authentication failed — check your git credentials or SSH key.")
-        else:
-            print("✗ Failed to fetch.")
-            if stderr:
-                print(f"  {stderr.splitlines()[0]}")
+        _print_fetch_failure(fetch_result.stderr)
         sys.exit(1)
 
     # Verify the compare ref actually exists before asking rev-list about it.
@@ -3606,21 +3641,36 @@ def _detect_self_loaded_native_modules() -> list[str]:
 
 
 def _abort_dependency_sync_if_self_locked(gateway_resume=None) -> None:
-    """Defer (exit 2) when THIS process holds a native module the sync must replace.
+    """Defer the venv rewrite when THIS process holds something it must replace.
 
     Runs at the last moment before the venv rewrite — after the code swap —
     so the on-disk pyproject reflects the update target and a deferral
-    leaves the user on NEW code with only the dependency install pending
-    (completed by the next launch's marker recovery).  No-op when nothing
-    at-risk is loaded.
+    leaves the user on NEW code with only the dependency install pending.
+    No-op when nothing at-risk is held.
+
+    Two hazards, both "this process holds a file the sync must replace", and
+    they end differently because their recoveries differ:
+
+    - A mapped native extension (``.pyd``).  Exit 2 and let the next launch's
+      marker recovery finish the install: that launch runs the install before
+      importing anything heavy, so it maps nothing and the swap succeeds.
+
+    - The ``hermes.exe`` console shim we were launched from (#88838, #89599).
+      The marker cannot help here — every future ``hermes`` launch is also the
+      shim, so deferring to the next launch defers forever.  Hand the install
+      to a child under the venv interpreter and exit, releasing the shim.
     """
     locked = _m()._detect_self_loaded_native_modules()
-    if not locked:
-        return
-    _m()._defer_update_for_self_lock(locked)
-    if gateway_resume is not None:
-        _m()._resume_windows_gateways_after_update(gateway_resume)
-    sys.exit(2)
+    if locked:
+        _m()._defer_update_for_self_lock(locked)
+        if gateway_resume is not None:
+            _m()._resume_windows_gateways_after_update(gateway_resume)
+        sys.exit(2)
+
+    if _m()._reexec_dependency_sync_off_windows_shim():
+        if gateway_resume is not None:
+            _m()._resume_windows_gateways_after_update(gateway_resume)
+        sys.exit(0)
 
 
 def _defer_update_for_self_lock(loaded: list[str]) -> None:
@@ -3889,6 +3939,121 @@ def _orphaned_desktop_backend_pids(
         if not (ancestors & root_set):
             return None
     return roots
+
+
+def _ledger_reapable_backend_pids(
+    matches: list[tuple[int, str, str]],
+) -> list[int]:
+    """PIDs positively identified by the spawn ledger as orphaned backends.
+
+    The strongest rung: instead of inferring lineage from PPIDs or cmdline
+    shape, look each venv holder up in the machine spawn ledger
+    (``hermes_cli.process_identity``). A holder qualifies when ALL of:
+
+    - its ``(pid, create_time)`` matches a live ledger entry (PID reuse
+      cannot forge this pair);
+    - the entry's purpose is a reapable backend kind (serve/dashboard/
+      gateway — never interactive processes);
+    - the entry's recorded SPAWNER is provably dead (``spawner_is_dead``).
+
+    Unlike the heuristic rungs, this is safe in ANY update context — no
+    hand-off contract needed — because the ownership claim is explicit: the
+    process itself declared who supervises it, and that supervisor is gone.
+    Holders not in the ledger are simply not returned (they fall through to
+    the later rungs); they never disqualify the identified ones. Never raises.
+    """
+    try:
+        from hermes_cli.process_identity import (
+            REAPABLE_PURPOSES,
+            ledger_entries,
+            spawner_is_dead,
+        )
+
+        entries = ledger_entries()
+    except Exception:
+        return []
+    by_pid = {e.get("pid"): e for e in entries if isinstance(e.get("pid"), int)}
+    roots: list[int] = []
+    for pid, _name, _cmdline in matches:
+        entry = by_pid.get(int(pid))
+        if not entry:
+            continue
+        if entry.get("purpose") not in REAPABLE_PURPOSES:
+            continue
+        if spawner_is_dead(entry) is True:
+            roots.append(int(pid))
+    return roots
+
+
+def _handoff_reapable_backend_pids(
+    matches: list[tuple[int, str, str]],
+) -> list[int] | None:
+    """PIDs of Hermes ``serve``/``dashboard`` backends safe to reap during a
+    GUI-updater hand-off, INCLUDING ones with a still-live parent.
+
+    Complements ``_orphaned_desktop_backend_pids``, which only reaps backends
+    whose supervisor is provably dead. That check returns ``None`` (keep
+    refusing) the moment ANY holder still has a live parent — which is exactly
+    the case that produced the field incident this fixes: a Windows Desktop
+    update hand-off (``update --yes --gateway --force``) left a *swarm* of
+    per-profile ``serve`` backends (mr-tester, probe-inherit, turqoise, …)
+    holding ``cryptography\\_rust.pyd``. Several still had a lingering
+    parent (the tearing-down Electron process, or the two-hop venv
+    launcher→worker chain mid-exit), so the orphan check disqualified the
+    WHOLE set and the update dead-ended — the user saw a 12-minute hang, then
+    force-closed, and the half-done state stranded bot sessions.
+
+    The hand-off is the safe signal: when the update-incomplete marker is
+    present (the GUI updater claimed it) AND this is a ``--gateway`` hand-off
+    run AND no live Desktop shim (``hermes.exe``) is open, NOTHING legitimate
+    is supervising or respawning a ``serve`` backend from this venv — by the
+    hand-off contract the Desktop tree-kills its backends and parks any
+    relaunch behind the marker (#50238). Any ``serve`` backend still holding
+    the venv here is therefore a leak, live parent or not, and reaping its
+    tree is correct rather than a race.
+
+    Guarded conservatively:
+
+    - Only Hermes backends (``hermes_cli.main`` + ``serve``/``dashboard``)
+      from THIS install's venv qualify; a non-backend holder (operator REPL,
+      stray script) disqualifies the whole set → ``None`` (keep refusing), so
+      we never widen the blast radius during a hand-off.
+    - Only runs when the CALLER has confirmed the hand-off context
+      (``args.gateway`` AND a claimed update-incomplete marker AND no live
+      ``hermes.exe`` shim) — outside that gate this function is never called
+      and the stricter orphan-only path stands.
+    - psutil unavailable → ``None`` (can't re-read argv to classify → refuse).
+
+    Returns the backend root PIDs to tree-reap, or ``None`` to leave the
+    decision to the caller's existing rungs. Never raises.
+    """
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return None
+
+    def _is_backend(argv_low: str) -> bool:
+        return "hermes_cli.main" in argv_low and (
+            " serve" in argv_low or " dashboard" in argv_low
+        )
+
+    roots: list[int] = []
+    for pid, _name, cmdline in matches:
+        argv = cmdline
+        try:
+            argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
+        except psutil.NoSuchProcess:
+            # Exited between scan and classification — nothing to reap.
+            continue
+        except Exception:
+            pass
+        if not _is_backend(argv.lower()):
+            # A non-backend holder during a hand-off is unexpected; refuse the
+            # whole set rather than reap something we cannot justify.
+            return None
+        roots.append(int(pid))
+
+    return roots or None
 
 
 def _stop_process_trees(pids: list[int]) -> None:
@@ -4755,6 +4920,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _time.sleep(1.0)
                 _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
+            # Positive-identity rung (runs FIRST, any update context): holders
+            # the spawn ledger proves are orphaned Hermes backends — the
+            # process self-registered (pid, create_time, purpose, spawner) at
+            # startup and its recorded spawner is provably dead. No PPID
+            # archaeology, no hand-off contract required.
+            _ledger_backends = _m()._ledger_reapable_backend_pids(_venv_holders)
+            if _ledger_backends:
+                print(
+                    f"  ⚠ {len(_ledger_backends)} ledger-identified orphaned "
+                    "Hermes backend process(es) hold the venv; stopping their trees"
+                )
+                _m()._stop_process_trees(_ledger_backends)
+                _time.sleep(1.0)
+                _venv_holders = _m()._detect_venv_python_processes()
+        if _venv_holders:
             _orphan_backends = _m()._orphaned_desktop_backend_pids(_venv_holders)
             if _orphan_backends:
                 # Every remaining holder is a Desktop `serve` backend whose
@@ -4774,6 +4954,43 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _m()._stop_process_trees(_orphan_backends)
                 _time.sleep(1.0)
                 _venv_holders = _m()._detect_venv_python_processes()
+        if _venv_holders:
+            # Final rung before the dead-end: a GUI-updater hand-off
+            # (`update --gateway --force` with the update-incomplete marker
+            # claimed) means the Desktop is contractually gone and nothing
+            # legitimate will respawn a `serve` backend from this venv. The
+            # orphan-only reap above bails the instant ANY holder still has a
+            # live parent — which stranded a whole swarm of per-profile
+            # backends (the tearing-down Electron parent / the venv
+            # launcher→worker chain still mid-exit) and hung the update. In
+            # the hand-off context those surviving Hermes backends are leaks,
+            # live parent or not — reap them by cmdline instead of dead-ending.
+            _handoff = False
+            try:
+                _handoff = bool(getattr(args, "gateway", False)) and _m()._update_marker_path().exists()
+            except Exception:
+                _handoff = False
+            # Fail closed: if we cannot positively verify the shim state
+            # (scripts dir unresolvable, detection raised), assume a live
+            # shim exists and keep refusing rather than reap.
+            _no_live_shim = False
+            try:
+                _scripts_dir = _m()._venv_scripts_dir()
+                if _scripts_dir is not None:
+                    _no_live_shim = not _m()._detect_concurrent_hermes_instances(_scripts_dir)
+            except Exception:
+                _no_live_shim = False
+            if _handoff and _no_live_shim:
+                _handoff_backends = _m()._handoff_reapable_backend_pids(_venv_holders)
+                if _handoff_backends:
+                    print(
+                        f"  ⚠ {len(_handoff_backends)} Hermes backend process(es) "
+                        "still hold the venv after the Desktop hand-off; "
+                        "stopping their trees"
+                    )
+                    _m()._stop_process_trees(_handoff_backends)
+                    _time.sleep(1.0)
+                    _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:
             print(_format_venv_python_holders_message(_venv_holders))
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
@@ -4896,20 +5113,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             text=True, encoding="utf-8", errors="replace",
         )
         if fetch_result.returncode != 0:
-            stderr = fetch_result.stderr.strip()
-            if "Could not resolve host" in stderr or "unable to access" in stderr:
-                print("✗ Network error — cannot reach the remote repository.")
-                print(f"  {stderr.splitlines()[0]}" if stderr else "")
-            elif (
-                "Authentication failed" in stderr or "could not read Username" in stderr
-            ):
-                print(
-                    "✗ Authentication failed — check your git credentials or SSH key."
-                )
-            else:
-                print("✗ Failed to fetch updates from origin.")
-                if stderr:
-                    print(f"  {stderr.splitlines()[0]}")
+            _print_fetch_failure(fetch_result.stderr)
             sys.exit(1)
 
         # Get current branch (returns literal "HEAD" when detached)
@@ -5108,10 +5312,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # otherwise "Already up to date!" gaslights the user while their
             # install stays bricked.
             healthy, detail = _venv_core_imports_healthy()
-            if not healthy:
+            # The Windows shim hand-off spawns this child precisely to run a
+            # sync its parent could not. The parent already pulled, so the
+            # checkout is current BY DESIGN and venv health is not the
+            # question — the pending sync is. Without this the child prints
+            # "Already up to date!" and exits without doing the one job it
+            # was spawned for.
+            handed_off_sync = os.environ.get(_m()._UPDATE_REEXEC_ENV) == "1"
+            if handed_off_sync:
+                print("→ Finishing the dependency install handed off by hermes.exe...")
+            elif not healthy:
                 print("⚠ Checkout is current, but the venv is unhealthy:")
                 print(f"  {detail}")
                 print("→ Repairing Python dependencies...")
+            if handed_off_sync or not healthy:
                 # Self-lock deferral (#86735): the repair rewrites the venv
                 # too — same mapped-extension hazard as the update sync.
                 _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
