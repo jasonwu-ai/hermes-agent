@@ -99,6 +99,7 @@ def _snapshot_profiles(runtime_home: Path) -> dict[str, Any]:
         live = LIVE_PROFILES_ROOT / profile
         target = profiles_root / profile
         target.mkdir(mode=0o700)
+        (target / "logs").mkdir(mode=0o700)
         for name in SAFE_PROFILE_FILES:
             source = live / name
             if source.is_file():
@@ -177,6 +178,37 @@ def _terminate_worker_groups(db_path: Path) -> None:
             pass
 
 
+def _pid_alive(pid: int) -> bool:
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        if stat_path.read_text(encoding="utf-8").split()[2] == "Z":
+            return False
+    except (FileNotFoundError, IndexError, OSError):
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _drain_worker_process(pid: int | None, *, timeout_seconds: int = 30) -> None:
+    if pid is None:
+        return
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.25)
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    raise TimeoutError(f"worker process did not exit after task completion: {pid}")
+
+
 def _wait_for_terminal(
     *,
     db_path: Path,
@@ -187,9 +219,14 @@ def _wait_for_terminal(
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     last_tick = 0.0
+    runtime_worker_pid: int | None = None
     while time.monotonic() < deadline:
         row = _task(db_path, task_id)
+        if row.get("worker_pid"):
+            runtime_worker_pid = int(row["worker_pid"])
         if row["status"] in TERMINAL_STATUSES:
+            _drain_worker_process(runtime_worker_pid)
+            row["runtime_worker_pid"] = runtime_worker_pid
             return row
         now = time.monotonic()
         if now - last_tick >= 8:
@@ -251,6 +288,10 @@ def _receipt_files(workspaces_root: Path) -> list[dict[str, Any]]:
     return receipts
 
 
+def _canonical_review_workspace_root(controller_module: Any) -> Path:
+    return Path(controller_module._default_workspace_root())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -267,7 +308,6 @@ def main() -> int:
     runtime_home.mkdir(mode=0o700)
     kanban_path = output / "kanban.db"
     workspaces_root = output / "workspaces"
-    review_root = output / "review-workspaces"
     kanban_home = output / "kanban-home"
     report_path = output / "run-report.json"
     source_head = os.popen(f"git -C {SOURCE_ROOT} rev-parse HEAD").read().strip()
@@ -306,6 +346,8 @@ def main() -> int:
         from hermes_cli import kanban_db
         from plugins.verified_pipeline import controller, review, validators
         from plugins.verified_pipeline.dashboard.plugin_api import router
+
+        review_root = _canonical_review_workspace_root(controller)
 
         app = FastAPI()
         app.include_router(router, prefix="/api/plugins/verified-pipeline")
@@ -402,7 +444,7 @@ def main() -> int:
                         "status": terminal["status"],
                         "consecutive_failures": terminal.get("consecutive_failures", 0),
                         "workspace_path": terminal["workspace_path"],
-                        "worker_pid": terminal["worker_pid"],
+                        "worker_pid": terminal["runtime_worker_pid"],
                     }
                 )
                 reconciled = review.reconcile_review_once(
