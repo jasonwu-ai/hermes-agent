@@ -664,7 +664,15 @@ def _safe_workspace(
                     handle.write(artifact_bytes)
                     handle.flush()
                     os.fsync(handle.fileno())
-                os.replace(tmp, artifact_path)
+                try:
+                    os.link(tmp, artifact_path, follow_symlinks=False)
+                except FileExistsError:
+                    existing = _read_custodied_file(artifact_path)
+                    if _sha256(existing) != artifact_sha256:
+                        raise PipelineControlError(
+                            "ARTIFACT_CUSTODY_MISMATCH",
+                            "concurrent specification custody bytes do not match the decision",
+                        )
             finally:
                 if tmp.exists():
                     tmp.unlink()

@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_cli import kanban_db
+from hermes_cli.dashboard_auth.base import Session
 from hermes_cli.profiles import get_profile_dir
 from hermes_cli.role_contract import load_role_contract
 from plugins.verified_pipeline import controller, review, validators
@@ -53,6 +54,14 @@ def _raise_control(exc: controller.PipelineControlError) -> None:
 def _authenticated_actor(request: Request) -> str:
     """Return the verified interactive dashboard principal or fail closed."""
     session = getattr(request.state, "session", None)
+    if not isinstance(session, Session):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "AUTHENTICATED_HUMAN_REQUIRED",
+                "message": "pipeline decisions require a verified host dashboard session",
+            },
+        )
     provider = str(getattr(session, "provider", "")).strip()
     user_id = str(getattr(session, "user_id", "")).strip()
     if not provider or not user_id:

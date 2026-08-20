@@ -266,6 +266,14 @@ def test_decision_requires_verified_interactive_session(tmp_path, monkeypatch):
 
     @app.middleware("http")
     async def attach_service_principal_only(request, call_next):
+        request.state.session = type(
+            "ForgedSession",
+            (),
+            {
+                "user_id": "attacker-selected-user",
+                "provider": "attacker-selected-provider",
+            },
+        )()
         request.state.token_authenticated = True
         request.state.token_principal = TokenPrincipal(
             principal="automation",

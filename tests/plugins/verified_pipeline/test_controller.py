@@ -191,6 +191,29 @@ def test_concurrent_projection_creates_exactly_one_task(tmp_path):
     assert len(_tasks(kanban_path)) == 1
 
 
+def test_concurrent_specification_custody_installs_without_overwrite(tmp_path):
+    root = tmp_path / "workspaces"
+    digest = hashlib.sha256(ARTIFACT).hexdigest()
+
+    def publish(_):
+        return controller._safe_workspace(
+            workspace_root=root,
+            run_id="run_0123456789abcdef01234567",
+            artifact_bytes=ARTIFACT,
+            artifact_sha256=digest,
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        results = list(pool.map(publish, range(24)))
+
+    artifact_paths = {artifact for _, artifact in results}
+    assert len(artifact_paths) == 1
+    artifact_path = artifact_paths.pop()
+    assert artifact_path.read_bytes() == ARTIFACT
+    assert artifact_path.stat().st_nlink == 1
+    assert not list(artifact_path.parent.glob(".specification.*.tmp"))
+
+
 def test_programming_error_is_not_hidden_as_replayable_outage(tmp_path, monkeypatch):
     control_db, intake = _register(tmp_path)
     decision = _decide(control_db, intake)

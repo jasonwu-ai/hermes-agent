@@ -71,16 +71,32 @@ def test_ceo_overlay_matches_controller_packet_and_validator_schema() -> None:
 
 def test_mandatory_implementation_inventory_overlays_are_admissible() -> None:
     expected_toolsets = {
-        "02-builder": ("bfl", "file", "kanban", "terminal", "todo"),
-        "09-test": ("bfl", "kanban", "terminal", "todo"),
-        "06-integration": ("bfl", "file", "kanban", "terminal", "todo"),
-        "08-release": ("bfl", "kanban", "terminal", "todo"),
+        "02-builder": ("file", "kanban"),
+        "09-test": ("file", "kanban"),
+        "06-integration": ("file", "kanban"),
+        "08-release": ("file", "kanban"),
     }
     assert set(expected_toolsets) == set(controller.MANDATORY_IMPLEMENTATION_PROFILES)
     for profile, toolsets in expected_toolsets.items():
         contract = load_role_contract(OVERLAYS / profile, profile, required=True)
         assert contract is not None
         assert contract.allowed_toolsets == toolsets
+        assert contract.workspace_only is True
+        assert contract.allowed_tools
+        assert "terminal" not in contract.allowed_tools
+        assert "execute_code" not in contract.allowed_tools
+        assert set(contract.allowed_tools) <= {
+            "read_file",
+            "search_files",
+            "write_file",
+            "patch",
+            "kanban_show",
+            "kanban_attachments",
+            "kanban_comment",
+            "kanban_heartbeat",
+            "kanban_complete",
+            "kanban_block",
+        }
         assert "governance canary does not invoke" in contract.path.read_text(
             encoding="utf-8"
         )
