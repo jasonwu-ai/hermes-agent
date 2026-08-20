@@ -5,6 +5,9 @@ import json
 from agent.tool_executor import _role_contract_tool_block
 
 
+# These unit tests exercise the shared policy primitive directly. The dispatch-level
+# regression in tests/run_agent/test_run_agent.py separately proves that rewritten
+# plugin arguments are rechecked by this same primitive immediately before execution.
 def _policy(monkeypatch, workspace, *, task_id="t_governance"):
     monkeypatch.setenv(
         "HERMES_ROLE_CONTRACT_ALLOWED_TOOLS",
