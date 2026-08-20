@@ -683,6 +683,11 @@ def _handle_complete(args: dict, **kw) -> str:
             metadata = json.loads(meta_json)
         except json.JSONDecodeError:
             pass
+    if os.environ.get("HERMES_ROLE_CONTRACT_ALLOWED_TOOLS"):
+        if metadata is None:
+            metadata = {}
+        if isinstance(metadata, dict):
+            metadata["_role_contract_restricted_delivery"] = True
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:

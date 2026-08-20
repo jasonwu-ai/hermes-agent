@@ -1111,7 +1111,12 @@ class GatewayKanbanWatchersMixin:
             seen.add(expanded)
             candidates.append(expanded)
 
-        # 1. Explicit artifacts list in payload.
+        restricted_delivery = bool(
+            isinstance(event_payload, dict)
+            and event_payload.get("restricted_artifact_delivery") is True
+        )
+
+        # 1. Explicit descriptor-captured artifacts list in payload.
         if isinstance(event_payload, dict):
             raw = event_payload.get("artifacts")
             if isinstance(raw, (list, tuple)):
@@ -1119,15 +1124,22 @@ class GatewayKanbanWatchersMixin:
                     if isinstance(item, str):
                         _add(item)
 
-            # 2. Paths embedded in the payload summary.
-            summary = event_payload.get("summary")
-            if isinstance(summary, str) and summary:
-                paths, _ = adapter.extract_local_files(summary)
-                for p in paths:
-                    _add(p)
+            # 2. Legacy prose extraction is forbidden for receipt-bound
+            # role-contract completions. Their uploads must come only from
+            # descriptor-captured completion artifacts/attachments.
+            if not restricted_delivery:
+                summary = event_payload.get("summary")
+                if isinstance(summary, str) and summary:
+                    paths, _ = adapter.extract_local_files(summary)
+                    for p in paths:
+                        _add(p)
 
         # 3. Legacy: paths embedded in task.result.
-        if task is not None and getattr(task, "result", None):
+        if (
+            not restricted_delivery
+            and task is not None
+            and getattr(task, "result", None)
+        ):
             result_text = str(task.result)
             paths, _ = adapter.extract_local_files(result_text)
             for p in paths:

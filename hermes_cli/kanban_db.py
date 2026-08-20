@@ -5908,6 +5908,8 @@ def complete_task(
         # ``metadata["artifacts"]`` — we promote it onto the event so
         # consumers don't have to fetch the run row to find it.
         if isinstance(metadata, dict):
+            if metadata.get("_role_contract_restricted_delivery") is True:
+                completed_payload["restricted_artifact_delivery"] = True
             md_artifacts = metadata.get("artifacts")
             if isinstance(md_artifacts, (list, tuple)):
                 cleaned_artifacts = [
