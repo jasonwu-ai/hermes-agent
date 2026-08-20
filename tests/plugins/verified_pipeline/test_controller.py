@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -411,3 +413,24 @@ def test_preexisting_workspace_bytes_must_match_canonical_artifact(tmp_path):
         )
     assert exc.value.code == "ARTIFACT_CUSTODY_MISMATCH"
     assert not (tmp_path / "kanban.db").exists()
+
+
+def test_custodied_file_rejects_inode_swap_between_lstat_and_open(tmp_path, monkeypatch):
+    artifact = tmp_path / "specification.md"
+    replacement = tmp_path / "replacement.md"
+    artifact.write_bytes(ARTIFACT)
+    replacement.write_bytes(b"replacement")
+    real_open = os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == artifact and not swapped:
+            swapped = True
+            os.replace(replacement, artifact)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(controller.os, "open", swapping_open)
+    with pytest.raises(controller.PipelineControlError) as exc:
+        controller._read_custodied_file(artifact)
+    assert exc.value.code == "ARTIFACT_CUSTODY_MISMATCH"

@@ -5,7 +5,15 @@ version: 4.0.0-canary.1
 allowed_toolsets:
   - file
   - kanban
-  - terminal
+allowed_tools:
+  - kanban_block
+  - kanban_comment
+  - kanban_complete
+  - kanban_show
+  - read_file
+  - search_files
+  - write_file
+workspace_only: true
 ---
 
 # CEO authority

@@ -581,7 +581,50 @@ def _read_custodied_file(path: Path) -> bytes:
             "ARTIFACT_CUSTODY_MISMATCH",
             "materialized specification must not be group/world-writable",
         )
-    return path.read_bytes()
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise PipelineControlError(
+            "ARTIFACT_CUSTODY_MISMATCH",
+            "materialized specification could not be opened safely",
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise PipelineControlError(
+                "ARTIFACT_CUSTODY_MISMATCH",
+                "materialized specification changed type while opening",
+            )
+        if opened.st_mode & 0o022:
+            raise PipelineControlError(
+                "ARTIFACT_CUSTODY_MISMATCH",
+                "materialized specification became group/world-writable while opening",
+            )
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise PipelineControlError(
+                "ARTIFACT_CUSTODY_MISMATCH",
+                "materialized specification changed while opening",
+            )
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    if len(raw) != opened.st_size:
+        raise PipelineControlError(
+            "ARTIFACT_CUSTODY_MISMATCH",
+            "materialized specification changed while reading",
+        )
+    return raw
 
 
 def _safe_workspace(

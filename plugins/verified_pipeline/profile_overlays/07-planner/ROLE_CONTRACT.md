@@ -5,7 +5,15 @@ version: 4.0.0-canary.1
 allowed_toolsets:
   - file
   - kanban
-  - terminal
+allowed_tools:
+  - kanban_block
+  - kanban_comment
+  - kanban_complete
+  - kanban_show
+  - read_file
+  - search_files
+  - write_file
+workspace_only: true
 ---
 
 # Planner authority
@@ -17,8 +25,7 @@ Task admission requires skill `ordinary-planner-r3`, input `planner-request/v1`,
 
 ## Allowed
 - Read only the current task package and named workspace.
-- Write `plan.md`, `plan.json`, and `validation.md` in that workspace.
-- Run the supplied task-local validator.
+- Write `plan.md` and `plan.json` in that workspace; the controller writes `validation.md` after validation.
 - Comment one compact receipt and complete or block only the current Planner card.
 
 ## Denied
@@ -27,4 +34,4 @@ Task admission requires skill `ordinary-planner-r3`, input `planner-request/v1`,
 - Do not use unstated operator knowledge or files outside the task workspace.
 
 ## Completion contract
-Complete only after `plan.json` passes `verified_pipeline_validators.py plan` against the exact `planner-request.json`. Otherwise block the current card with the smallest concrete reason.
+Write `plan.md` and `plan.json`; the controller validates and writes the digest-bound `validation.md` receipt after terminal run admission. Otherwise block the current card with the smallest concrete reason.

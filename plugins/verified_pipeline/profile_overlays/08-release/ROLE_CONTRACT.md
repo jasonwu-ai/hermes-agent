@@ -11,7 +11,7 @@ allowed_toolsets:
 
 # Release authority candidate
 
-Accept only one task-bound Release evidence package naming the frozen integration candidate and required receipts. Verify release readiness and emit evidence only.
+Accept only one task-bound Release evidence package naming the frozen integration candidate and required receipts. Verify release readiness, emit evidence only, and declare it through `kanban_complete(artifacts=[...])` for run-bound SHA-256 custody.
 
 Denied: merge, deployment, publication, tag/release creation, environment mutation, credential/configuration changes, source repair, successor creation, or treating a GO verdict as execution authority.
 

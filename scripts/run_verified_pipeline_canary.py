@@ -32,6 +32,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db
+from hermes_cli.dashboard_auth.base import Session
 from plugins.verified_pipeline import controller, execution, materializer, release, review, validators
 from plugins.verified_pipeline.dashboard.plugin_api import router
 
@@ -102,8 +103,59 @@ def _latest(kanban_path: Path, assignee: str):
 def _complete(kanban_path: Path, task_id: str, result: str) -> None:
     conn = kanban_db.connect(db_path=kanban_path)
     try:
+        task = kanban_db.claim_task(conn, task_id, claimer="connected-canary-adapter")
+        if task is None or task.current_run_id is None:
+            raise RuntimeError(f"could not claim canary task: {task_id}")
+        if task.workspace_kind == "worktree" and not task.workspace_path:
+            workspace = kanban_db.workspaces_root() / task.id
+            workspace.mkdir(parents=True, exist_ok=True)
+        else:
+            workspace = kanban_db.resolve_workspace(task)
+        kanban_db.set_workspace_path(conn, task.id, workspace)
+        task = kanban_db.get_task(conn, task.id)
+        assert task is not None
+        run_id = int(task.current_run_id)
+        workspace = Path(task.workspace_path).resolve()
+        basis = {
+            "schema": "hermes-role-contract/v2",
+            "profile": task.assignee,
+            "version": "1.0.0",
+            "contract_sha256": task.expected_role_contract_sha256,
+            "configured_toolsets": [],
+            "allowed_toolsets": ["kanban"],
+            "allowed_tools": [],
+            "workspace_only": False,
+            "mandatory_toolsets": ["kanban"],
+            "effective_toolsets": ["kanban"],
+            "task_id": task.id,
+            "run_id": run_id,
+            "workspace_path": str(workspace),
+        }
+        receipt = {
+            **basis,
+            "contract_size": 1,
+            "contract_path": f"/deterministic-canary/{task.assignee}/ROLE_CONTRACT.md",
+            "receipt_id": hashlib.sha256(
+                json.dumps(basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+        }
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ? AND task_id = ?",
+                (json.dumps({"role_contract_admission": receipt}), run_id, task.id),
+            )
+            kanban_db._append_event(
+                conn, task.id, "role_contract_admitted", receipt, run_id=run_id
+            )
+        artifact = workspace / "canary-stage-receipt.txt"
+        artifact.write_text(f"{result}\n", encoding="utf-8")
         if not kanban_db.complete_task(
-            conn, task_id, result=result, fire_lifecycle_hook=False
+            conn,
+            task_id,
+            result=result,
+            metadata={"artifacts": [str(artifact)]},
+            expected_run_id=run_id,
+            fire_lifecycle_hook=False,
         ):
             raise RuntimeError(f"could not complete canary task: {task_id}")
     finally:
@@ -380,6 +432,23 @@ def run(output_dir: Path) -> dict[str, Any]:
     importlib.reload(release)
 
     app = FastAPI()
+
+    @app.middleware("http")
+    async def attach_deterministic_verified_session(request, call_next):
+        # Exercise the plugin's trusted host-session boundary without claiming
+        # that this disposable canary ran a real identity-provider login.
+        request.state.session = Session(
+            user_id="connected-canary-operator",
+            email="canary@example.invalid",
+            display_name="Connected Canary",
+            org_id="canary",
+            provider="deterministic-canary",
+            expires_at=2_000_000_000,
+            access_token="non-secret-canary-token",
+            refresh_token="non-secret-canary-refresh",
+        )
+        return await call_next(request)
+
     app.include_router(router, prefix="/api/plugins/verified-pipeline")
     client = TestClient(app)
     created = client.post(

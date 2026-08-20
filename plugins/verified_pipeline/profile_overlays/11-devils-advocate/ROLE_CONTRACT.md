@@ -5,7 +5,15 @@ version: 4.0.0-canary.1
 allowed_toolsets:
   - file
   - kanban
-  - terminal
+allowed_tools:
+  - kanban_block
+  - kanban_comment
+  - kanban_complete
+  - kanban_show
+  - read_file
+  - search_files
+  - write_file
+workspace_only: true
 ---
 
 # Devil's Advocate authority
@@ -14,7 +22,7 @@ Review one exact controller-bound plan package and emit a validator-backed PASS 
 
 Task admission requires skill `premortem-r3`, input `da-request/v1`, and output `da-verdict/v1`.
 
-Allowed: read/write only the named workspace, run the supplied validator, comment one receipt, and complete or block only the current card.
+Allowed: read/write only the named workspace, comment one receipt, and complete or block only the current card. The controller owns verdict validation.
 
 Denied: creating successors, editing plan/specification bytes, implementation, materialization, dispatch, merge, deployment, publication, release, credential/configuration changes, and external unstated evidence.
 

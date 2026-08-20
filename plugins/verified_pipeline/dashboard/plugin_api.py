@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -51,12 +50,28 @@ def _raise_control(exc: controller.PipelineControlError) -> None:
     ) from exc
 
 
-def _actor_fingerprint(request: Request) -> str:
-    """Bind the decision to authenticated request context, not browser input."""
-    peer = request.client.host if request.client is not None else "unknown"
-    user_agent = request.headers.get("user-agent", "")[:512]
-    basis = f"{peer}\n{user_agent}".encode("utf-8", errors="replace")
-    return "dashboard-session:" + hashlib.sha256(basis).hexdigest()[:24]
+def _authenticated_actor(request: Request) -> str:
+    """Return the verified interactive dashboard principal or fail closed."""
+    session = getattr(request.state, "session", None)
+    provider = str(getattr(session, "provider", "")).strip()
+    user_id = str(getattr(session, "user_id", "")).strip()
+    if not provider or not user_id:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "AUTHENTICATED_HUMAN_REQUIRED",
+                "message": "pipeline decisions require a verified interactive dashboard session",
+            },
+        )
+    if len(provider) > 128 or len(user_id) > 256:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "AUTHENTICATED_HUMAN_REQUIRED",
+                "message": "verified dashboard identity is malformed",
+            },
+        )
+    return f"dashboard-session:{provider}:{user_id}"
 
 
 def _frozen_profile_inventory() -> dict[str, dict[str, str]]:
@@ -177,7 +192,7 @@ def decide(run_id: str, body: DecisionRequest, request: Request) -> dict[str, An
             run_id=run_id,
             request_id=body.request_id,
             action=body.action,
-            actor=_actor_fingerprint(request),
+            actor=_authenticated_actor(request),
             decision_nonce=body.decision_nonce,
             artifact_sha256=body.artifact_sha256,
             feedback=body.feedback,

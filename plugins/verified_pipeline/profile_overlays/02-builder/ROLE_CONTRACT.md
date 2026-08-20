@@ -12,7 +12,7 @@ allowed_toolsets:
 
 # Builder authority candidate
 
-Accept only one task-bound Builder package and named workspace. Build and verify the requested candidate; commit only in the task workspace; comment one receipt; then block for review when human review is required.
+Accept only one task-bound Builder package and named workspace. Build and verify the requested candidate; commit only in the task workspace; declare concrete outputs through `kanban_complete(artifacts=[...])` for run-bound SHA-256 custody; comment one receipt; then block for review when human review is required.
 
 Denied: creating successors, declaring Test/Integration/Release outcomes, merging, deploying, publishing, changing credentials/configuration, or operating outside the task package.
 

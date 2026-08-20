@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 from typing import Any, Callable, Mapping, Optional
 
 from cryptography.exceptions import InvalidSignature
@@ -524,11 +525,18 @@ def _authorized_task_body(payload: Mapping[str, Any], task: Mapping[str, Any]) -
         raise ExecutionError(
             "EXECUTION_TASK_TEMPLATE_DRIFT", "materialized task boundary template drifted"
         )
-    return inert.replace(
+    authorized_body = inert.replace(
         "# Verified implementation task (INERT)",
         "# Verified implementation task (EXECUTION AUTHORIZED)",
         1,
     ).replace(expected, authorized, 1)
+    return (
+        authorized_body
+        + "\n## Completion evidence\n\n"
+        + "Before completing, declare at least one concrete task-workspace output "
+        + "through `kanban_complete(artifacts=[...])`. Completion is rejected unless "
+        + "durable custody binds exact artifact SHA-256 bytes to this terminal run.\n"
+    )
 
 
 def _init_execution_board_schema(conn: sqlite3.Connection) -> None:
@@ -899,6 +907,172 @@ def arm_execution(
         conn.close()
 
 
+def _sha256_regular_file(path: Path) -> tuple[str, int]:
+    try:
+        before = path.lstat()
+    except FileNotFoundError as exc:
+        raise ExecutionError("EXECUTION_ARTIFACT_MISSING", "captured artifact is missing") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise ExecutionError("EXECUTION_ARTIFACT_DRIFT", "captured artifact is not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ExecutionError("EXECUTION_ARTIFACT_DRIFT", "captured artifact cannot be opened safely") from exc
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise ExecutionError("EXECUTION_ARTIFACT_DRIFT", "captured artifact changed while opening")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    finally:
+        os.close(fd)
+    if size != opened.st_size:
+        raise ExecutionError("EXECUTION_ARTIFACT_DRIFT", "captured artifact changed while reading")
+    return digest.hexdigest(), size
+
+
+def _implementation_stage_receipt(
+    board_conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    expected_profile: str,
+    expected_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    events = board_conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = 'completed' "
+        "ORDER BY id DESC LIMIT 2",
+        (task_id,),
+    ).fetchall()
+    if len(events) != 1 or events[0]["run_id"] is None:
+        raise ExecutionError(
+            "EXECUTION_STAGE_RECEIPT_MISSING",
+            "implementation task has no unambiguous terminal run receipt",
+        )
+    run_id = int(events[0]["run_id"])
+    run = board_conn.execute(
+        "SELECT profile, status, outcome, ended_at, metadata FROM task_runs "
+        "WHERE id = ? AND task_id = ?",
+        (run_id, task_id),
+    ).fetchone()
+    admitted = board_conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'role_contract_admitted' ORDER BY id",
+        (task_id, run_id),
+    ).fetchall()
+    if (
+        run is None
+        or run["profile"] != expected_profile
+        or run["status"] != "done"
+        or run["outcome"] != "completed"
+        or run["ended_at"] is None
+        or len(admitted) != 1
+    ):
+        raise ExecutionError(
+            "EXECUTION_STAGE_RUN_MISMATCH",
+            "implementation terminal run does not match admitted stage identity",
+        )
+    try:
+        metadata = json.loads(run["metadata"] or "{}")
+        admission = metadata["role_contract_admission"]
+        admitted_receipt = json.loads(admitted[0]["payload"])
+        admission_basis = {
+            key: admission[key]
+            for key in (
+                "schema",
+                "profile",
+                "version",
+                "contract_sha256",
+                "configured_toolsets",
+                "allowed_toolsets",
+                "allowed_tools",
+                "workspace_only",
+                "mandatory_toolsets",
+                "effective_toolsets",
+                "task_id",
+                "run_id",
+                "workspace_path",
+            )
+        }
+        computed_admission_id = hashlib.sha256(
+            json.dumps(admission_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        completed_payload = json.loads(events[0]["payload"] or "{}")
+        manifest = completed_payload["artifact_manifest"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ExecutionError(
+            "EXECUTION_STAGE_RECEIPT_INVALID",
+            "implementation stage receipt is missing or malformed",
+        ) from exc
+    if (
+        admission != admitted_receipt
+        or admission.get("receipt_id") != computed_admission_id
+        or admission.get("task_id") != task_id
+        or admission.get("run_id") != run_id
+        or admission.get("profile") != expected_profile
+        or admission.get("schema") != expected_contract.get("schema")
+        or admission.get("version") != expected_contract.get("version")
+        or admission.get("contract_sha256") != expected_contract.get("sha256")
+        or not isinstance(manifest, list)
+        or not manifest
+    ):
+        raise ExecutionError(
+            "EXECUTION_STAGE_RECEIPT_MISMATCH",
+            "implementation stage receipt does not match frozen run and artifact custody",
+        )
+    artifacts: list[dict[str, Any]] = []
+    for item in manifest:
+        if not isinstance(item, dict) or item.get("source_run_id") != run_id:
+            raise ExecutionError(
+                "EXECUTION_STAGE_RECEIPT_MISMATCH",
+                "artifact manifest is not bound to the terminal run",
+            )
+        attachment = board_conn.execute(
+            "SELECT filename, stored_path, size, sha256, source_run_id, artifact_role "
+            "FROM task_attachments WHERE task_id = ? AND capture_key = ?",
+            (task_id, item.get("capture_key")),
+        ).fetchone()
+        if attachment is None:
+            raise ExecutionError("EXECUTION_ARTIFACT_MISSING", "captured artifact row is missing")
+        observed_sha, observed_size = _sha256_regular_file(Path(attachment["stored_path"]))
+        if (
+            attachment["source_run_id"] != run_id
+            or attachment["filename"] != item.get("filename")
+            or attachment["sha256"] != item.get("sha256")
+            or attachment["size"] != item.get("size")
+            or observed_sha != item.get("sha256")
+            or observed_size != item.get("size")
+        ):
+            raise ExecutionError("EXECUTION_ARTIFACT_DRIFT", "captured artifact bytes or metadata drifted")
+        artifacts.append(
+            {
+                "filename": item["filename"],
+                "size": item["size"],
+                "sha256": item["sha256"],
+                "source_run_id": run_id,
+                "artifact_role": attachment["artifact_role"],
+                "capture_key": item["capture_key"],
+            }
+        )
+    return {
+        "task_id": task_id,
+        "run_id": run_id,
+        "profile": expected_profile,
+        "role_contract_sha256": admission["contract_sha256"],
+        "admission_receipt_id": admission["receipt_id"],
+        "artifacts": artifacts,
+    }
+
+
 def _validated_completion_receipt_on_board_connection(
     execution_key: str,
     *,
@@ -955,11 +1129,18 @@ def _validated_completion_receipt_on_board_connection(
             (task_id,),
         ).fetchone()
         assert task_row is not None
+        stage_receipt = _implementation_stage_receipt(
+            board_conn,
+            task_id=task_id,
+            expected_profile=task["assignee"],
+            expected_contract=payload["frozen_profiles"][task["assignee"]],
+        )
         task_results[task["id"]] = {
             "task_id": task_id,
             "status": task_row["status"],
             "result": task_row["result"],
             "completed_at": task_row["completed_at"],
+            "stage_receipt": stage_receipt,
         }
     receipt = {
         "schema": EXECUTION_CONTROLLER_ID,

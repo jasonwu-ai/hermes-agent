@@ -29,6 +29,7 @@ _TOOLSET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 _EXPECTED_FRONTMATTER_KEYS = frozenset(
     {"schema", "profile", "version", "allowed_toolsets"}
 )
+_OPTIONAL_FRONTMATTER_KEYS = frozenset({"allowed_tools", "workspace_only"})
 
 
 class RoleContractError(RuntimeError):
@@ -42,6 +43,8 @@ class RoleContract:
     profile: str
     version: str
     allowed_toolsets: tuple[str, ...]
+    allowed_tools: tuple[str, ...]
+    workspace_only: bool
     body: str
     sha256: str
     raw_size: int
@@ -55,6 +58,7 @@ class RoleContractAdmission:
     mandatory_toolsets: tuple[str, ...]
     task_id: str
     run_id: Optional[int]
+    workspace_path: Optional[str]
     receipt_id: str
 
     def receipt(self) -> dict[str, Any]:
@@ -67,10 +71,13 @@ class RoleContractAdmission:
             "contract_path": str(self.contract.path),
             "configured_toolsets": list(self.configured_toolsets),
             "allowed_toolsets": list(self.contract.allowed_toolsets),
+            "allowed_tools": list(self.contract.allowed_tools),
+            "workspace_only": self.contract.workspace_only,
             "mandatory_toolsets": list(self.mandatory_toolsets),
             "effective_toolsets": list(self.effective_toolsets),
             "task_id": self.task_id,
             "run_id": self.run_id,
+            "workspace_path": self.workspace_path,
             "receipt_id": self.receipt_id,
         }
 
@@ -152,9 +159,11 @@ def _parse_contract(raw: bytes, path: Path, expected_profile: str) -> RoleContra
     if not isinstance(frontmatter, dict):
         raise RoleContractError(f"role contract front matter must be a mapping: {path}")
     keys = frozenset(str(k) for k in frontmatter)
-    if keys != _EXPECTED_FRONTMATTER_KEYS:
+    if not _EXPECTED_FRONTMATTER_KEYS.issubset(keys) or not keys.issubset(
+        _EXPECTED_FRONTMATTER_KEYS | _OPTIONAL_FRONTMATTER_KEYS
+    ):
         missing = sorted(_EXPECTED_FRONTMATTER_KEYS - keys)
-        extra = sorted(keys - _EXPECTED_FRONTMATTER_KEYS)
+        extra = sorted(keys - _EXPECTED_FRONTMATTER_KEYS - _OPTIONAL_FRONTMATTER_KEYS)
         raise RoleContractError(
             f"role contract front matter keys mismatch: missing={missing}, extra={extra}"
         )
@@ -163,6 +172,8 @@ def _parse_contract(raw: bytes, path: Path, expected_profile: str) -> RoleContra
     profile = frontmatter.get("profile")
     version = frontmatter.get("version")
     allowed = frontmatter.get("allowed_toolsets")
+    allowed_tools = frontmatter.get("allowed_tools", [])
+    workspace_only = frontmatter.get("workspace_only", False)
     if schema != ROLE_CONTRACT_SCHEMA:
         raise RoleContractError(
             f"unsupported role contract schema {schema!r}; expected {ROLE_CONTRACT_SCHEMA!r}"
@@ -175,6 +186,18 @@ def _parse_contract(raw: bytes, path: Path, expected_profile: str) -> RoleContra
         raise RoleContractError("role contract version must be a semantic version string")
     if not isinstance(allowed, list) or not allowed:
         raise RoleContractError("role contract allowed_toolsets must be a non-empty list")
+    if not isinstance(allowed_tools, list) or any(
+        not isinstance(item, str) or not _TOOLSET_RE.fullmatch(item.strip())
+        for item in allowed_tools
+    ):
+        raise RoleContractError("role contract allowed_tools must be a list of tool names")
+    normalized_tools = tuple(sorted({item.strip() for item in allowed_tools}))
+    if len(normalized_tools) != len(allowed_tools):
+        raise RoleContractError("role contract allowed_tools must not contain duplicates")
+    if not isinstance(workspace_only, bool):
+        raise RoleContractError("role contract workspace_only must be boolean")
+    if workspace_only and not normalized_tools:
+        raise RoleContractError("workspace_only role contract requires allowed_tools")
 
     normalized: list[str] = []
     seen: set[str] = set()
@@ -209,6 +232,8 @@ def _parse_contract(raw: bytes, path: Path, expected_profile: str) -> RoleContra
         profile=profile.strip(),
         version=version.strip(),
         allowed_toolsets=tuple(sorted(normalized)),
+        allowed_tools=normalized_tools,
+        workspace_only=workspace_only,
         body=body,
         sha256=hashlib.sha256(raw).hexdigest(),
         raw_size=len(raw),
@@ -244,6 +269,7 @@ def admit_role_contract(
     *,
     task_id: str,
     run_id: Optional[int],
+    workspace_path: Optional[str] = None,
     required: bool,
 ) -> Optional[RoleContractAdmission]:
     """Admit a profile contract and derive a non-widening toolset surface."""
@@ -268,10 +294,13 @@ def admit_role_contract(
         "contract_sha256": contract.sha256,
         "configured_toolsets": list(configured),
         "allowed_toolsets": list(contract.allowed_toolsets),
+        "allowed_tools": list(contract.allowed_tools),
+        "workspace_only": contract.workspace_only,
         "mandatory_toolsets": sorted(_MANDATORY_WORKER_TOOLSETS),
         "effective_toolsets": list(effective),
         "task_id": task_id,
         "run_id": run_id,
+        "workspace_path": workspace_path,
     }
     receipt_id = hashlib.sha256(
         json.dumps(receipt_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -283,6 +312,7 @@ def admit_role_contract(
         mandatory_toolsets=tuple(sorted(_MANDATORY_WORKER_TOOLSETS)),
         task_id=task_id,
         run_id=run_id,
+        workspace_path=workspace_path,
         receipt_id=receipt_id,
     )
 

@@ -4621,6 +4621,27 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    existing_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+        (run_id, task_id),
+    ).fetchone()
+    existing_metadata: dict = {}
+    if existing_row is not None and existing_row["metadata"]:
+        try:
+            parsed = json.loads(existing_row["metadata"])
+            if isinstance(parsed, dict):
+                existing_metadata = parsed
+        except (TypeError, ValueError, json.JSONDecodeError):
+            existing_metadata = {}
+    closing_metadata = dict(existing_metadata)
+    if isinstance(metadata, dict):
+        for key, value in metadata.items():
+            # Admission is dispatcher-owned provenance. A worker completion may
+            # neither forge it on an unadmitted run nor replace the receipt
+            # persisted before spawn.
+            if key == "role_contract_admission":
+                continue
+            closing_metadata[key] = value
     conn.execute(
         """
         UPDATE task_runs
@@ -4641,7 +4662,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(closing_metadata, ensure_ascii=False) if closing_metadata else None,
             now,
             run_id,
         ),
@@ -6017,13 +6038,21 @@ def _persist_scratch_completion_artifacts(
         "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
-    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+    if (
+        not row
+        or row["workspace_kind"] not in {"scratch", "dir", "worktree"}
+        or not row["workspace_path"]
+    ):
         return
 
     workspace = Path(row["workspace_path"]).expanduser()
-    is_managed, board = _managed_scratch_path_info(workspace)
-    if not is_managed:
-        return
+    board: Optional[str]
+    if row["workspace_kind"] == "scratch":
+        is_managed, board = _managed_scratch_path_info(workspace)
+        if not is_managed:
+            return
+    else:
+        board = get_current_board()
 
     workspace_root = Path(os.path.abspath(workspace))
     has_managed_candidate = False
@@ -11759,6 +11788,11 @@ def _admit_worker_role_contract(
             configured,
             task_id=task.id,
             run_id=task.current_run_id,
+            workspace_path=(
+                str(Path(task.workspace_path).expanduser().resolve())
+                if task.workspace_path
+                else None
+            ),
             required=bool(task.require_role_contract),
         )
     except RoleContractError as exc:
@@ -12018,6 +12052,11 @@ def _default_spawn(
             worker_toolsets or [],
             task_id=task.id,
             run_id=task.current_run_id,
+            workspace_path=(
+                str(Path(task.workspace_path).expanduser().resolve())
+                if task.workspace_path
+                else None
+            ),
             required=bool(task.require_role_contract),
         )
         setattr(task, "_role_contract_admission", admission)
@@ -12051,6 +12090,17 @@ def _default_spawn(
         env["HERMES_ROLE_CONTRACT_VERSION"] = admission.contract.version
         env["HERMES_ROLE_CONTRACT_SHA256"] = admission.contract.sha256
         env["HERMES_ROLE_CONTRACT_RECEIPT_ID"] = admission.receipt_id
+        if admission.contract.allowed_tools:
+            env["HERMES_ROLE_CONTRACT_ALLOWED_TOOLS"] = json.dumps(
+                list(admission.contract.allowed_tools), separators=(",", ":")
+            )
+        if admission.contract.workspace_only:
+            if not admission.workspace_path:
+                raise _WorkerRoleContractAdmissionError(
+                    f"workspace-only role contract has no bound workspace for task {task.id}"
+                )
+            env["HERMES_ROLE_CONTRACT_WORKSPACE_ONLY"] = "1"
+            env["HERMES_ROLE_CONTRACT_WORKSPACE_PATH"] = admission.workspace_path
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
