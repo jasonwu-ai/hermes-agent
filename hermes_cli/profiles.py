@@ -38,7 +38,12 @@ from agent.skill_utils import is_excluded_skill_path
 logger = logging.getLogger(__name__)
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_NUMERIC_PROFILE_PREFIX_RE = re.compile(r"^\d{2}-")
 _WARNED_MISSING_ALLOWLIST_ENTRIES: set[tuple[str, ...]] = set()
+
+
+class AmbiguousProfileError(ValueError):
+    """Raised when a bare runtime profile reference has multiple matches."""
 
 # Directories bootstrapped inside every new profile
 _PROFILE_DIRS = [
@@ -372,19 +377,97 @@ def validate_alias_name(name: str) -> None:
 
 
 def get_profile_dir(name: str) -> Path:
-    """Resolve a profile name to its HERMES_HOME directory."""
+    """Return the exact on-disk path for a profile identifier.
+
+    This helper intentionally does not resolve shorthand references. Profile
+    management operations (create/delete/rename/export) must remain exact so a
+    bare name can never mutate a differently named prefixed profile.
+    """
     canon = normalize_profile_name(name)
     if canon == "default":
         return _get_default_hermes_home()
     return _get_profiles_root() / canon
 
 
-def profile_exists(name: str) -> bool:
-    """Check whether a profile directory exists."""
+def resolve_profile_reference(
+    name: str,
+    *,
+    profiles_root: Optional[Path] = None,
+) -> str:
+    """Resolve a runtime profile reference to one installed canonical id.
+
+    Exact profile ids always win. If an exact directory is absent, an
+    *unprefixed* reference such as ``builder`` may resolve to exactly one
+    ``NN-builder`` directory. Multiple suffix matches fail closed rather than
+    depending on filesystem iteration order. This resolver is for runtime
+    ingress (``-p``, worker dispatch), not profile-management paths.
+    """
     canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    if canon == "default":
+        return canon
+
+    root = profiles_root if profiles_root is not None else _get_profiles_root()
+    exact = root / canon
+    if exact.is_dir():
+        return canon
+
+    # A caller that already supplied an explicit numeric profile id does not
+    # get a second prefix silently added (``02-builder`` must never fall back
+    # to ``07-02-builder``).
+    matches: list[str] = []
+    if not _NUMERIC_PROFILE_PREFIX_RE.match(canon):
+        candidate_re = re.compile(rf"^\d{{2}}-{re.escape(canon)}$")
+        try:
+            matches = sorted(
+                entry.name
+                for entry in root.iterdir()
+                if candidate_re.fullmatch(entry.name) and entry.is_dir()
+            )
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"Unable to inspect profiles directory {root}: {exc}"
+            ) from exc
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        joined = ", ".join(matches)
+        raise AmbiguousProfileError(
+            f"Profile reference {canon!r} is ambiguous; use one of: {joined}"
+        )
+    raise FileNotFoundError(
+        f"Profile {canon!r} does not exist. "
+        f"Create it with: hermes profile create {canon}"
+    )
+
+
+def profile_exists(name: str) -> bool:
+    """Check whether an exact, valid profile directory exists."""
+    canon = normalize_profile_name(name)
+    try:
+        validate_profile_name(canon)
+    except ValueError:
+        return False
     if canon == "default":
         return True
     return get_profile_dir(canon).is_dir()
+
+
+def runtime_profile_exists(name: str) -> bool:
+    """Return whether a runtime reference resolves to exactly one profile.
+
+    Ambiguous or invalid shorthand is deliberately non-spawnable. Exact
+    management helpers remain separate and never reinterpret a destructive
+    target.
+    """
+    try:
+        if profile_exists(name):
+            return True
+        resolve_profile_reference(name)
+    except (FileNotFoundError, ValueError):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2481,12 +2564,6 @@ def resolve_profile_env(profile_name: str) -> str:
         root = _get_default_hermes_home()
     if canon == "default":
         return str(root)
-    profile_dir = root / "profiles" / canon
-
-    if not profile_dir.is_dir():
-        raise FileNotFoundError(
-            f"Profile '{canon}' does not exist. "
-            f"Create it with: hermes profile create {canon}"
-        )
-
-    return str(profile_dir)
+    profiles_root = root / "profiles"
+    resolved = resolve_profile_reference(canon, profiles_root=profiles_root)
+    return str(profiles_root / resolved)

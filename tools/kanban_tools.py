@@ -1324,6 +1324,11 @@ def _handle_attachments(args: dict, **kw) -> str:
                         "filename": a.filename,
                         "content_type": a.content_type,
                         "size": a.size,
+                        "sha256": a.sha256,
+                        "source_path": a.source_path,
+                        "source_run_id": a.source_run_id,
+                        "artifact_role": a.artifact_role,
+                        "capture_key": a.capture_key,
                         "uploaded_by": a.uploaded_by,
                         "stored_path": a.stored_path,
                         "created_at": a.created_at,
@@ -1408,6 +1413,11 @@ def _handle_create(args: dict, **kw) -> str:
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
+    require_role_contract, role_contract_bool_error = _parse_bool_arg(
+        args, "require_role_contract"
+    )
+    if role_contract_bool_error:
+        return tool_error(role_contract_bool_error)
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
@@ -1458,6 +1468,7 @@ def _handle_create(args: dict, **kw) -> str:
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
+                require_role_contract=require_role_contract,
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
@@ -2281,6 +2292,15 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "require_role_contract": {
+                "type": "boolean",
+                "description": (
+                    "Fail closed unless the assignee profile's exact "
+                    "ROLE_CONTRACT.md bytes are validated and recorded in a "
+                    "run-bound admission receipt before worker spawn. "
+                    "Defaults to false for ordinary cards."
                 ),
             },
             "model": {
