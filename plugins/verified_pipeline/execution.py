@@ -899,16 +899,16 @@ def arm_execution(
         conn.close()
 
 
-def record_execution_completion(
+def _validated_completion_receipt_on_board_connection(
     execution_key: str,
     *,
     board: str,
     authority_verifier: Mapping[str, Any],
     db_path: Optional[str | os.PathLike[str]],
-    kanban_db_path: str | os.PathLike[str],
+    board_conn: sqlite3.Connection,
+    require_existing: bool = False,
 ) -> dict[str, Any]:
-    """Append a release-inert receipt only after every bound task is done."""
-    init_execution_schema(db_path)
+    """Reconstruct exact completion using an already transaction-bound board."""
     row, intent, payload = _load_execution(
         execution_key, authority_verifier=authority_verifier, db_path=db_path
     )
@@ -931,45 +931,36 @@ def record_execution_completion(
             "EXECUTION_BOARD_MISMATCH", "requested board does not match execution authority"
         )
 
-    from hermes_cli import kanban_db
-
-    board_conn = kanban_db.connect(db_path=Path(kanban_db_path))
-    _init_execution_board_schema(board_conn)
-    try:
-        with kanban_db.write_txn(board_conn):
-            _validate_board_arm_receipt(board_conn, intent=intent, payload=payload)
-            _validate_arm_events(
-                board_conn,
-                execution_key=execution_key,
-                expected_statuses={
-                    intent["task_map"][task["id"]]: _expected_armed_status(task)
-                    for task in materializer._topological_tasks(payload["plan"])
-                },
-            )
-            _validate_bound_graph(
-                board_conn,
-                intent=intent,
-                payload=payload,
-                allowed_statuses={"done"},
-                authorized=True,
-            )
-            task_results: dict[str, dict[str, Any]] = {}
-            for task in payload["plan"]["tasks"]:
-                task_id = intent["task_map"][task["id"]]
-                task_row = board_conn.execute(
-                    "SELECT status, result, completed_at FROM tasks WHERE id = ?",
-                    (task_id,),
-                ).fetchone()
-                assert task_row is not None
-                task_results[task["id"]] = {
-                    "task_id": task_id,
-                    "status": task_row["status"],
-                    "result": task_row["result"],
-                    "completed_at": task_row["completed_at"],
-                }
-    finally:
-        board_conn.close()
-
+    _validate_board_arm_receipt(board_conn, intent=intent, payload=payload)
+    _validate_arm_events(
+        board_conn,
+        execution_key=execution_key,
+        expected_statuses={
+            intent["task_map"][task["id"]]: _expected_armed_status(task)
+            for task in materializer._topological_tasks(payload["plan"])
+        },
+    )
+    _validate_bound_graph(
+        board_conn,
+        intent=intent,
+        payload=payload,
+        allowed_statuses={"done"},
+        authorized=True,
+    )
+    task_results: dict[str, dict[str, Any]] = {}
+    for task in payload["plan"]["tasks"]:
+        task_id = intent["task_map"][task["id"]]
+        task_row = board_conn.execute(
+            "SELECT status, result, completed_at FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        assert task_row is not None
+        task_results[task["id"]] = {
+            "task_id": task_id,
+            "status": task_row["status"],
+            "result": task_row["result"],
+            "completed_at": task_row["completed_at"],
+        }
     receipt = {
         "schema": EXECUTION_CONTROLLER_ID,
         "execution_key": execution_key,
@@ -980,6 +971,49 @@ def record_execution_completion(
         "task_results": task_results,
         "boundary": "release review required; no merge, deploy, or release authority",
     }
+    if require_existing:
+        receipt_conn = controller.connect(db_path)
+        try:
+            existing = receipt_conn.execute(
+                "SELECT payload_json FROM execution_completion_receipts "
+                "WHERE execution_key = ?",
+                (execution_key,),
+            ).fetchone()
+        finally:
+            receipt_conn.close()
+        if existing is None or existing["payload_json"] != _canonical(receipt):
+            raise ExecutionError(
+                "EXECUTION_COMPLETION_DRIFT",
+                "stored completion receipt does not match the locked board",
+            )
+    return receipt
+
+
+def record_execution_completion(
+    execution_key: str,
+    *,
+    board: str,
+    authority_verifier: Mapping[str, Any],
+    db_path: Optional[str | os.PathLike[str]],
+    kanban_db_path: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Append a release-inert receipt only after every bound task is done."""
+    init_execution_schema(db_path)
+    from hermes_cli import kanban_db
+
+    board_conn = kanban_db.connect(db_path=Path(kanban_db_path))
+    _init_execution_board_schema(board_conn)
+    try:
+        with kanban_db.write_txn(board_conn):
+            receipt = _validated_completion_receipt_on_board_connection(
+                execution_key,
+                board=board,
+                authority_verifier=authority_verifier,
+                db_path=db_path,
+                board_conn=board_conn,
+            )
+    finally:
+        board_conn.close()
     conn = controller.connect(db_path)
     try:
         with controller._write_txn(conn):
@@ -1001,8 +1035,8 @@ def record_execution_completion(
                 "VALUES (?, ?, ?, ?, ?)",
                 (
                     execution_key,
-                    row["run_id"],
-                    row["plan_sha256"],
+                    receipt["run_id"],
+                    receipt["plan_sha256"],
                     _canonical(receipt),
                     controller._now(),
                 ),
