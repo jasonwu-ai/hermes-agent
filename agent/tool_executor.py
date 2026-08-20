@@ -199,6 +199,14 @@ def _role_contract_tool_block(function_name: str, function_args: dict) -> Option
         requested_task = function_args.get("task_id")
         if requested_task is not None and str(requested_task) != current_task:
             return "role-contract Kanban action is limited to the current task"
+        current_board = os.environ.get("HERMES_KANBAN_BOARD")
+        requested_board = function_args.get("board")
+        if (
+            current_board
+            and requested_board is not None
+            and str(requested_board) != current_board
+        ):
+            return "role-contract Kanban action is limited to the admitted board"
 
     if os.environ.get("HERMES_ROLE_CONTRACT_WORKSPACE_ONLY") != "1":
         return None
@@ -206,6 +214,8 @@ def _role_contract_tool_block(function_name: str, function_args: dict) -> Option
     if not workspace_text:
         return "workspace-only role contract has no admitted workspace"
     workspace = Path(workspace_text).expanduser().resolve()
+    if function_name == "patch" and function_args.get("mode") == "patch":
+        return "workspace-only role contracts do not admit multi-file patch payloads"
     path_values: list[str] = []
     for key in ("path", "workdir", "output_path"):
         value = function_args.get(key)
@@ -216,6 +226,13 @@ def _role_contract_tool_block(function_name: str, function_args: dict) -> Option
         path_values.append(artifacts)
     elif isinstance(artifacts, (list, tuple)):
         path_values.extend(str(value) for value in artifacts)
+    metadata = function_args.get("metadata")
+    if isinstance(metadata, dict):
+        nested_artifacts = metadata.get("artifacts")
+        if isinstance(nested_artifacts, str):
+            path_values.append(nested_artifacts)
+        elif isinstance(nested_artifacts, (list, tuple)):
+            path_values.extend(str(value) for value in nested_artifacts)
     for value in path_values:
         candidate = Path(value).expanduser()
         if not candidate.is_absolute():
@@ -701,6 +718,11 @@ def _run_agent_tool_execution_middleware(
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
 
+        if block_message is None:
+            block_message = _role_contract_tool_block(function_name, final_args)
+            if block_message is not None:
+                block_error_type = "role_contract_block"
+
         guardrail_decision = None
         if block_message is None:
             guardrail_decision = agent._tool_guardrails.before_call(
@@ -760,6 +782,9 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
+            final_block = _role_contract_tool_block(function_name, final_args)
+            if final_block is not None:
+                return json.dumps({"error": final_block}, ensure_ascii=False)
             return execute(final_args)
         finally:
             _hb_stop.set()

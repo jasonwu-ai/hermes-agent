@@ -133,6 +133,18 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_rejects_nested_metadata_artifacts(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(
+        kt._handle_complete({
+            "summary": "attempt trusted-reader escape",
+            "metadata": {"artifacts": ["/tmp/outside-workspace-secret"]},
+        })
+    )
+    assert "metadata.artifacts is not accepted" in out["error"]
+
+
 def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the

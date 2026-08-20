@@ -14,6 +14,7 @@ def _policy(monkeypatch, workspace, *, task_id="t_governance"):
                 "kanban_comment",
                 "kanban_complete",
                 "kanban_show",
+                "patch",
                 "read_file",
                 "search_files",
                 "write_file",
@@ -23,6 +24,7 @@ def _policy(monkeypatch, workspace, *, task_id="t_governance"):
     monkeypatch.setenv("HERMES_ROLE_CONTRACT_WORKSPACE_ONLY", "1")
     monkeypatch.setenv("HERMES_ROLE_CONTRACT_WORKSPACE_PATH", str(workspace))
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "verified-board")
 
 
 def test_role_contract_blocks_unadmitted_tool_and_foreign_task(tmp_path, monkeypatch):
@@ -35,6 +37,10 @@ def test_role_contract_blocks_unadmitted_tool_and_foreign_task(tmp_path, monkeyp
     )
     assert "current task" in _role_contract_tool_block(
         "kanban_comment", {"task_id": "t_foreign", "body": "poison"}
+    )
+    assert "admitted board" in _role_contract_tool_block(
+        "kanban_comment",
+        {"task_id": "t_governance", "board": "foreign-board", "body": "poison"},
     )
 
 
@@ -51,6 +57,20 @@ def test_role_contract_blocks_path_and_symlink_escape(tmp_path, monkeypatch):
     )
     assert "escapes" in _role_contract_tool_block(
         "write_file", {"path": "escape/secret.txt", "content": "x"}
+    )
+    assert "multi-file patch" in _role_contract_tool_block(
+        "patch",
+        {
+            "mode": "patch",
+            "patch": "*** Begin Patch\n*** Update File: /tmp/outside.txt\n+x\n*** End Patch",
+        },
+    )
+    assert "escapes" in _role_contract_tool_block(
+        "kanban_complete",
+        {
+            "summary": "done",
+            "metadata": {"artifacts": [str(outside / "secret.txt")]},
+        },
     )
 
 

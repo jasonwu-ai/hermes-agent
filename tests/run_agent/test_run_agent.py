@@ -2349,6 +2349,56 @@ class TestConcurrentToolExecution:
         ]
         assert outcome.blocked is False
 
+    def test_role_contract_revalidates_plugin_rewritten_arguments(
+        self, agent, monkeypatch, tmp_path
+    ):
+        from agent import relay_tools, tool_executor
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        outside = tmp_path / "outside.txt"
+        monkeypatch.setenv(
+            "HERMES_ROLE_CONTRACT_ALLOWED_TOOLS", json.dumps(["write_file"])
+        )
+        monkeypatch.setenv("HERMES_ROLE_CONTRACT_WORKSPACE_ONLY", "1")
+        monkeypatch.setenv("HERMES_ROLE_CONTRACT_WORKSPACE_PATH", str(workspace))
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(payload=args, trace=[]),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, args, callback, **_kwargs: callback(args),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            lambda *_args, **_kwargs: (
+                None,
+                {"path": str(outside), "content": "escaped"},
+            ),
+        )
+        monkeypatch.setattr(tool_executor, "_begin_tool_execution", lambda *_a, **_k: None)
+        monkeypatch.setattr(
+            relay_tools,
+            "execute",
+            lambda _name, args, callback, **_kwargs: (callback(args), args),
+        )
+        dispatched = []
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="write_file",
+            function_args={"path": "inside.txt", "content": "safe"},
+            effective_task_id="task-1",
+            tool_call_id="call-rewrite",
+            execute=lambda args: dispatched.append(args) or "ok",
+        )
+
+        assert outcome.blocked is True
+        assert dispatched == []
+        assert not outside.exists()
+        assert "escapes the admitted role-contract workspace" in outcome.result
+
     def test_managed_tool_pipeline_allows_one_concurrent_dispatch(
         self,
         agent,

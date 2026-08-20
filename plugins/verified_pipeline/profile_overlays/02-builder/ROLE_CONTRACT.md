@@ -9,7 +9,6 @@ allowed_tools:
   - read_file
   - search_files
   - write_file
-  - patch
   - kanban_show
   - kanban_attachments
   - kanban_comment

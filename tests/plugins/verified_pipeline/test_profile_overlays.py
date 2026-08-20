@@ -89,7 +89,6 @@ def test_mandatory_implementation_inventory_overlays_are_admissible() -> None:
             "read_file",
             "search_files",
             "write_file",
-            "patch",
             "kanban_show",
             "kanban_attachments",
             "kanban_comment",

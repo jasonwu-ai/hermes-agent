@@ -668,6 +668,10 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    if isinstance(metadata, dict) and "artifacts" in metadata:
+        return tool_error(
+            "metadata.artifacts is not accepted; declare artifacts through the top-level artifacts field"
+        )
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
@@ -719,20 +723,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"metadata must be an object/dict, got "
                     f"{type(metadata).__name__}"
                 )
-            # Don't overwrite an existing metadata.artifacts the worker
-            # passed manually — merge instead.
-            existing = metadata.get("artifacts")
-            if isinstance(existing, (list, tuple)):
-                merged: list[str] = []
-                seen: set[str] = set()
-                for item in list(existing) + artifacts:
-                    s = str(item).strip()
-                    if s and s not in seen:
-                        seen.add(s)
-                        merged.append(s)
-                metadata["artifacts"] = merged
-            else:
-                metadata["artifacts"] = artifacts
+            metadata["artifacts"] = artifacts
     if not (summary or result):
         return tool_error(
             "provide at least one of: summary (preferred), result"
