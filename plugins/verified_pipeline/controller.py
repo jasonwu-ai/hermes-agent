@@ -36,6 +36,13 @@ CONTROLLER_ID = "verified-pipeline/decision-outbox/v1"
 MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
 PLANNER_PROFILE = "07-planner"
 REVISION_PROFILE = "00-cos"
+IMPLEMENTATION_PROFILES = (
+    "02-builder",
+    "09-test",
+    "10-validator",
+    "06-integration",
+    "08-release",
+)
 VALID_ACTIONS = frozenset({"approve", "request_changes"})
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")

@@ -41,6 +41,8 @@ def test_authenticated_surface_freezes_profiles_and_projects_one_task(tmp_path, 
     _write_contract(home, controller.PLANNER_PROFILE)
     _write_contract(home, review.DA_PROFILE)
     _write_contract(home, review.CEO_PROFILE)
+    for profile in controller.IMPLEMENTATION_PROFILES:
+        _write_contract(home, profile)
     kanban_path = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(kanban_path))
@@ -93,6 +95,7 @@ def test_authenticated_surface_freezes_profiles_and_projects_one_task(tmp_path, 
             controller.PLANNER_PROFILE,
             review.DA_PROFILE,
             review.CEO_PROFILE,
+            *controller.IMPLEMENTATION_PROFILES,
         ]
     )
     assert intake["authority_ceiling"] == [
