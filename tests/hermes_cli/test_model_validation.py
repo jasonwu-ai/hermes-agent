@@ -314,6 +314,14 @@ class TestCopilotNormalization:
         assert opencode_model_api_mode("opencode-zen-custom", "grok-4.5") == "codex_responses"
         assert opencode_model_api_mode("OpenCode-Zen-Custom", "claude-3-7-sonnet") == "anthropic_messages"
 
+    def test_unrelated_provider_prefixes_are_not_opencode_families(self):
+        from hermes_cli.models import opencode_provider_family
+
+        assert opencode_provider_family("opencode-google") is None
+        assert opencode_provider_family("opencode-gopher") is None
+        assert opencode_provider_family("opencode-zender") is None
+        assert opencode_provider_family("OpenCode-Google") is None
+
 
 class TestNormalizeOpencodeBaseUrl:
     """Symmetric /v1 normalization for OpenCode Zen / Go base URLs.

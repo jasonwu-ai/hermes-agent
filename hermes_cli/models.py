@@ -5291,9 +5291,9 @@ def opencode_provider_family(provider_id: Optional[str]) -> Optional[str]:
     canonical = normalize_provider(provider_id)
     if canonical in {"opencode-zen", "opencode-go"}:
         return canonical
-    if raw.startswith("opencode-go"):
+    if raw == "opencode-go" or raw.startswith("opencode-go-"):
         return "opencode-go"
-    if raw.startswith("opencode-zen"):
+    if raw == "opencode-zen" or raw.startswith("opencode-zen-"):
         return "opencode-zen"
     return None
 
