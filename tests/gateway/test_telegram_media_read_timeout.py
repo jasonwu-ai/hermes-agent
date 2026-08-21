@@ -24,7 +24,11 @@ from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
 @pytest.fixture
-def adapter():
+def adapter(monkeypatch):
+    # These tests exercise Telegram timeout propagation, not DNS/SSRF policy.
+    # Admit the synthetic example.com URL deterministically so qualification
+    # never depends on external DNS availability.
+    monkeypatch.setattr("tools.url_safety.is_safe_url", lambda _url: True)
     a = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
     a._bot = MagicMock()
     a._metadata_thread_id = lambda metadata: None
