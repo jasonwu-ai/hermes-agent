@@ -389,6 +389,18 @@ def test_new_da_request_exposes_calibrated_score_contract(tmp_path):
     assert da_request["risk_policy"]["score_floor"] == 0
     assert validators.calibrated_score([], da_request["risk_policy"]) == 100
 
+    custom_policy = dict(da_request["risk_policy"])
+    custom_policy["score_base"] = 80
+    custom_policy["score_floor"] = 10
+    custom_request = json.loads(json.dumps(da_request))
+    custom_request["risk_policy"] = custom_policy
+    validators.validate_da_request(custom_request)
+    assert validators.calibrated_score([], custom_policy) == 80
+    unresolved = _da_finding(1)
+    assert validators.calibrated_score([unresolved], custom_policy) == 45
+    resolved = {**unresolved, "resolved": True}
+    assert validators.calibrated_score([resolved], custom_policy) == 80
+
     malformed_request = json.loads(json.dumps(da_request))
     del malformed_request["risk_policy"]["score_base"]
     with pytest.raises(validators.ArtifactValidationError, match="risk_policy fields"):

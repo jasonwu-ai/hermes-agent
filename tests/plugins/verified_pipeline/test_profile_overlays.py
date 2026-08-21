@@ -58,7 +58,8 @@ def test_da_overlay_matches_controller_packet_and_validator_schema() -> None:
     assert "deterministic controller validates" in text
     assert "score_base" in text
     assert "score_floor" in text
-    assert "zero findings score exactly 100" in text
+    assert "zero findings score exactly `score_base` for v2" in text
+    assert "exactly 100 for legacy v1" in text
     assert "not a residual-risk score" in text
     assert "verified_pipeline_validators.py" not in text
     assert "terminal" not in contract.allowed_tools
