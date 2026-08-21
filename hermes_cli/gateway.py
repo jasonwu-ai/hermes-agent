@@ -5721,6 +5721,25 @@ def _guard_official_docker_root_gateway() -> None:
     sys.exit(1)
 
 
+def _running_under_systemd(env=None) -> bool:
+    """Return whether systemd already owns this process lifecycle."""
+    source = os.environ if env is None else env
+    return bool(
+        str(source.get("INVOCATION_ID", "")).strip()
+        or str(source.get("SYSTEMD_EXEC_PID", "")).strip()
+    )
+
+
+def _refresh_systemd_unit_for_gateway_launch() -> None:
+    """Best-effort refresh for a manual gateway launch, never a service boot."""
+    if not supports_systemd_services() or _running_under_systemd():
+        return
+    try:
+        refresh_systemd_unit_if_needed(system=False)
+    except Exception:
+        pass  # best-effort; don't block gateway startup
+
+
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
     """Run the gateway in foreground.
 
@@ -5785,19 +5804,10 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         except (OSError, AttributeError):
             pass
 
-    # Refresh the systemd unit definition on every boot so that restart
-    # settings (RestartSec, StartLimitIntervalSec, etc.) stay current even
-    # when the process was respawned via exit-code-75 (stale-code or
-    # /restart) rather than through `hermes gateway restart` which already
-    # calls refresh_systemd_unit_if_needed().  Without this, a code update
-    # that ships new unit settings won't take effect until the next manual
-    # `hermes gateway start/restart` — leaving the gateway vulnerable to
-    # the exact failure mode the new settings were meant to prevent.
-    if supports_systemd_services():
-        try:
-            refresh_systemd_unit_if_needed(system=False)
-        except Exception:
-            pass  # best-effort; don't block gateway startup
+    # A service-owned gateway must never rewrite/start another unit while
+    # booting. Explicit gateway start/restart paths already refresh their
+    # selected service definition before launch.
+    _refresh_systemd_unit_for_gateway_launch()
 
     from gateway.run import start_gateway
 
