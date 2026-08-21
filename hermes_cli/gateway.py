@@ -5730,6 +5730,16 @@ def _running_under_systemd(env=None) -> bool:
     )
 
 
+def _refresh_systemd_unit_for_gateway_launch() -> None:
+    """Best-effort refresh for a manual gateway launch, never a service boot."""
+    if not supports_systemd_services() or _running_under_systemd():
+        return
+    try:
+        refresh_systemd_unit_if_needed(system=False)
+    except Exception:
+        pass  # best-effort; don't block gateway startup
+
+
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
     """Run the gateway in foreground.
 
@@ -5797,11 +5807,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     # A service-owned gateway must never rewrite/start another unit while
     # booting. Explicit gateway start/restart paths already refresh their
     # selected service definition before launch.
-    if supports_systemd_services() and not _running_under_systemd():
-        try:
-            refresh_systemd_unit_if_needed(system=False)
-        except Exception:
-            pass  # best-effort; don't block gateway startup
+    _refresh_systemd_unit_for_gateway_launch()
 
     from gateway.run import start_gateway
 

@@ -6,12 +6,25 @@ Read-only source: `/root/hermes-agent` at `119b2eae41ce9dea2391b36ab418dfa568246
 
 The live source predates the candidate's v0.20.5 reconciliation and its verified-pipeline/role-contract implementation. Each dirty path was expanded and SHA256 recorded before reconciliation. No task artifact, configuration, credential, service, or production file was written.
 
+### Reproducible status accounting
+
+The captured live `git status --porcelain` has **40 entries**. Its status-entry accounting and the expanded audit-record accounting are deliberately distinct:
+
+| Source status entry | Count | Expansion in this audit |
+| --- | ---: | ---: |
+| Modified file | 18 | 18 file records |
+| Untracked file | 19 | 19 file records |
+| Untracked directory | 3 | 6 leaf-artifact records after expansion |
+| **Total** | **40** | **43 file/leaf path records** |
+
+Thus the inventory below records **43** paths: `18 + 19 + 6`. The three directory status entries are not counted a second time as leaves. SHA256 values remain the evidence for every listed file or leaf artifact.
+
 ## Preserved behavior
 
 - `hermes_cli/gateway.py` (live SHA256 `05efab41fea3661b5c2bcf4bd62ba161253c6d15b12702c3185097800fa74710`): ported semantically. A systemd-owned gateway now skips user-unit refresh during boot, preventing a system/user scope collision. The current candidate's newer gateway lifecycle behavior is otherwise retained.
 - `tests/hermes_cli/test_gateway_systemd_refresh_guard.py` (live SHA256 `abc3250593f16e4d70610c2318eedd251023655393e24e5a39116deef71a71b3): ported as a behavior test.
 
-## Excluded modified paths
+## Excluded paths
 
 These files were reviewed against the candidate's newer equivalents and excluded rather than overwriting post-v0.20.5 behavior. The fleet/context overlay was additionally rejected because it hard-codes a profile path and uses a user-facing behavioral environment variable; the candidate's profile-scoped context and prompt-cache contracts remain authoritative.
 
@@ -33,7 +46,7 @@ These files were reviewed against the candidate's newer equivalents and excluded
 - `tools/kanban_tools.py` `acdaa8f00845a48ad1072beeded045d4b474dd2e731a03a12cfa9268f1db00d5` — legacy worker policy conflicts with candidate role-contract tool executor.
 - `toolsets.py` `834c248a23dc4a8bf470da26a9375abe077d6e6a3556349cbde64f17eb0f6d24` — excluded evidence-broker toolset.
 
-## Expanded untracked paths
+## Expanded untracked file paths
 
 All untracked implementation and test files below are excluded as an older, parallel plan/spec/role/evidence implementation. Candidate `plugins/verified_pipeline`, `hermes_cli/role_contract.py`, and associated tests provide the reviewed replacements; importing both would duplicate control planes and weaken the narrow-core/plugin boundary.
 
