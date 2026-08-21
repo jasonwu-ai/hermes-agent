@@ -46,14 +46,21 @@ def test_da_overlay_matches_controller_packet_and_validator_schema() -> None:
     assert contract is not None
     contract_text = contract.path.read_text(encoding="utf-8")
     assert validators.DA_REQUEST_SCHEMA in contract_text
+    assert validators.LEGACY_DA_REQUEST_SCHEMA in contract_text
     assert validators.DA_VERDICT_SCHEMA in contract_text
     assert review.DA_SKILL in contract_text
     skill = OVERLAYS / profile / "skills" / review.DA_SKILL / "SKILL.md"
     assert _skill_frontmatter(skill)["name"] == review.DA_SKILL
     text = skill.read_text(encoding="utf-8")
     assert validators.DA_REQUEST_SCHEMA in text
+    assert validators.LEGACY_DA_REQUEST_SCHEMA in text
     assert validators.DA_VERDICT_SCHEMA in text
     assert "deterministic controller validates" in text
+    assert "score_base" in text
+    assert "score_floor" in text
+    assert "zero findings score exactly `score_base` for v2" in text
+    assert "exactly 100 for legacy v1" in text
+    assert "not a residual-risk score" in text
     assert "verified_pipeline_validators.py" not in text
     assert "terminal" not in contract.allowed_tools
     assert "execute_code" not in contract.allowed_tools

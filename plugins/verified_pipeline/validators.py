@@ -10,7 +10,9 @@ import re
 from typing import Any, Mapping
 
 PLAN_SCHEMA = "verified-plan/v1"
-DA_REQUEST_SCHEMA = "da-request/v1"
+LEGACY_DA_REQUEST_SCHEMA = "da-request/v1"
+CURRENT_DA_REQUEST_SCHEMA = "da-request/v2"
+DA_REQUEST_SCHEMA = CURRENT_DA_REQUEST_SCHEMA
 DA_VERDICT_SCHEMA = "da-verdict/v1"
 CEO_REQUEST_SCHEMA = "ceo-request/v1"
 CEO_DECISION_SCHEMA = "ceo-decision/v1"
@@ -39,7 +41,15 @@ MATERIALITY_BASES = {
     "advisory_improvement",
 }
 BLOCKING_BASES = MATERIALITY_BASES - {"lifecycle_custody", "advisory_improvement"}
+LEGACY_RISK_POLICY_FIELDS = {
+    "severe_risk_threshold",
+    "blocking_penalty",
+    "severe_penalty",
+    "advisory_penalty",
+}
 DEFAULT_RISK_POLICY = {
+    "score_base": 100,
+    "score_floor": 0,
     "severe_risk_threshold": 12,
     "blocking_penalty": 35,
     "severe_penalty": 15,
@@ -267,8 +277,14 @@ def validate_da_request(request: Any) -> dict[str, Any]:
     }
     if set(request) != required:
         raise ArtifactValidationError(f"DA request fields must be exactly {sorted(required)}")
-    if request["schema"] != DA_REQUEST_SCHEMA:
-        raise ArtifactValidationError(f"DA request schema must be {DA_REQUEST_SCHEMA}")
+    if request["schema"] not in {
+        LEGACY_DA_REQUEST_SCHEMA,
+        CURRENT_DA_REQUEST_SCHEMA,
+    }:
+        raise ArtifactValidationError(
+            "DA request schema must be "
+            f"{LEGACY_DA_REQUEST_SCHEMA} or {CURRENT_DA_REQUEST_SCHEMA}"
+        )
     for field in (
         "run_id",
         "specification_id",
@@ -299,11 +315,23 @@ def validate_da_request(request: Any) -> dict[str, Any]:
     if _digest(request["specification"].encode("utf-8")) != request["specification_sha256"]:
         raise ArtifactValidationError("specification bytes do not match DA request")
     policy = request["risk_policy"]
-    if not isinstance(policy, dict) or set(policy) != set(DEFAULT_RISK_POLICY):
+    expected_policy_fields = (
+        LEGACY_RISK_POLICY_FIELDS
+        if request["schema"] == LEGACY_DA_REQUEST_SCHEMA
+        else set(DEFAULT_RISK_POLICY)
+    )
+    if not isinstance(policy, dict) or set(policy) != expected_policy_fields:
         raise ArtifactValidationError("risk_policy fields are invalid")
-    for key in DEFAULT_RISK_POLICY:
+    for key in expected_policy_fields:
         if type(policy[key]) is not int or policy[key] < 0:
             raise ArtifactValidationError(f"risk_policy.{key} must be non-negative")
+    if (
+        request["schema"] == CURRENT_DA_REQUEST_SCHEMA
+        and policy["score_floor"] > policy["score_base"]
+    ):
+        raise ArtifactValidationError(
+            "risk_policy.score_floor must not exceed score_base"
+        )
     prior = request["prior_findings"]
     if prior != "none" and not isinstance(prior, list):
         raise ArtifactValidationError("prior_findings must be none or an array")
@@ -311,7 +339,7 @@ def validate_da_request(request: Any) -> dict[str, Any]:
 
 
 def calibrated_score(findings: list[dict[str, Any]], policy: Mapping[str, int]) -> int:
-    score = 100
+    score = policy.get("score_base", 100)
     penalties = {
         "blocking": policy["blocking_penalty"],
         "severe": policy["severe_penalty"],
@@ -320,7 +348,7 @@ def calibrated_score(findings: list[dict[str, Any]], policy: Mapping[str, int]) 
     for finding in findings:
         if not finding.get("resolved", False):
             score -= penalties[finding["classification"]]
-    return max(0, score)
+    return max(policy.get("score_floor", 0), score)
 
 
 def validate_da_verdict(verdict: Any, *, request: Mapping[str, Any]) -> dict[str, Any]:
