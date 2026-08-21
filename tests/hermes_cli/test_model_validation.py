@@ -320,7 +320,15 @@ class TestCopilotNormalization:
         assert opencode_provider_family("opencode-google") is None
         assert opencode_provider_family("opencode-gopher") is None
         assert opencode_provider_family("opencode-zender") is None
+        assert opencode_provider_family("opencode-freezer") is None
         assert opencode_provider_family("OpenCode-Google") is None
+
+    def test_free_family_accepts_builtin_and_hyphenated_custom_names(self):
+        from hermes_cli.models import opencode_provider_family
+
+        assert opencode_provider_family("opencode-free") == "opencode-free"
+        assert opencode_provider_family("opencode-free-bridge") == "opencode-free"
+        assert opencode_provider_family("OpenCode-Free-Bridge") == "opencode-free"
 
 
 class TestNormalizeOpencodeBaseUrl:
