@@ -692,9 +692,9 @@ def _task_body(payload: Mapping[str, Any], artifact_path: Path) -> str:
     if payload["action"] == "approve":
         instruction = (
             "Produce a bounded implementation plan from the exact specification. "
-            "Read `planner-request.json`, write only `plan.md` and `plan.json`, then run "
-            "`python3 verified_pipeline_validators.py plan plan.json --request "
-            "planner-request.json > validation.md`. Do not create downstream tasks, "
+            "Read `planner-request.json` and write only `plan.md` and `plan.json`. "
+            "Complete only the current Planner card; the deterministic controller validates "
+            "the exact terminal-run artifacts and writes `validation.md`. Do not create downstream tasks, "
             "dispatch workers, merge, deploy, or release."
         )
     else:

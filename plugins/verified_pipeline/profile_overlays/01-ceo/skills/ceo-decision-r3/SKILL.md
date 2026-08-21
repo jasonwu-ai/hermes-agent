@@ -11,6 +11,6 @@ description: Review one controller-canonical ceo-request/v1 and emit a validator
 4. Write `decision.md` and `decision.json`.
 5. `decision.json` uses schema `ceo-decision/v1` and exactly: `schema`, `specification_id`, `plan_revision`, `decision`, `rationale`, `required_changes`, `decision_question`, `material_scope_or_risk_change`.
 6. For `APPROVE`: empty changes, null question, material flag false. For `REJECT_WITH_CHANGES`: one or more smallest changes, null question, material flag false. For `NEEDS_JASON_DECISION`: empty changes, one concise question, material flag true.
-7. Run exactly: `python3 verified_pipeline_validators.py ceo decision.json --request ceo-request.json`.
-8. Comment one receipt and complete only this card after validation. Otherwise block only this card.
+7. Comment one receipt and complete only this card after writing both artifacts. The deterministic controller validates the exact terminal-run decision before any transition.
+8. If the task-bound input is malformed or the artifacts cannot be written, block only this card.
 9. Never create successors, materialize, arm, implement, merge, deploy, publish, or release.

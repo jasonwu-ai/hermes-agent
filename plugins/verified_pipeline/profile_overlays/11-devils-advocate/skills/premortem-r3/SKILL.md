@@ -11,6 +11,6 @@ description: Review one controller-canonical da-request/v1 and emit a validator-
 4. Write `premortem.md` and `verdict.json`.
 5. `verdict.json` uses schema `da-verdict/v1` and exactly: `schema`, `specification_id`, `plan_revision`, `review_round`, `verdict`, `findings`, `score`, `most_likely_failure`, `most_dangerous_failure`, `cross_cutting_assumption`, `escalate_to_jason`, `decision_question`.
 6. Each finding must use every field required by the task-local validator. Classification, materiality, risk threshold, score, lineage, resolution, and escalation must be internally consistent with `da-request.json`.
-7. Run exactly: `python3 verified_pipeline_validators.py da verdict.json --request da-request.json`.
-8. On validator-backed PASS, comment one receipt and complete only this card. On validator-backed REVISE, comment one receipt and block only this card with `kind='needs_input'`.
+7. Comment one receipt after writing both artifacts. The deterministic controller validates the exact terminal-run verdict before any transition.
+8. On intended PASS, complete only this card. On intended REVISE, block only this card with `kind='needs_input'`; malformed output remains closed because the controller rejects it.
 9. Never create successors, edit the plan/specification, implement, materialize, dispatch, merge, deploy, publish, or release.

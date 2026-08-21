@@ -330,11 +330,6 @@ def prepare_initial_planner_workspace(
             "Planner request does not match specification bytes",
         )
     _write_exact(workspace / "planner-request.json", _canonical_bytes(request), "Planner request")
-    _write_exact(
-        workspace / "verified_pipeline_validators.py",
-        Path(validators.__file__).read_bytes(),
-        "task-local validator",
-    )
     return request
 
 
@@ -1257,12 +1252,6 @@ def _prepare_review_workspace(
         name=payload["workspace_name"],
         create=True,
     )
-    validator_bytes = Path(validators.__file__).read_bytes()
-    _write_exact(
-        workspace / "verified_pipeline_validators.py",
-        validator_bytes,
-        "task-local validator",
-    )
     kind = payload["kind"]
     request = payload["request"]
     if Path(request["output_workspace"]).resolve() != workspace:
@@ -1320,23 +1309,22 @@ def _task_body(payload: Mapping[str, Any]) -> str:
             "create successors, implement, materialize a DAG, merge, deploy, or release.\n\n"
             "Read `planner-request.json`, `specification.md`, `review-findings.json`, "
             "`previous-plan.md`, and `previous-plan.json`. Write `plan.md` and `plan.json`, "
-            "then run:\n\n"
-            "`python3 verified_pipeline_validators.py plan plan.json "
-            "--request planner-request.json > validation.md`\n"
+            "then complete only this card. The deterministic controller validates the exact "
+            "terminal-run artifacts and writes `validation.md`.\n"
         )
     if kind == "da_review":
         return (
             "# Bounded Devil's Advocate review\n\n"
             "Review only the exact `da-request.json`. Write `premortem.md` and "
-            "`verdict.json`. Do not create successors or implementation work. Validate with:\n\n"
-            "`python3 verified_pipeline_validators.py da verdict.json --request da-request.json`\n\n"
+            "`verdict.json`. Do not create successors or implementation work. The deterministic "
+            "controller validates the exact terminal-run verdict.\n\n"
             "On PASS complete this card. On REVISE block it with `kind='needs_input'`.\n"
         )
     return (
         "# Bounded CEO review\n\n"
         "Review only the exact `ceo-request.json`. Write `decision.md` and `decision.json`. "
-        "Do not create successors, materialize a DAG, merge, deploy, or release. Validate with:\n\n"
-        "`python3 verified_pipeline_validators.py ceo decision.json --request ceo-request.json`\n"
+        "Do not create successors, materialize a DAG, merge, deploy, or release. The deterministic "
+        "controller validates the exact terminal-run decision.\n"
     )
 
 
