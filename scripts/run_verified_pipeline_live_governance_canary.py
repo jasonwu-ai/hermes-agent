@@ -35,11 +35,9 @@ MANDATORY_CONTRACT_PROFILES = (
     "08-release",
 )
 SAFE_PROFILE_FILES = (
-    ".env",
     ".no-bundled-skills",
     "AGENTS.md",
     "SOUL.md",
-    "auth.json",
     "config.yaml",
     "context_length_cache.yaml",
     "profile.yaml",
@@ -50,6 +48,8 @@ FINAL_REVIEW_STATUSES = {
     "JASON_DECISION_REQUIRED",
     "DA_ESCALATED",
 }
+CANARY_SESSION_PROVIDER = "verified-pipeline-canary"
+CANARY_SESSION_USER_ID = "profile-canary-owner"
 SPECIFICATION = """# Tier-2 governance-only canary specification
 
 ## Goal
@@ -130,8 +130,6 @@ def _snapshot_profiles(
             source = live / name
             if source.is_file():
                 _copy_file(source, target / name)
-                if name in {".env", "auth.json"}:
-                    manifest["credential_files"].append(str(target / name))
         if credential_auth is not None:
             _copy_file(credential_auth, target / "auth.json")
             auth_target = str(target / "auth.json")
@@ -334,6 +332,30 @@ def _canonical_control_db_path(controller_module: Any) -> Path:
     return Path(controller_module._default_db_path())
 
 
+def _attach_canary_authenticated_session(app: Any) -> None:
+    """Attach a typed, canary-only dashboard session to in-process requests.
+
+    This runner explicitly reports that it does not exercise host authentication
+    middleware. The synthetic session only satisfies the hardened plugin API's
+    typed interactive-principal boundary after host auth is qualified separately.
+    """
+    from hermes_cli.dashboard_auth.base import Session
+
+    @app.middleware("http")
+    async def attach_canary_session(request: Any, call_next: Any) -> Any:
+        request.state.session = Session(
+            user_id=CANARY_SESSION_USER_ID,
+            email="",
+            display_name="Verified Pipeline Profile Canary",
+            org_id="",
+            provider=CANARY_SESSION_PROVIDER,
+            expires_at=2_000_000_000,
+            access_token="",
+            refresh_token="",
+        )
+        return await call_next(request)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -361,6 +383,10 @@ def main() -> int:
         "started_at_epoch": int(time.time()),
         "status": "PREFLIGHT",
         "host_auth_middleware_exercised": False,
+        "decision_session_mode": "typed_canary_harness_session",
+        "decision_principal": (
+            f"dashboard-session:{CANARY_SESSION_PROVIDER}:{CANARY_SESSION_USER_ID}"
+        ),
         "production_gateway_exercised": False,
         "implementation_authority": False,
         "tasks": [],
@@ -402,6 +428,7 @@ def main() -> int:
         control_db_path = _canonical_control_db_path(controller)
 
         app = FastAPI()
+        _attach_canary_authenticated_session(app)
         app.include_router(router, prefix="/api/plugins/verified-pipeline")
         client = TestClient(app)
         created = client.post(

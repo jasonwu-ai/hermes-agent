@@ -7,8 +7,43 @@ import sys
 
 import psutil
 import pytest
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+
+from hermes_cli.dashboard_auth.base import Session
 
 from scripts import run_verified_pipeline_live_governance_canary as runner
+
+
+def test_profile_snapshot_allowlist_excludes_live_credentials() -> None:
+    assert ".env" not in runner.SAFE_PROFILE_FILES
+    assert "auth.json" not in runner.SAFE_PROFILE_FILES
+
+
+def test_runner_attaches_typed_canary_session_without_host_auth_claim() -> None:
+    app = FastAPI()
+    runner._attach_canary_authenticated_session(app)
+
+    @app.get("/session")
+    def session(request: Request) -> dict[str, str]:
+        attached = request.state.session
+        assert isinstance(attached, Session)
+        return {
+            "provider": attached.provider,
+            "user_id": attached.user_id,
+            "access_token": attached.access_token,
+            "refresh_token": attached.refresh_token,
+        }
+
+    response = TestClient(app).get("/session")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "provider": runner.CANARY_SESSION_PROVIDER,
+        "user_id": runner.CANARY_SESSION_USER_ID,
+        "access_token": "",
+        "refresh_token": "",
+    }
 
 
 def test_runner_uses_controller_canonical_review_workspace_root(tmp_path: Path) -> None:
