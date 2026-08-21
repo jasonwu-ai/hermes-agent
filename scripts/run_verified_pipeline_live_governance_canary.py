@@ -96,7 +96,21 @@ def _copy_file(source: Path, destination: Path) -> None:
 def _validated_credential_auth(source_home: Path) -> Path:
     if source_home.is_symlink():
         raise RuntimeError("credential source home must not be a symlink")
-    auth_path = source_home / "auth.json"
+    try:
+        resolved_home = source_home.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("credential source home is missing") from exc
+    home_stat = resolved_home.stat()
+    if not stat.S_ISDIR(home_stat.st_mode):
+        raise RuntimeError("credential source home must be a directory")
+    if stat.S_IMODE(home_stat.st_mode) & 0o077:
+        raise RuntimeError("credential source home must be owner-only")
+    if hasattr(os, "getuid") and home_stat.st_uid != os.getuid():
+        raise RuntimeError("credential source home must be owned by the current user")
+    live_profiles_root = LIVE_PROFILES_ROOT.resolve()
+    if resolved_home.is_relative_to(live_profiles_root):
+        raise RuntimeError("credential source home must not resolve inside live profiles")
+    auth_path = resolved_home / "auth.json"
     if auth_path.is_symlink():
         raise RuntimeError("credential source auth.json must not be a symlink")
     try:
@@ -111,6 +125,8 @@ def _validated_credential_auth(source_home: Path) -> Path:
         raise RuntimeError("credential source auth.json must be owner-only")
     if hasattr(os, "getuid") and auth_stat.st_uid != os.getuid():
         raise RuntimeError("credential source auth.json must be owned by the current user")
+    if auth_path.resolve(strict=True).is_relative_to(live_profiles_root):
+        raise RuntimeError("credential source auth.json must not resolve inside live profiles")
     return auth_path
 
 
@@ -332,6 +348,23 @@ def _canonical_control_db_path(controller_module: Any) -> Path:
     return Path(controller_module._default_db_path())
 
 
+def _canary_decision_identity() -> dict[str, Any]:
+    return {
+        "host_auth_middleware_exercised": False,
+        "decision_session_mode": "typed_canary_harness_session",
+        "decision_principal": (
+            f"dashboard-session:{CANARY_SESSION_PROVIDER}:{CANARY_SESSION_USER_ID}"
+        ),
+    }
+
+
+def _scrub_profile_snapshots(runtime_home: Path) -> bool:
+    profiles_root = runtime_home / "profiles"
+    if profiles_root.exists():
+        shutil.rmtree(profiles_root)
+    return not profiles_root.exists()
+
+
 def _attach_canary_authenticated_session(app: Any) -> None:
     """Attach a typed, canary-only dashboard session to in-process requests.
 
@@ -382,16 +415,12 @@ def main() -> int:
         "source_root": str(SOURCE_ROOT),
         "started_at_epoch": int(time.time()),
         "status": "PREFLIGHT",
-        "host_auth_middleware_exercised": False,
-        "decision_session_mode": "typed_canary_harness_session",
-        "decision_principal": (
-            f"dashboard-session:{CANARY_SESSION_PROVIDER}:{CANARY_SESSION_USER_ID}"
-        ),
         "production_gateway_exercised": False,
         "implementation_authority": False,
         "tasks": [],
         "reconciliations": [],
     }
+    report.update(_canary_decision_identity())
     exit_code = 1
     try:
         credential_auth = None
@@ -567,10 +596,7 @@ def main() -> int:
         report["error"] = str(exc)
     finally:
         _terminate_worker_groups(kanban_path)
-        profiles_root = runtime_home / "profiles"
-        if profiles_root.exists():
-            shutil.rmtree(profiles_root)
-        report["profile_snapshots_scrubbed"] = not profiles_root.exists()
+        report["profile_snapshots_scrubbed"] = _scrub_profile_snapshots(runtime_home)
         report["finished_at_epoch"] = int(time.time())
         if kanban_path.exists():
             report["final_tasks"] = [
