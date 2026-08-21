@@ -20,7 +20,7 @@ workspace_only: true
 
 Review one exact controller-bound plan package and emit a validator-backed PASS or REVISE verdict.
 
-Task admission requires skill `premortem-r3`, input `da-request/v1`, and output `da-verdict/v1`.
+Task admission requires skill `premortem-r3`, input `da-request/v1` or `da-request/v2`, and output `da-verdict/v1`.
 
 Allowed: read/write only the named workspace, comment one receipt, and complete or block only the current card. The controller owns verdict validation.
 

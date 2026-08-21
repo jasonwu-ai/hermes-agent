@@ -377,18 +377,14 @@ def _advance_planner(control_db, kanban_path, workspaces, intake, task_id):
     )
 
 
-def test_straight_through_review_stops_after_ceo_approval_and_replays(tmp_path):
+def test_new_da_request_exposes_calibrated_score_contract(tmp_path):
     control_db, kanban_path, workspaces, intake, planner_id = _setup(tmp_path)
-    first = _advance_planner(
-        control_db, kanban_path, workspaces, intake, planner_id
-    )
-    assert first["advanced"][0]["status"] == "DA_REVIEW_QUEUED"
+    _advance_planner(control_db, kanban_path, workspaces, intake, planner_id)
     da = _latest_task(kanban_path, review.DA_PROFILE)
-    assert da["expected_role_contract_sha256"] == FROZEN[review.DA_PROFILE]["sha256"]
-    assert json.loads(da["skills"]) == [review.DA_SKILL]
     da_request = json.loads(
         (Path(da["workspace_path"]) / "da-request.json").read_text(encoding="utf-8")
     )
+    assert da_request["schema"] == validators.DA_REQUEST_SCHEMA
     assert da_request["risk_policy"]["score_base"] == 100
     assert da_request["risk_policy"]["score_floor"] == 0
     assert validators.calibrated_score([], da_request["risk_policy"]) == 100
@@ -406,7 +402,62 @@ def test_straight_through_review_stops_after_ceo_approval_and_replays(tmp_path):
     ):
         validators.validate_da_request(inverted_range)
 
-    _write_da(Path(da["workspace_path"]), verdict="PASS")
+
+def test_straight_through_review_stops_after_ceo_approval_and_replays(
+    tmp_path, monkeypatch
+):
+    control_db, kanban_path, workspaces, intake, planner_id = _setup(tmp_path)
+    planner_workspace = Path(_task(kanban_path, planner_id).workspace_path)
+    _write_plan(planner_workspace)
+    _complete(kanban_path, planner_id)
+
+    legacy_policy = {
+        key: validators.DEFAULT_RISK_POLICY[key]
+        for key in validators.LEGACY_RISK_POLICY_FIELDS
+    }
+    with monkeypatch.context() as legacy:
+        legacy.setattr(
+            validators,
+            "DA_REQUEST_SCHEMA",
+            validators.LEGACY_DA_REQUEST_SCHEMA,
+        )
+        legacy.setattr(validators, "DEFAULT_RISK_POLICY", legacy_policy)
+        first = review.submit_planner_completion(
+            run_id=intake["run_id"],
+            task_id=planner_id,
+            kind="planner_intake",
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+            workspace_root=workspaces,
+        )
+    assert first["status"] == "DA_REVIEW_QUEUED"
+
+    delivery = review.project_review_outbox(
+        f"verified-pipeline:{intake['run_id']}:da-review:1",
+        db_path=control_db,
+        kanban_db_path=kanban_path,
+        workspace_root=workspaces,
+    )
+    assert delivery["status"] == "DELIVERED"
+    da = _latest_task(kanban_path, review.DA_PROFILE)
+    assert da["expected_role_contract_sha256"] == FROZEN[review.DA_PROFILE]["sha256"]
+    assert json.loads(da["skills"]) == [review.DA_SKILL]
+    legacy_request = json.loads(
+        (Path(da["workspace_path"]) / "da-request.json").read_text(encoding="utf-8")
+    )
+    assert legacy_request["schema"] == validators.LEGACY_DA_REQUEST_SCHEMA
+    assert set(legacy_request["risk_policy"]) == validators.LEGACY_RISK_POLICY_FIELDS
+    validators.validate_da_request(legacy_request)
+    assert validators.calibrated_score([], legacy_request["risk_policy"]) == 100
+
+    valid_verdict = _write_da(Path(da["workspace_path"]), verdict="PASS")
+    historical_failure = json.loads(json.dumps(valid_verdict))
+    historical_failure["score"] = 0
+    with pytest.raises(
+        validators.ArtifactValidationError,
+        match="DA score must equal 100",
+    ):
+        validators.validate_da_verdict(historical_failure, request=legacy_request)
     _complete(kanban_path, da["id"])
     second = review.reconcile_review_once(
         intake["run_id"],
