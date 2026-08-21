@@ -104,6 +104,31 @@ class TestExtractItemTextVariations:
 
 
 class TestPrunePreCheckpointItemsRetainsSummaries:
+    def test_retains_image_only_user_message_at_one_token_cost(self):
+        image_message = {
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}],
+        }
+        items = [
+            image_message,
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+        ]
+
+        pruned = prune_pre_checkpoint_items(items, retained_user_token_budget=1)
+
+        assert pruned == [items[1], image_message]
+
+    def test_drops_image_only_user_message_when_budget_is_zero(self):
+        items = [
+            {
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}],
+            },
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+        ]
+
+        assert prune_pre_checkpoint_items(items, retained_user_token_budget=0) == [items[1]]
+
     def test_retains_summary_and_user_in_original_order(self):
         summary_content = _standalone_summary_content("Step 1 complete")
         items = [

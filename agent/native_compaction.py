@@ -361,7 +361,13 @@ def prune_pre_checkpoint_items(
 
         text = _extract_item_text(item)
         if text is None:
-            continue
+            content = item.get("content")
+            if not (is_user and isinstance(content, list) and content):
+                continue
+            # A non-empty multipart user message may be image-only. Preserve
+            # the original item and charge the minimum one-token accounting
+            # cost below rather than silently deleting the user's image.
+            text = ""
         # Image-only user messages have empty text but non-empty content —
         # main retains them at 1-token cost (images count as zero, matching
         # Codex's retention accounting). Don't skip them just because text
