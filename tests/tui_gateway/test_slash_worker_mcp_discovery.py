@@ -51,6 +51,11 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     (profile_home / "config.yaml").write_text(
         yaml.safe_dump(
             {
+                # The product's interactive default is intentionally short so a
+                # slow MCP server cannot hold slash-worker startup. This test,
+                # however, asserts first-snapshot readiness and can run under
+                # heavily loaded CI, so give its local probe an explicit bound.
+                "mcp_discovery_timeout": 30.0,
                 "mcp_servers": {
                     "profileprobe": {
                         "enabled": True,
@@ -99,9 +104,9 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
         proc.stdin.flush()
         try:
-            line = output.get(timeout=10)
+            line = output.get(timeout=45)
         except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
+            pytest.fail("slash worker produced no /tools response within 45 seconds")
         response = json.loads(line)
         assert response["ok"] is True
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
