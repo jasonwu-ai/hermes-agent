@@ -124,12 +124,11 @@ def collect_runtime_inventory() -> UpdatePlan:
         )
 
         method = detect_install_method()
-        plan.install_method = method
         managed = get_managed_system()
-        if managed:
-            plan.install_method = managed
-        plan.updatable_in_place = method in ("git", "unknown") and not managed
-        plan.update_mechanism = recommended_update_command_for_method(method)
+        effective_method = managed or method
+        plan.install_method = effective_method
+        plan.updatable_in_place = effective_method in ("git", "unknown")
+        plan.update_mechanism = recommended_update_command_for_method(effective_method)
     except Exception as exc:
         logger.debug("Install-method probe failed: %s", exc)
 

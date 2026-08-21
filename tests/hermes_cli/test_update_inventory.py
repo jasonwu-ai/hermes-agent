@@ -71,6 +71,18 @@ class TestCollectInventory:
         assert plan.updatable_in_place is False
         assert "docker pull" in plan.update_mechanism
 
+    def test_managed_system_drives_update_mechanism(self, fleet, monkeypatch):
+        """Managed installs must not inherit guidance from the detected source tree."""
+        monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr("hermes_cli.config.get_managed_system", lambda: "nixos")
+
+        plan = ui.collect_runtime_inventory()
+
+        assert plan.install_method == "nixos"
+        assert plan.updatable_in_place is False
+        assert "hermes update" not in plan.update_mechanism
+        assert "Nix" in plan.update_mechanism
+
     def test_dead_pids_excluded(self, fleet, monkeypatch):
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         plan = ui.collect_runtime_inventory()
