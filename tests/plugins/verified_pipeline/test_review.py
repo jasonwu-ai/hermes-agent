@@ -386,6 +386,25 @@ def test_straight_through_review_stops_after_ceo_approval_and_replays(tmp_path):
     da = _latest_task(kanban_path, review.DA_PROFILE)
     assert da["expected_role_contract_sha256"] == FROZEN[review.DA_PROFILE]["sha256"]
     assert json.loads(da["skills"]) == [review.DA_SKILL]
+    da_request = json.loads(
+        (Path(da["workspace_path"]) / "da-request.json").read_text(encoding="utf-8")
+    )
+    assert da_request["risk_policy"]["score_base"] == 100
+    assert da_request["risk_policy"]["score_floor"] == 0
+    assert validators.calibrated_score([], da_request["risk_policy"]) == 100
+
+    malformed_request = json.loads(json.dumps(da_request))
+    del malformed_request["risk_policy"]["score_base"]
+    with pytest.raises(validators.ArtifactValidationError, match="risk_policy fields"):
+        validators.validate_da_request(malformed_request)
+
+    inverted_range = json.loads(json.dumps(da_request))
+    inverted_range["risk_policy"]["score_floor"] = 101
+    with pytest.raises(
+        validators.ArtifactValidationError,
+        match="score_floor must not exceed score_base",
+    ):
+        validators.validate_da_request(inverted_range)
 
     _write_da(Path(da["workspace_path"]), verdict="PASS")
     _complete(kanban_path, da["id"])

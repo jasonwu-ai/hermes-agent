@@ -40,6 +40,8 @@ MATERIALITY_BASES = {
 }
 BLOCKING_BASES = MATERIALITY_BASES - {"lifecycle_custody", "advisory_improvement"}
 DEFAULT_RISK_POLICY = {
+    "score_base": 100,
+    "score_floor": 0,
     "severe_risk_threshold": 12,
     "blocking_penalty": 35,
     "severe_penalty": 15,
@@ -304,6 +306,10 @@ def validate_da_request(request: Any) -> dict[str, Any]:
     for key in DEFAULT_RISK_POLICY:
         if type(policy[key]) is not int or policy[key] < 0:
             raise ArtifactValidationError(f"risk_policy.{key} must be non-negative")
+    if policy["score_floor"] > policy["score_base"]:
+        raise ArtifactValidationError(
+            "risk_policy.score_floor must not exceed score_base"
+        )
     prior = request["prior_findings"]
     if prior != "none" and not isinstance(prior, list):
         raise ArtifactValidationError("prior_findings must be none or an array")
@@ -311,7 +317,7 @@ def validate_da_request(request: Any) -> dict[str, Any]:
 
 
 def calibrated_score(findings: list[dict[str, Any]], policy: Mapping[str, int]) -> int:
-    score = 100
+    score = policy["score_base"]
     penalties = {
         "blocking": policy["blocking_penalty"],
         "severe": policy["severe_penalty"],
@@ -320,7 +326,7 @@ def calibrated_score(findings: list[dict[str, Any]], policy: Mapping[str, int]) 
     for finding in findings:
         if not finding.get("resolved", False):
             score -= penalties[finding["classification"]]
-    return max(0, score)
+    return max(policy["score_floor"], score)
 
 
 def validate_da_verdict(verdict: Any, *, request: Mapping[str, Any]) -> dict[str, Any]:
