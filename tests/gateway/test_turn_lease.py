@@ -182,6 +182,12 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
 
     runner = _bootstrap(monkeypatch, tmp_path)
+
+    async def _run_to_thread_inline(func, /, *args, **kwargs):
+        """Keep this lease-SLA test independent of host executor startup."""
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _run_to_thread_inline)
     runner._turn_leases = SessionTurnLeaseRegistry()
     holder = await runner._turn_leases.acquire(
         "sess-dedup", owner_key="holder-key", generation=1, timeout=1
