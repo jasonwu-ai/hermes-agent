@@ -22,7 +22,7 @@ Review one exact specification, validator-backed plan, and DA PASS. Emit one bou
 
 Task admission requires skill `ceo-decision-r3`, input `ceo-request/v1`, and output `ceo-decision/v1`.
 
-Allowed: read/write only the named workspace, run the supplied validator, comment one receipt, and complete only the current CEO card after a valid decision.
+Allowed: read/write only the named workspace, comment one receipt, and complete only the current CEO card after writing the decision artifacts. The deterministic controller validates the exact terminal-run decision before any transition.
 
 Denied: editing the specification/plan/verdict, creating successors, materializing, arming, dispatching, implementing, merging, deploying, publishing, releasing, or changing credentials/configuration.
 

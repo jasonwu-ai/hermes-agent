@@ -4,6 +4,8 @@ import { existsSync, readFileSync, rmSync } from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
 
+import { readCachedUnionRoster } from '../../../sdk/roster-cache.mjs'
+
 // The @mention middleware appends a handoff note whose hermes command the
 // active agent runs verbatim in its terminal. The sender display name and
 // @handle used to be interpolated into the double-quoted -q argument (and
@@ -150,6 +152,7 @@ test('behavior: @dixie on a Connections bot stays in this chat and does not herm
   const delivered = []
   const context = {
     atom,
+    readCachedUnionRoster,
     PALETTE_AREA: 'palette',
     COMPOSER_AREAS: { middleware: 'middleware' },
     queryClient: {

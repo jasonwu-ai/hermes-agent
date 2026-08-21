@@ -12,6 +12,6 @@ description: Produce one controller-canonical verified-plan/v1 package from a ta
 5. Write `plan.json` with schema `verified-plan/v1` and exactly these top-level fields: `schema`, `specification_id`, `specification_sha256`, `plan_revision`, `title`, `summary`, `tasks`, `final_task_id`, `review_dispositions`.
 6. Every task has exactly: `id`, `title`, `assignee`, `goal`, `dependencies`, `deliverable`, `acceptance_criteria`, `workspace`. Use only implementation profiles explicitly required by the specification. Do not assign governance profiles. Use workspace `scratch` or `worktree`.
 7. For revision 1, set `review_dispositions` to `[]`. On later revisions, include one `{finding_id, disposition}` for every prior finding.
-8. Run exactly: `python3 verified_pipeline_validators.py plan plan.json --request planner-request.json > validation.md`.
-9. If validation passes, comment one compact receipt naming the three artifacts and complete only this card. If input is ambiguous or validation cannot pass, block only this card.
+8. Comment one compact receipt naming `plan.md` and `plan.json`, then complete only this card. The deterministic controller validates the exact terminal-run artifacts and writes digest-bound `validation.md` before any transition.
+9. If input is ambiguous or the artifacts cannot be written, block only this card.
 10. Never create successors, materialize, arm, implement, merge, deploy, publish, or release.

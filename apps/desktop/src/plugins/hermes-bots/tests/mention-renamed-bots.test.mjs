@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
 
+import { readCachedUnionRoster } from '../../../sdk/roster-cache.mjs'
+
 // Renamed bots stay taggable (Discord report, Aug 2026): renaming a bot —
 // Bot Mode title or `hermes profile rename` display_name — must update what
 // the user can @-tag it with, in the mention middleware, group rooms, and
@@ -126,6 +128,7 @@ test('composer autocomplete offers the renamed tag and matches on the display na
   const roster = { profiles: [{ name: 'default' }, { name: 'writer' }, { name: 'ops' }] }
   const context = {
     atom,
+    readCachedUnionRoster,
     jsx,
     jsxs: jsx,
     useQuery: () => ({}),

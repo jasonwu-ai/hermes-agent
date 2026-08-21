@@ -81,6 +81,8 @@ import type { UsageStats } from '@/types/hermes'
 
 import { planPluginOpenSession } from './plugin-open-session-plan'
 
+export { readCachedUnionRoster } from './roster-cache.mjs'
+
 // -- state: readonly views over the app's live atoms -------------------------
 
 const readonlyAtom = <T>(atomLike: ReadableAtom<T>): ReadableAtom<T> => atomLike

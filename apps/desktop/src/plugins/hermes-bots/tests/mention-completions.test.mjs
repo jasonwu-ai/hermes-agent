@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import vm from 'node:vm'
 
+import { readCachedUnionRoster } from '../../../sdk/roster-cache.mjs'
+
 // The mention-completions source (#88060): typing @ offers roster handles.
 // Extract the registered provide() by running plugin registration with a
 // stubbed ctx/queryClient and exercising the captured contribution.
@@ -37,6 +39,7 @@ function loadProvide({ roster, active = 'default', focused = active, meta = {} }
       removeEventListener: () => undefined
     },
     document: { getElementById: () => null, createElement: () => ({}), head: { appendChild: () => undefined } },
+    readCachedUnionRoster,
     queryClient: {
       // Key-exact semantics like the real QueryClient (v5): a 2-element
       // ROSTER_KEY lookup MUST miss the 3-element cache keys useRoster

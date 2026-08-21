@@ -48,6 +48,7 @@ import {
   PALETTE_AREA,
   profileColor,
   queryClient,
+  readCachedUnionRoster,
   relativeTime,
   ScrollArea,
   SearchField,
@@ -2848,41 +2849,15 @@ function useRoster() {
  *  prefix scan keeping the freshest snapshot. Never throws: cold cache or
  *  legacy queryClient returns null and callers fall back to their own path. */
 function cachedUnionRoster() {
-  if (typeof queryClient === 'undefined' || !queryClient || typeof queryClient.getQueryData !== 'function') {
-    return null
-  }
-
-  try {
-    const connectionId = String(
-      host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local'
-    )
-    const exact = queryClient.getQueryData([...ROSTER_KEY, connectionId])
-
-    if (Array.isArray(exact?.profiles)) {
-      return exact
-    }
-
-    if (typeof queryClient.getQueriesData === 'function') {
-      let best = null
-
-      // v5 takes a filters object; a legacy v3 queryClient treats the same
-      // object as the key itself and simply matches nothing — harmless.
-      for (const [, data] of queryClient.getQueriesData({ queryKey: ROSTER_KEY })) {
-        if (
-          Array.isArray(data?.profiles) &&
-          (!best || Number(data.fetchedAt || 0) > Number(best.fetchedAt || 0))
-        ) {
-          best = data
-        }
-      }
-
-      return best
-    }
-  } catch {
-    /* cache hiccup — caller falls back (middleware refetches) */
-  }
-
-  return null
+  // Source-only legacy harnesses strip SDK imports. Production always receives
+  // this helper from @hermes/plugin-sdk; stripped harnesses retain the caller's
+  // existing refetch/fallback path instead of throwing on an absent binding.
+  if (typeof readCachedUnionRoster !== 'function') return null
+  const connectionId = String(
+    host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local'
+  )
+  const client = typeof queryClient === 'undefined' ? null : queryClient
+  return readCachedUnionRoster(client, ROSTER_KEY, connectionId)
 }
 
 /** Merge the union agent roster (host.agents) over the active gateway's

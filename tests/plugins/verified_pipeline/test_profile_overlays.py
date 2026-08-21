@@ -34,7 +34,10 @@ def test_planner_overlay_matches_controller_packet_and_validator_schema() -> Non
     text = skill.read_text(encoding="utf-8")
     assert "planner-request/v1" in text
     assert validators.PLAN_SCHEMA in text
-    assert "verified_pipeline_validators.py plan" in text
+    assert "deterministic controller validates" in text
+    assert "verified_pipeline_validators.py" not in text
+    assert "terminal" not in contract.allowed_tools
+    assert "execute_code" not in contract.allowed_tools
 
 
 def test_da_overlay_matches_controller_packet_and_validator_schema() -> None:
@@ -50,7 +53,10 @@ def test_da_overlay_matches_controller_packet_and_validator_schema() -> None:
     text = skill.read_text(encoding="utf-8")
     assert validators.DA_REQUEST_SCHEMA in text
     assert validators.DA_VERDICT_SCHEMA in text
-    assert "verified_pipeline_validators.py da" in text
+    assert "deterministic controller validates" in text
+    assert "verified_pipeline_validators.py" not in text
+    assert "terminal" not in contract.allowed_tools
+    assert "execute_code" not in contract.allowed_tools
 
 
 def test_ceo_overlay_matches_controller_packet_and_validator_schema() -> None:
@@ -66,7 +72,33 @@ def test_ceo_overlay_matches_controller_packet_and_validator_schema() -> None:
     text = skill.read_text(encoding="utf-8")
     assert validators.CEO_REQUEST_SCHEMA in text
     assert validators.CEO_DECISION_SCHEMA in text
-    assert "verified_pipeline_validators.py ceo" in text
+    assert "deterministic controller validates" in text
+    assert "verified_pipeline_validators.py" not in text
+    assert "terminal" not in contract.allowed_tools
+    assert "execute_code" not in contract.allowed_tools
+
+
+def test_governance_task_bodies_delegate_validation_to_controller() -> None:
+    planner_payload = {
+        "action": "approve",
+        "run_id": "run_" + "a" * 24,
+        "decision_id": "decision_" + "b" * 24,
+        "specification_id": "spec-1",
+        "revision": 1,
+        "artifact_sha256": "c" * 64,
+        "frozen_profiles": {},
+        "authority_ceiling": ["plan"],
+        "feedback": None,
+    }
+    bodies = [
+        controller._task_body(planner_payload, Path("/tmp/specification.md")),
+        review._task_body({"kind": "planner_revision"}),
+        review._task_body({"kind": "da_review"}),
+        review._task_body({"kind": "ceo_review"}),
+    ]
+    for body in bodies:
+        assert "deterministic controller validates" in body
+        assert "verified_pipeline_validators.py" not in body
 
 
 def test_mandatory_implementation_inventory_overlays_are_admissible() -> None:
