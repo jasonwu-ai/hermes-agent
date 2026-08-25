@@ -79,6 +79,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -160,6 +161,8 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+KANBAN_COMPLETION_MAX_ARTIFACTS = 16
+KANBAN_COMPLETION_MAX_TOTAL_BYTES = 100 * 1024 * 1024
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -1141,6 +1144,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Opt-in fail-closed worker-role admission. Existing cards remain inert.
+    require_role_contract: bool = False
+    # Decision-time digest of the exact assignee contract bytes.
+    expected_role_contract_sha256: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1241,17 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            require_role_contract=(
+                bool(row["require_role_contract"])
+                if "require_role_contract" in keys and row["require_role_contract"]
+                else False
+            ),
+            expected_role_contract_sha256=(
+                row["expected_role_contract_sha256"]
+                if "expected_role_contract_sha256" in keys
+                and row["expected_role_contract_sha256"]
+                else None
             ),
         )
 
@@ -1422,7 +1440,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Per-card fail-closed role admission. Legacy cards remain disabled.
+    require_role_contract INTEGER NOT NULL DEFAULT 0,
+    -- Optional decision-time digest of the exact role-contract bytes.
+    expected_role_contract_sha256 TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1490,6 +1512,9 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     stored_path  TEXT NOT NULL,
     content_type TEXT,
     size         INTEGER NOT NULL DEFAULT 0,
+    -- Digest is populated for worker completion artifacts. Legacy/user
+    -- uploads may remain NULL.
+    sha256       TEXT,
     uploaded_by  TEXT,
     created_at   INTEGER NOT NULL
 );
@@ -2679,6 +2704,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "require_role_contract" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "require_role_contract",
+            "require_role_contract INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "expected_role_contract_sha256" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "expected_role_contract_sha256",
+            "expected_role_contract_sha256 TEXT",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2707,6 +2748,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+    attachment_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_attachments'"
+    ).fetchone() is not None
+    if attachment_table_exists:
+        attachment_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_attachments)")
+        }
+        if "sha256" not in attachment_cols:
+            _add_column_if_missing(conn, "task_attachments", "sha256", "sha256 TEXT")
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -3178,6 +3229,8 @@ def create_task(
     reasoning_effort: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
+    require_role_contract: bool = False,
+    expected_role_contract_sha256: Optional[str] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
@@ -3229,6 +3282,18 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    expected_role_contract_sha256 = (
+        str(expected_role_contract_sha256).strip().lower()
+        if expected_role_contract_sha256 is not None
+        else None
+    )
+    if expected_role_contract_sha256:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_role_contract_sha256):
+            raise ValueError("expected_role_contract_sha256 must be 64 lowercase hex characters")
+        if not require_role_contract:
+            raise ValueError("expected_role_contract_sha256 requires require_role_contract=True")
+        if not assignee:
+            raise ValueError("expected_role_contract_sha256 requires an assignee")
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3497,8 +3562,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id,
+                        require_role_contract, expected_role_contract_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3590,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        1 if require_role_contract else 0,
+                        expected_role_contract_sha256,
                     ),
                 )
                 for pid in parents:
@@ -3552,6 +3620,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "require_role_contract": bool(require_role_contract) or None,
+                        "expected_role_contract_sha256": expected_role_contract_sha256,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4347,6 +4417,26 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    existing_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+        (run_id, task_id),
+    ).fetchone()
+    existing_metadata: dict = {}
+    if existing_row is not None and existing_row["metadata"]:
+        try:
+            parsed = json.loads(existing_row["metadata"])
+            if isinstance(parsed, dict):
+                existing_metadata = parsed
+        except (TypeError, ValueError, json.JSONDecodeError):
+            existing_metadata = {}
+    closing_metadata = dict(existing_metadata)
+    if isinstance(metadata, dict):
+        for key, value in metadata.items():
+            # Dispatcher-owned admission provenance cannot be forged or replaced
+            # by worker completion metadata.
+            if key == "role_contract_admission":
+                continue
+            closing_metadata[key] = value
     conn.execute(
         """
         UPDATE task_runs
@@ -4367,7 +4457,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(closing_metadata, ensure_ascii=False) if closing_metadata else None,
             now,
             run_id,
         ),
@@ -5478,16 +5568,27 @@ def complete_task(
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
-            for stored_path in metadata.pop("_staged_artifacts", []):
-                path = Path(stored_path)
-                _insert_completion_attachment(
-                    conn,
-                    task_id,
-                    filename=path.name,
-                    stored_path=str(path),
-                    size=path.stat().st_size,
-                    created_at=now,
-                )
+            staged_receipts = metadata.pop("_staged_artifact_receipts", [])
+            try:
+                for receipt in staged_receipts:
+                    _insert_completion_attachment(
+                        conn,
+                        task_id,
+                        filename=Path(receipt["stored_path"]).name,
+                        stored_path=receipt["stored_path"],
+                        size=receipt["size"],
+                        expected_sha256=receipt["sha256"],
+                        expected_device=receipt["device"],
+                        expected_inode=receipt["inode"],
+                        created_at=now,
+                    )
+            except Exception:
+                for receipt in staged_receipts:
+                    try:
+                        Path(receipt["stored_path"]).unlink(missing_ok=True)
+                    except (KeyError, OSError, TypeError):
+                        pass
+                raise
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -5649,22 +5750,38 @@ def _persist_scratch_completion_artifacts(
     task_id: str,
     metadata: dict,
 ) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
+    """Copy declared workspace artifacts into durable task attachments.
+
+    Scratch outputs must survive cleanup, while worktree/dir evidence must be
+    detached from mutable source trees before later review. All declared files
+    remain constrained to the task workspace.
+    """
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
         return
+    if len(raw_artifacts) > KANBAN_COMPLETION_MAX_ARTIFACTS:
+        raise ArtifactPreservationError(
+            f"completion declares more than {KANBAN_COMPLETION_MAX_ARTIFACTS} artifacts"
+        )
 
     row = conn.execute(
         "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
-    if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
+    if (
+        not row
+        or row["workspace_kind"] not in {"scratch", "worktree", "dir"}
+        or not row["workspace_path"]
+    ):
         return
 
     workspace = Path(row["workspace_path"]).expanduser()
-    is_managed, board = _managed_scratch_path_info(workspace)
-    if not is_managed:
-        return
+    if row["workspace_kind"] == "scratch":
+        is_managed, board = _managed_scratch_path_info(workspace)
+        if not is_managed:
+            return
+    else:
+        board = get_current_board()
 
     try:
         workspace_root = workspace.resolve()
@@ -5673,8 +5790,10 @@ def _persist_scratch_completion_artifacts(
 
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
+    staged_receipts: list[dict[str, Any]] = []
     used_destinations: set[Path] = set()
     changed = False
+    aggregate_size = 0
 
     def _discard_copies() -> None:
         for copied in used_destinations:
@@ -5692,43 +5811,110 @@ def _persist_scratch_completion_artifacts(
         if not artifact:
             continue
         src = Path(artifact).expanduser()
-        try:
-            resolved_src = src.resolve()
-        except OSError:
+        lexical_src = Path(os.path.abspath(src))
+        if not lexical_src.is_relative_to(workspace_root):
             persisted.append(artifact)
             continue
-
-        if not resolved_src.is_relative_to(workspace_root):
-            persisted.append(artifact)
-            continue
-
-        if not src.is_file():
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared scratch artifact is unavailable or not a regular file: {artifact}"
-            )
-
-        size = resolved_src.stat().st_size
-        if size > KANBAN_ATTACHMENT_MAX_BYTES:
-            _discard_copies()
-            raise ArtifactPreservationError(
-                f"declared scratch artifact exceeds the "
-                f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
-            )
 
         dest: Optional[Path] = None
+        source_fd: Optional[int] = None
+        destination_fd: Optional[int] = None
         try:
+            source_fd = os.open(
+                lexical_src,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            source_stat = os.fstat(source_fd)
+            source_path_stat = os.stat(lexical_src, follow_symlinks=False)
+            relative_parts = lexical_src.relative_to(workspace_root).parts
+            current = workspace_root
+            has_symlink_component = False
+            for part in relative_parts:
+                current /= part
+                if stat.S_ISLNK(os.lstat(current).st_mode):
+                    has_symlink_component = True
+                    break
+            if (
+                not stat.S_ISREG(source_stat.st_mode)
+                or has_symlink_component
+                or source_path_stat.st_dev != source_stat.st_dev
+                or source_path_stat.st_ino != source_stat.st_ino
+            ):
+                raise ArtifactPreservationError(
+                    f"declared artifact is not a confined regular file: {artifact}"
+                )
+            if source_stat.st_size > KANBAN_ATTACHMENT_MAX_BYTES:
+                raise ArtifactPreservationError(
+                    f"declared scratch artifact exceeds the "
+                    f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
+                )
+            aggregate_size += source_stat.st_size
+            if aggregate_size > KANBAN_COMPLETION_MAX_TOTAL_BYTES:
+                raise ArtifactPreservationError(
+                    "declared completion artifacts exceed the aggregate size limit"
+                )
             attachment_dir.mkdir(parents=True, exist_ok=True)
-            dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
-                copied = 0
-                while chunk := source_file.read(1024 * 1024):
-                    copied += len(chunk)
-                    if copied > KANBAN_ATTACHMENT_MAX_BYTES:
-                        raise ArtifactPreservationError(
-                            f"declared scratch artifact grew beyond the size limit: {artifact}"
-                        )
-                    destination_file.write(chunk)
+            dest = _unique_attachment_path(attachment_dir, lexical_src.name, used_destinations)
+            destination_fd = os.open(
+                dest,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            copied = 0
+            source_digest = hashlib.sha256()
+            while chunk := os.read(source_fd, 1024 * 1024):
+                copied += len(chunk)
+                if copied > source_stat.st_size or copied > KANBAN_ATTACHMENT_MAX_BYTES:
+                    raise ArtifactPreservationError(
+                        f"declared scratch artifact grew beyond the size limit: {artifact}"
+                    )
+                source_digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_fd, view)
+                    view = view[written:]
+            if copied != source_stat.st_size:
+                raise ArtifactPreservationError(
+                    f"declared scratch artifact changed while being preserved: {artifact}"
+                )
+            after = os.stat(lexical_src, follow_symlinks=False)
+            if (
+                after.st_dev != source_stat.st_dev
+                or after.st_ino != source_stat.st_ino
+                or after.st_size != source_stat.st_size
+                or after.st_mtime_ns != source_stat.st_mtime_ns
+                or after.st_ctime_ns != source_stat.st_ctime_ns
+                or not stat.S_ISREG(after.st_mode)
+            ):
+                raise ArtifactPreservationError(
+                    f"declared scratch artifact identity changed while being preserved: {artifact}"
+                )
+            os.fsync(destination_fd)
+            destination_stat = os.fstat(destination_fd)
+            os.lseek(destination_fd, 0, os.SEEK_SET)
+            destination_digest = hashlib.sha256()
+            destination_size = 0
+            while chunk := os.read(destination_fd, 1024 * 1024):
+                destination_size += len(chunk)
+                destination_digest.update(chunk)
+            if (
+                not stat.S_ISREG(destination_stat.st_mode)
+                or destination_size != copied
+                or destination_stat.st_size != copied
+                or destination_digest.digest() != source_digest.digest()
+            ):
+                raise ArtifactPreservationError(
+                    f"preserved artifact snapshot did not match its source descriptor: {artifact}"
+                )
+            staged_receipts.append(
+                {
+                    "stored_path": str(dest.absolute()),
+                    "size": copied,
+                    "sha256": destination_digest.hexdigest(),
+                    "device": destination_stat.st_dev,
+                    "inode": destination_stat.st_ino,
+                }
+            )
         except Exception as exc:
             if dest is not None:
                 try:
@@ -5741,6 +5927,11 @@ def _persist_scratch_completion_artifacts(
             raise ArtifactPreservationError(
                 f"could not preserve declared scratch artifact {artifact}: {exc}"
             ) from exc
+        finally:
+            if destination_fd is not None:
+                os.close(destination_fd)
+            if source_fd is not None:
+                os.close(source_fd)
 
         used_destinations.add(dest)
         persisted.append(str(dest.resolve()))
@@ -5748,9 +5939,7 @@ def _persist_scratch_completion_artifacts(
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+        metadata["_staged_artifact_receipts"] = staged_receipts
 
 
 def _insert_completion_attachment(
@@ -5760,15 +5949,67 @@ def _insert_completion_attachment(
     filename: str,
     stored_path: str,
     size: int,
+    expected_sha256: str,
+    expected_device: int,
+    expected_inode: int,
     created_at: int,
 ) -> None:
-    """Record a worker-produced artifact in the existing attachment table."""
-    conn.execute(
-        "INSERT INTO task_attachments "
-        "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-        "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
-        (task_id, filename, stored_path, size, created_at),
-    )
+    """Record a worker-produced artifact with a completion-time digest."""
+    digest = hashlib.sha256()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(stored_path, flags)
+    except OSError as exc:
+        raise ArtifactPreservationError(
+            f"could not open preserved completion artifact safely: {stored_path}"
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size != size
+            or opened.st_dev != expected_device
+            or opened.st_ino != expected_inode
+        ):
+            raise ArtifactPreservationError(
+                f"preserved completion artifact changed before hashing: {stored_path}"
+            )
+        observed_size = 0
+        while chunk := os.read(fd, 1024 * 1024):
+            observed_size += len(chunk)
+            digest.update(chunk)
+        if observed_size != opened.st_size:
+            raise ArtifactPreservationError(
+                f"preserved completion artifact changed while hashing: {stored_path}"
+            )
+        artifact_sha256 = digest.hexdigest()
+        if artifact_sha256 != expected_sha256:
+            raise ArtifactPreservationError(
+                f"preserved completion artifact digest changed before admission: {stored_path}"
+            )
+        insertion = conn.execute(
+            "INSERT INTO task_attachments "
+            "(task_id, filename, stored_path, content_type, size, sha256, uploaded_by, created_at) "
+            "VALUES (?, ?, ?, NULL, ?, ?, 'kanban_complete', ?)",
+            (task_id, filename, stored_path, size, artifact_sha256, created_at),
+        )
+        admitted = os.fstat(fd)
+        if (
+            admitted.st_dev != opened.st_dev
+            or admitted.st_ino != opened.st_ino
+            or admitted.st_size != opened.st_size
+            or admitted.st_mtime_ns != opened.st_mtime_ns
+            or admitted.st_ctime_ns != opened.st_ctime_ns
+        ):
+            conn.execute(
+                "DELETE FROM task_attachments WHERE rowid = ?",
+                (insertion.lastrowid,),
+            )
+            raise ArtifactPreservationError(
+                f"preserved completion artifact changed during admission: {stored_path}"
+            )
+    finally:
+        os.close(fd)
     _append_event(
         conn,
         task_id,
@@ -9537,6 +9778,19 @@ def check_respawn_guard(
     return None
 
 
+def _runtime_profile_exists(name: str) -> bool:
+    """Return whether a runtime assignee resolves to one installed profile."""
+    try:
+        from hermes_cli.profiles import profile_exists, resolve_profile_reference
+
+        if profile_exists(name):
+            return True
+        resolve_profile_reference(name)
+        return True
+    except Exception:
+        return False
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -9558,13 +9812,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _runtime_profile_exists(row["assignee"]):
             return True
     return False
 
@@ -9584,12 +9833,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _runtime_profile_exists(row["assignee"]):
             return True
     return False
 
@@ -10168,11 +10413,7 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+        if not _runtime_profile_exists(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -10229,6 +10470,18 @@ def _dispatch_once_locked(
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            continue
+        try:
+            _admit_worker_role_contract(conn, claimed)
+        except _WorkerRoleContractAdmissionError as exc:
+            block_task(
+                conn,
+                claimed.id,
+                reason=f"role_contract_admission: {exc}",
+                kind="capability",
+                expected_run_id=claimed.current_run_id,
+            )
+            result.auto_blocked.append(claimed.id)
             continue
         try:
             resolved_branch_name = None
@@ -10288,6 +10541,15 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except _WorkerRoleContractAdmissionError as exc:
+            block_task(
+                conn,
+                claimed.id,
+                reason=f"role_contract_pre_spawn: {exc}",
+                kind="capability",
+                expected_run_id=claimed.current_run_id,
+            )
+            result.auto_blocked.append(claimed.id)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -10322,11 +10584,7 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _runtime_profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
@@ -10683,6 +10941,108 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 _retagged_workspace_roots: set[str] = set()
 
 
+class _WorkerRoleContractAdmissionError(RuntimeError):
+    """Stable fail-closed worker role-contract admission error."""
+
+
+def _admit_worker_role_contract(
+    conn: sqlite3.Connection,
+    task: Task,
+) -> Optional[object]:
+    """Admit and durably record a task/run-bound role contract before spawn."""
+    if not task.assignee:
+        raise _WorkerRoleContractAdmissionError(f"task {task.id} has no assignee")
+    from hermes_cli.profiles import (
+        normalize_profile_name,
+        resolve_profile_env,
+        resolve_profile_reference,
+    )
+
+    profile_arg = normalize_profile_name(task.assignee)
+    try:
+        profile_home = resolve_profile_env(profile_arg)
+        resolved_profile = resolve_profile_reference(
+            profile_arg,
+            profiles_root=Path(profile_home).parent,
+        )
+    except FileNotFoundError as exc:
+        if task.require_role_contract:
+            raise _WorkerRoleContractAdmissionError(
+                f"required role contract profile does not exist: {profile_arg}"
+            ) from exc
+        setattr(task, "_role_contract_admission", None)
+        return None
+    except ValueError as exc:
+        raise _WorkerRoleContractAdmissionError(
+            f"profile resolution rejected for {profile_arg!r}: {exc}"
+        ) from exc
+
+    configured = _resolve_worker_cli_toolsets(profile_home) or []
+    from hermes_cli.role_contract import RoleContractError, admit_role_contract
+
+    try:
+        admission = admit_role_contract(
+            profile_home,
+            resolved_profile,
+            configured,
+            task_id=task.id,
+            run_id=task.current_run_id,
+            workspace_path=(
+                str(Path(task.workspace_path).expanduser().resolve())
+                if task.workspace_path
+                else None
+            ),
+            branch_name=task.branch_name,
+            required=bool(task.require_role_contract),
+        )
+    except RoleContractError as exc:
+        raise _WorkerRoleContractAdmissionError(str(exc)) from exc
+    expected_digest = task.expected_role_contract_sha256
+    if expected_digest:
+        observed_digest = admission.contract.sha256 if admission is not None else None
+        if observed_digest != expected_digest:
+            raise _WorkerRoleContractAdmissionError(
+                "role contract digest does not match the decision-time receipt: "
+                f"expected {expected_digest}, observed {observed_digest or 'none'}"
+            )
+    setattr(task, "_role_contract_admission", admission)
+    if admission is None:
+        return None
+
+    receipt = admission.receipt()
+    run_id = task.current_run_id
+    with write_txn(conn):
+        if run_id is None or _current_run_id(conn, task.id) != int(run_id):
+            raise _WorkerRoleContractAdmissionError(
+                f"role contract admission lost active run binding for task {task.id}"
+            )
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ? AND task_id = ?",
+            (int(run_id), task.id),
+        ).fetchone()
+        metadata: dict = {}
+        if row and row["metadata"]:
+            try:
+                parsed = json.loads(row["metadata"])
+                if isinstance(parsed, dict):
+                    metadata = parsed
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+        metadata["role_contract_admission"] = receipt
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ? AND task_id = ?",
+            (json.dumps(metadata, ensure_ascii=False), int(run_id), task.id),
+        )
+        _append_event(
+            conn,
+            task.id,
+            "role_contract_admitted",
+            receipt,
+            run_id=int(run_id),
+        )
+    return admission
+
+
 def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
     """Reclaim pre-tag worker rows in state.db so they leave the session lists.
 
@@ -10728,9 +11088,16 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
-    from hermes_cli.profiles import normalize_profile_name
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_reference
 
     profile_arg = normalize_profile_name(task.assignee)
+    try:
+        resolved_profile_arg = resolve_profile_reference(profile_arg)
+    except FileNotFoundError:
+        # Preserve direct-spawn compatibility for test fixtures and external
+        # callers that defer missing-profile diagnosis to CLI startup. Required
+        # role-contract admission still fails closed before Popen below.
+        resolved_profile_arg = profile_arg
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -10752,7 +11119,7 @@ def _default_spawn(
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        env["HERMES_HOME"] = resolve_profile_env(resolved_profile_arg)
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
@@ -10828,7 +11195,7 @@ def _default_spawn(
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
-    env["HERMES_PROFILE"] = profile_arg
+    env["HERMES_PROFILE"] = resolved_profile_arg
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -10840,7 +11207,7 @@ def _default_spawn(
 
     cmd = [
         *_resolve_hermes_argv(),
-        "-p", profile_arg,
+        "-p", resolved_profile_arg,
         "--cli",
         # Worker subprocesses switch to a profile-scoped HERMES_HOME above,
         # so they see that profile's shell-hook allowlist instead of the
@@ -10871,6 +11238,64 @@ def _default_spawn(
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    admission_marker = object()
+    admission = getattr(task, "_role_contract_admission", admission_marker)
+    if admission is admission_marker:
+        from hermes_cli.role_contract import admit_role_contract
+
+        admission = admit_role_contract(
+            env.get("HERMES_HOME") or "",
+            resolved_profile_arg,
+            worker_toolsets or [],
+            task_id=task.id,
+            run_id=task.current_run_id,
+            workspace_path=(
+                str(Path(workspace).expanduser().resolve()) if workspace else None
+            ),
+            branch_name=task.branch_name,
+            required=bool(task.require_role_contract),
+        )
+        setattr(task, "_role_contract_admission", admission)
+    if task.expected_role_contract_sha256:
+        observed_digest = admission.contract.sha256 if admission is not None else None
+        if observed_digest != task.expected_role_contract_sha256:
+            raise _WorkerRoleContractAdmissionError(
+                "role contract digest does not match the decision-time receipt: "
+                f"expected {task.expected_role_contract_sha256}, "
+                f"observed {observed_digest or 'none'}"
+            )
+    if admission is not None:
+        from hermes_cli.role_contract import verify_admission_bytes
+
+        if admission.task_id != task.id or admission.run_id != task.current_run_id:
+            raise _WorkerRoleContractAdmissionError(
+                f"role contract admission binding mismatch for task {task.id}"
+            )
+        try:
+            verify_admission_bytes(admission)
+        except Exception as exc:
+            raise _WorkerRoleContractAdmissionError(str(exc)) from exc
+        worker_toolsets = list(admission.effective_toolsets)
+        env["HERMES_ROLE_CONTRACT_SCHEMA"] = admission.contract.schema
+        env["HERMES_ROLE_CONTRACT_VERSION"] = admission.contract.version
+        env["HERMES_ROLE_CONTRACT_SHA256"] = admission.contract.sha256
+        env["HERMES_ROLE_CONTRACT_RECEIPT_ID"] = admission.receipt_id
+        if admission.contract.allowed_tools:
+            env["HERMES_ROLE_CONTRACT_ALLOWED_TOOLS"] = json.dumps(
+                list(admission.contract.allowed_tools), separators=(",", ":")
+            )
+        if admission.contract.workspace_only:
+            bound_workspace = admission.workspace_path
+            if not bound_workspace:
+                raise _WorkerRoleContractAdmissionError(
+                    f"workspace-only role contract has no bound workspace for task {task.id}"
+                )
+            if Path(bound_workspace).resolve() != Path(workspace).resolve():
+                raise _WorkerRoleContractAdmissionError(
+                    f"role contract workspace binding changed before spawn for task {task.id}"
+                )
+            env["HERMES_ROLE_CONTRACT_WORKSPACE_ONLY"] = "1"
+            env["HERMES_ROLE_CONTRACT_WORKSPACE_PATH"] = bound_workspace
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([

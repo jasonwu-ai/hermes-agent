@@ -1,0 +1,14 @@
+{
+  "name": "verified-pipeline",
+  "label": "Verified Pipeline",
+  "description": "Review exact specification bytes and project one bounded Planner or revision task",
+  "icon": "ShieldCheck",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/verified-pipeline",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

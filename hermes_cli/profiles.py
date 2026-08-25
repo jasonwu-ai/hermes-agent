@@ -38,7 +38,12 @@ from agent.skill_utils import is_excluded_skill_path
 logger = logging.getLogger(__name__)
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_NUMERIC_PROFILE_PREFIX_RE = re.compile(r"^\d{2}-")
 _WARNED_MISSING_ALLOWLIST_ENTRIES: set[tuple[str, ...]] = set()
+
+
+class AmbiguousProfileError(ValueError):
+    """Raised when a shorthand runtime profile reference has multiple matches."""
 
 # Directories bootstrapped inside every new profile
 _PROFILE_DIRS = [
@@ -377,6 +382,51 @@ def get_profile_dir(name: str) -> Path:
     if canon == "default":
         return _get_default_hermes_home()
     return _get_profiles_root() / canon
+
+
+def resolve_profile_reference(
+    name: str,
+    *,
+    profiles_root: Optional[Path] = None,
+) -> str:
+    """Resolve a runtime profile reference to one installed canonical id.
+
+    Exact ids win. An unprefixed reference such as ``builder`` may resolve to
+    exactly one ``NN-builder`` directory; ambiguity fails closed. Profile
+    management operations continue to use exact ids through ``get_profile_dir``.
+    """
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    if canon == "default":
+        return canon
+
+    root = profiles_root if profiles_root is not None else _get_profiles_root()
+    if (root / canon).is_dir():
+        return canon
+
+    matches: list[str] = []
+    if not _NUMERIC_PROFILE_PREFIX_RE.match(canon):
+        candidate_re = re.compile(rf"^\d{{2}}-{re.escape(canon)}$")
+        try:
+            matches = sorted(
+                entry.name
+                for entry in root.iterdir()
+                if candidate_re.fullmatch(entry.name) and entry.is_dir()
+            )
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"Unable to inspect profiles directory {root}: {exc}"
+            ) from exc
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise AmbiguousProfileError(
+            f"Profile reference {canon!r} is ambiguous; use one of: "
+            + ", ".join(matches)
+        )
+    raise FileNotFoundError(
+        f"Profile {canon!r} does not exist. Create it with: hermes profile create {canon}"
+    )
 
 
 def profile_exists(name: str) -> bool:
@@ -2514,8 +2564,6 @@ def resolve_profile_env(profile_name: str) -> str:
     spelling (#82581 junction follow-up).  Physically the paths are
     identical (junction-transparent); only the spelling is preserved.
     """
-    canon = normalize_profile_name(profile_name)
-    validate_profile_name(canon)
     env_home = os.environ.get("HERMES_HOME", "").strip()
     if env_home:
         env_path = Path(env_home)
@@ -2524,6 +2572,7 @@ def resolve_profile_env(profile_name: str) -> str:
         root = env_path.parent.parent if env_path.parent.name == "profiles" else env_path
     else:
         root = _get_default_hermes_home()
+    canon = resolve_profile_reference(profile_name, profiles_root=root / "profiles")
     if canon == "default":
         return str(root)
     profile_dir = root / "profiles" / canon

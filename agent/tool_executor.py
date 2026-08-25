@@ -186,6 +186,70 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     )
 
 
+def _role_contract_tool_block(function_name: str, function_args: dict) -> Optional[str]:
+    """Enforce receipt-pinned per-tool, task, and workspace authority."""
+    raw_allowed = os.environ.get("HERMES_ROLE_CONTRACT_ALLOWED_TOOLS")
+    if not raw_allowed:
+        return None
+    try:
+        allowed = json.loads(raw_allowed)
+    except json.JSONDecodeError:
+        return "role-contract allowed-tools policy is malformed"
+    if not isinstance(allowed, list) or not all(isinstance(item, str) for item in allowed):
+        return "role-contract allowed-tools policy is malformed"
+    if function_name not in allowed:
+        return f"tool {function_name!r} is outside the admitted role contract"
+
+    current_task = os.environ.get("HERMES_KANBAN_TASK")
+    if function_name.startswith("kanban_") and current_task:
+        requested_task = function_args.get("task_id")
+        if requested_task is not None and str(requested_task) != current_task:
+            return "role-contract Kanban action is limited to the current task"
+        current_board = os.environ.get("HERMES_KANBAN_BOARD")
+        requested_board = function_args.get("board")
+        if (
+            current_board
+            and requested_board is not None
+            and str(requested_board) != current_board
+        ):
+            return "role-contract Kanban action is limited to the admitted board"
+
+    if os.environ.get("HERMES_ROLE_CONTRACT_WORKSPACE_ONLY") != "1":
+        return None
+    workspace_text = os.environ.get("HERMES_ROLE_CONTRACT_WORKSPACE_PATH")
+    if not workspace_text:
+        return "workspace-only role contract has no admitted workspace"
+    workspace = Path(workspace_text).expanduser().resolve()
+    if function_name == "patch" and function_args.get("mode") == "patch":
+        return "workspace-only role contracts do not admit multi-file patch payloads"
+    path_values: list[str] = []
+    for key in ("path", "workdir", "output_path"):
+        value = function_args.get(key)
+        if isinstance(value, str) and value.strip():
+            path_values.append(value)
+    artifacts = function_args.get("artifacts")
+    if isinstance(artifacts, str):
+        path_values.append(artifacts)
+    elif isinstance(artifacts, (list, tuple)):
+        path_values.extend(str(value) for value in artifacts)
+    metadata = function_args.get("metadata")
+    if isinstance(metadata, dict):
+        nested_artifacts = metadata.get("artifacts")
+        if isinstance(nested_artifacts, str):
+            path_values.append(nested_artifacts)
+        elif isinstance(nested_artifacts, (list, tuple)):
+            path_values.extend(str(value) for value in nested_artifacts)
+    for value in path_values:
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        try:
+            candidate.resolve().relative_to(workspace)
+        except (OSError, ValueError):
+            return f"path {value!r} escapes the admitted role-contract workspace"
+    return None
+
+
 def _resolve_concurrent_tool_timeout() -> float | None:
     """Resolve the per-batch concurrent tool deadline.
 
@@ -663,6 +727,11 @@ def _run_agent_tool_execution_middleware(
                 if authorization_gate is None
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
+
+        if block_message is None:
+            block_message = _role_contract_tool_block(function_name, final_args)
+            if block_message is not None:
+                block_error_type = "role_contract_block"
 
         guardrail_decision = None
         if block_message is None:
