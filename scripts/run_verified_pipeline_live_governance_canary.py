@@ -133,11 +133,18 @@ def _validated_credential_auth(source_home: Path) -> Path:
 def _snapshot_profiles(
     runtime_home: Path,
     credential_auth: Path | None = None,
+    *,
+    active_profiles: tuple[str, ...] = GOVERNANCE_PROFILES,
 ) -> dict[str, Any]:
+    if not set(GOVERNANCE_PROFILES).issubset(active_profiles):
+        raise RuntimeError("active profile snapshot must include every governance profile")
+    unknown = set(active_profiles) - set(GOVERNANCE_PROFILES) - set(MANDATORY_CONTRACT_PROFILES)
+    if unknown:
+        raise RuntimeError(f"unsupported active profile snapshot: {sorted(unknown)}")
     profiles_root = runtime_home / "profiles"
     profiles_root.mkdir(parents=True, mode=0o700)
-    manifest: dict[str, Any] = {"profiles": {}, "credential_files": []}
-    for profile in GOVERNANCE_PROFILES:
+    manifest: dict[str, Any] = {"profiles": {}}
+    for profile in active_profiles:
         live = LIVE_PROFILES_ROOT / profile
         target = profiles_root / profile
         target.mkdir(mode=0o700)
@@ -148,15 +155,14 @@ def _snapshot_profiles(
                 _copy_file(source, target / name)
         if credential_auth is not None:
             _copy_file(credential_auth, target / "auth.json")
-            auth_target = str(target / "auth.json")
-            if auth_target not in manifest["credential_files"]:
-                manifest["credential_files"].append(auth_target)
         overlay = OVERLAYS / profile
         _copy_file(overlay / "ROLE_CONTRACT.md", target / "ROLE_CONTRACT.md")
-        shutil.copytree(overlay / "skills", target / "skills")
-        for path in (target / "skills").rglob("*"):
-            if path.is_file():
-                path.chmod(0o600)
+        overlay_skills = overlay / "skills"
+        if overlay_skills.is_dir():
+            shutil.copytree(overlay_skills, target / "skills")
+            for path in (target / "skills").rglob("*"):
+                if path.is_file():
+                    path.chmod(0o600)
         manifest["profiles"][profile] = {
             "contract_sha256": _sha256(target / "ROLE_CONTRACT.md"),
             "config_sha256": _sha256(target / "config.yaml"),
@@ -166,6 +172,8 @@ def _snapshot_profiles(
             },
         }
     for profile in MANDATORY_CONTRACT_PROFILES:
+        if profile in active_profiles:
+            continue
         source = OVERLAYS / profile / "ROLE_CONTRACT.md"
         if not source.is_file():
             raise RuntimeError(f"mandatory candidate role contract missing: {profile}")
@@ -427,11 +435,11 @@ def main() -> int:
         if args.credential_source_home is not None:
             source_home = args.credential_source_home.expanduser().absolute()
             credential_auth = _validated_credential_auth(source_home)
-            report["credential_source_sha256"] = _sha256(credential_auth)
-        report["profile_snapshot"] = _snapshot_profiles(
+        profile_snapshot = _snapshot_profiles(
             runtime_home,
             credential_auth=credential_auth,
         )
+        report["profile_snapshot"] = {"profiles": profile_snapshot["profiles"]}
         os.environ.update(
             {
                 "HERMES_HOME": str(runtime_home),
