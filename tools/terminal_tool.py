@@ -1524,10 +1524,14 @@ def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Op
         return None
     if not _docker_session_isolation_enabled():
         return config.get("host_cwd")
-    if _resolve_container_task_id(task_id) == "default":
-        # Top-level CLI parent — single-session process, legacy behavior.
+    raw_task_id = task_id or "default"
+    if raw_task_id == "default":
+        # Literal top-level CLI parent — single-session process, legacy behavior.
+        # Named sessions with CWD-only overrides also collapse to the shared
+        # ``default`` container, but must still read their raw session override
+        # below so the attached workspace becomes that session's mount source.
         return config.get("host_cwd")
-    overrides = resolve_task_overrides(task_id)
+    overrides = resolve_task_overrides(raw_task_id)
     if overrides.get("cwd_source") == "process":
         return None
     candidate = overrides.get("cwd")
