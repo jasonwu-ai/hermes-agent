@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import threading
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -47,6 +48,20 @@ FROZEN["09-test"].update(
         "workspace_only": True,
     }
 )
+for _governance_profile in (
+    controller.PLANNER_PROFILE,
+    review.DA_PROFILE,
+    review.CEO_PROFILE,
+):
+    FROZEN[_governance_profile].update(
+        {
+            "allowed_toolsets": ["file", "kanban"],
+            "allowed_tools": sorted(
+                controller.GOVERNANCE_ROLE_TOOL_CEILINGS[_governance_profile]
+            ),
+            "workspace_only": True,
+        }
+    )
 ARTIFACT = b"# Exact specification\n\nBuild one bounded, reviewed plan.\n"
 AUTHORITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
 AUTHORITY_VERIFIER = {
@@ -168,10 +183,15 @@ def _admit_fixture_run(conn, task_id: str) -> tuple[object, int]:
     run_id = int(task.current_run_id)
     workspace = str(Path(task.workspace_path).resolve()) if task.workspace_path else None
     frozen_contract = FROZEN.get(task.assignee, {})
-    implementation_role = task.assignee in controller.IMPLEMENTATION_PROFILES
-    allowed_toolsets = frozen_contract.get("allowed_toolsets", []) if implementation_role else []
-    allowed_tools = frozen_contract.get("allowed_tools", []) if implementation_role else []
-    workspace_only = frozen_contract.get("workspace_only", False) if implementation_role else False
+    bounded_role = task.assignee in controller.ROLE_TOOL_CEILINGS
+    allowed_toolsets = frozen_contract.get("allowed_toolsets", []) if bounded_role else []
+    allowed_tools = frozen_contract.get("allowed_tools", []) if bounded_role else []
+    workspace_only = frozen_contract.get("workspace_only", False) if bounded_role else False
+    workspace_dev = workspace_ino = workspace_mode = None
+    if workspace is not None:
+        from hermes_cli.role_contract import workspace_identity
+
+        workspace_dev, workspace_ino, workspace_mode = workspace_identity(workspace)
     basis = {
         "schema": "hermes-role-contract/v2",
         "profile": task.assignee,
@@ -186,6 +206,9 @@ def _admit_fixture_run(conn, task_id: str) -> tuple[object, int]:
         "task_id": task.id,
         "run_id": run_id,
         "workspace_path": str(workspace),
+        "workspace_dev": workspace_dev,
+        "workspace_ino": workspace_ino,
+        "workspace_mode": workspace_mode,
         "branch_name": task.branch_name,
     }
     receipt = {
@@ -863,6 +886,15 @@ def test_concurrent_review_projection_creates_exactly_one_successor(tmp_path):
     assert {receipt["status"] for receipt in receipts} == {"DELIVERED"}
     assert len({receipt["task_id"] for receipt in receipts}) == 1
     assert len(_tasks(kanban_path)) == 2
+
+
+def test_review_exact_publication_rejects_divergent_existing_bytes(tmp_path):
+    request = tmp_path / "request.json"
+    request.write_bytes(b'{"authority":"drifted"}')
+    with pytest.raises(review.ReviewCoordinationError) as exc:
+        review._write_exact(request, b'{"authority":"expected"}', "review request")
+    assert exc.value.code == "REVIEW_ARTIFACT_CUSTODY_MISMATCH"
+    assert request.read_bytes() == b'{"authority":"drifted"}'
 
 
 def test_task_workspace_drift_blocks_admission_before_successor(tmp_path):
@@ -1669,7 +1701,7 @@ def test_execution_crash_window_and_concurrent_replays_converge(tmp_path):
     assert len(_implementation_rows(kanban_path)) == 2
 
 
-def test_execution_completion_requires_all_bound_tasks_done(tmp_path):
+def test_execution_completion_requires_all_bound_tasks_done(tmp_path, monkeypatch):
     control_db, kanban_path, intake, board, projected, _, intent = (
         _authorized_execution(tmp_path)
     )
@@ -1691,20 +1723,62 @@ def test_execution_completion_requires_all_bound_tasks_done(tmp_path):
     assert progressed_replay["status"] == "ARMED"
     assert progressed_replay["replayed"] is True
     _complete(kanban_path, projected["task_map"]["verify"])
-    def complete_receipt(_):
+    deferred_paths = {
+        row["id"]: Path(row["workspace_path"])
+        for row in _implementation_rows(kanban_path)
+        if row["workspace_kind"] == "scratch"
+    }
+    assert all(path.is_dir() for path in deferred_paths.values())
+    original_finalize = execution._finalize_terminal_custody
+    first_finalize_started = threading.Event()
+    release_first_finalize = threading.Event()
+    call_lock = threading.Lock()
+    call_count = 0
+
+    def delayed_finalize(*args, **kwargs):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            position = call_count
+        if position == 1:
+            first_finalize_started.set()
+            assert release_first_finalize.wait(timeout=10)
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(execution, "_finalize_terminal_custody", delayed_finalize)
+
+    def complete_receipt():
         return execution.record_execution_completion(
             intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
             kanban_db_path=kanban_path,
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        receipts = list(pool.map(complete_receipt, range(2)))
+        first = pool.submit(complete_receipt)
+        assert first_finalize_started.wait(timeout=10)
+        second = pool.submit(complete_receipt)
+        try:
+            second_receipt = second.result(timeout=10)
+        finally:
+            release_first_finalize.set()
+        receipts = [first.result(timeout=10), second_receipt]
     assert {item["replayed"] for item in receipts} == {False, True}
     receipt = next(item for item in receipts if not item["replayed"])
     assert receipt["status"] == execution.COMPLETION_STATUS
     assert receipt["run_id"] == intake["run_id"]
     assert receipt["final_task_id"] == projected["task_map"]["verify"]
     assert set(receipt["task_results"]) == {"build", "verify"}
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        for task_id in deferred_paths:
+            acknowledgements = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? AND kind = ?",
+                (task_id, execution._TERMINAL_ACK_KIND),
+            ).fetchall()
+            assert len(acknowledgements) == 1
+    finally:
+        conn.close()
+    assert all(path.is_dir() for path in deferred_paths.values())
     for stage in receipt["task_results"].values():
         stage_receipt = stage["stage_receipt"]
         assert stage_receipt["task_id"] == stage["task_id"]
@@ -1723,6 +1797,67 @@ def test_execution_completion_requires_all_bound_tasks_done(tmp_path):
         intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER, db_path=control_db,
         kanban_db_path=kanban_path,
     ) == {**receipt, "replayed": True}
+
+
+def test_verified_pipeline_cleanup_preserves_workspace_contents(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    task_id = projected["task_map"]["build"]
+    _complete(kanban_path, task_id)
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        task = kanban_db.get_task(conn, task_id)
+        workspace = Path(task.workspace_path)
+        sentinel = workspace / "must-survive.txt"
+        sentinel.write_text("preserved custody", encoding="utf-8")
+        kanban_db._cleanup_workspace(conn, task_id)
+    finally:
+        conn.close()
+
+    assert workspace.is_dir()
+    assert sentinel.read_text(encoding="utf-8") == "preserved custody"
+
+
+def test_execution_replay_rejects_admission_authority_drift_with_stable_id(tmp_path):
+    control_db, kanban_path, _, board, projected, _, intent = _authorized_execution(tmp_path)
+    execution.arm_execution(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+    _complete(kanban_path, projected["task_map"]["build"])
+    _complete(kanban_path, projected["task_map"]["verify"])
+    execution.record_execution_completion(
+        intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+        db_path=control_db, kanban_db_path=kanban_path,
+    )
+
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        row = conn.execute(
+            "SELECT id, metadata FROM task_runs WHERE task_id = ? AND status = 'done'",
+            (projected["task_map"]["build"],),
+        ).fetchone()
+        metadata = json.loads(row["metadata"])
+        original_id = metadata["role_contract_admission"]["receipt_id"]
+        metadata["role_contract_admission"]["allowed_tools"] = ["terminal", "unsafe-extra"]
+        assert metadata["role_contract_admission"]["receipt_id"] == original_id
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata, sort_keys=True), row["id"]),
+            )
+    finally:
+        conn.close()
+
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"], board=board, authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db, kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_COMPLETION_DRIFT"
 
 
 def test_execution_completion_rejects_missing_stage_receipt(tmp_path):
@@ -2241,6 +2376,54 @@ def _completed_execution(tmp_path: Path):
     )
     completion.pop("replayed", None)
     return control_db, kanban_path, intake, board, intent, completion
+
+
+def test_execution_replay_rejects_terminal_acknowledgement_tampering(tmp_path):
+    control_db, kanban_path, _, board, intent, _ = _completed_execution(tmp_path)
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        with kanban_db.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = '{}' WHERE kind = ?",
+                (execution._TERMINAL_ACK_KIND,),
+            )
+    finally:
+        conn.close()
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"],
+            board=board,
+            authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_TERMINAL_ACK_DRIFT"
+
+
+def test_execution_replay_rejects_durable_attachment_tampering(tmp_path):
+    control_db, kanban_path, _, board, intent, completion = _completed_execution(tmp_path)
+    stage = next(iter(completion["task_results"].values()))["stage_receipt"]
+    artifact = stage["artifacts"][0]
+    conn = kanban_db.connect(db_path=kanban_path)
+    try:
+        attachment = conn.execute(
+            "SELECT stored_path FROM task_attachments "
+            "WHERE task_id = ? AND filename = ?",
+            (stage["task_id"], artifact["filename"]),
+        ).fetchone()
+        assert attachment is not None
+    finally:
+        conn.close()
+    Path(attachment["stored_path"]).write_bytes(b"tampered after aggregate receipt")
+    with pytest.raises(execution.ExecutionError) as exc:
+        execution.record_execution_completion(
+            intent["idempotency_key"],
+            board=board,
+            authority_verifier=AUTHORITY_VERIFIER,
+            db_path=control_db,
+            kanban_db_path=kanban_path,
+        )
+    assert exc.value.code == "EXECUTION_ARTIFACT_DRIFT"
 
 
 def _persist_release_authority(

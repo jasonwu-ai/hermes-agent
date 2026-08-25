@@ -8,10 +8,13 @@ Kanban DAG; normal Kanban dependency gating owns subsequent execution.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import base64
 import hashlib
+import hmac
 import json
 import os
+
 from pathlib import Path
 import re
 import sqlite3
@@ -985,11 +988,60 @@ def _sha256_regular_file(path: Path) -> tuple[str, int]:
                 break
             digest.update(chunk)
             size += len(chunk)
+        after = os.fstat(fd)
+        try:
+            current = path.lstat()
+        except FileNotFoundError as exc:
+            raise ExecutionError(
+                "EXECUTION_ARTIFACT_DRIFT", "captured artifact path changed while reading"
+            ) from exc
+        def identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+        if (
+            size != opened.st_size
+            or not stat.S_ISREG(after.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or identity(before) != identity(opened)
+            or identity(opened) != identity(after)
+            or identity(after) != identity(current)
+        ):
+            raise ExecutionError("EXECUTION_ARTIFACT_DRIFT", "captured artifact changed while reading")
+        return digest.hexdigest(), size
     finally:
         os.close(fd)
-    if size != opened.st_size:
-        raise ExecutionError("EXECUTION_ARTIFACT_DRIFT", "captured artifact changed while reading")
-    return digest.hexdigest(), size
+
+
+_ADMISSION_RECEIPT_BASIS_KEYS = (
+    "schema",
+    "profile",
+    "version",
+    "contract_sha256",
+    "configured_toolsets",
+    "allowed_toolsets",
+    "allowed_tools",
+    "workspace_only",
+    "mandatory_toolsets",
+    "effective_toolsets",
+    "task_id",
+    "run_id",
+    "workspace_path",
+    "workspace_dev",
+    "workspace_ino",
+    "workspace_mode",
+    "branch_name",
+)
+
+
+def _computed_admission_receipt_id(admission: Mapping[str, Any]) -> str:
+    basis = {key: admission[key] for key in _ADMISSION_RECEIPT_BASIS_KEYS}
+    return hashlib.sha256(_canonical(basis).encode("utf-8")).hexdigest()
 
 
 def _implementation_stage_receipt(
@@ -1036,28 +1088,7 @@ def _implementation_stage_receipt(
         metadata = json.loads(run["metadata"] or "{}")
         admission = metadata["role_contract_admission"]
         admitted_receipt = json.loads(admitted[0]["payload"])
-        admission_basis = {
-            key: admission[key]
-            for key in (
-                "schema",
-                "profile",
-                "version",
-                "contract_sha256",
-                "configured_toolsets",
-                "allowed_toolsets",
-                "allowed_tools",
-                "workspace_only",
-                "mandatory_toolsets",
-                "effective_toolsets",
-                "task_id",
-                "run_id",
-                "workspace_path",
-                "branch_name",
-            )
-        }
-        computed_admission_id = hashlib.sha256(
-            json.dumps(admission_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        computed_admission_id = _computed_admission_receipt_id(admission)
         completed_payload = json.loads(events[0]["payload"] or "{}")
         artifact_paths = completed_payload.get("artifacts") or []
         source_commit = metadata.get("source_commit")
@@ -1103,7 +1134,16 @@ def _implementation_stage_receipt(
             and bool(current_workspace)
             and Path(admitted_workspace).resolve() == Path(current_workspace).resolve()
         )
-    except OSError:
+        if same_workspace:
+            from hermes_cli.role_contract import verify_workspace_identity
+
+            verify_workspace_identity(
+                admitted_workspace,
+                expected_dev=admission.get("workspace_dev"),
+                expected_ino=admission.get("workspace_ino"),
+                expected_mode=admission.get("workspace_mode"),
+            )
+    except (OSError, ValueError, RuntimeError):
         same_workspace = False
     if (
         not same_workspace
@@ -1275,6 +1315,7 @@ def _implementation_stage_receipt(
         "profile": expected_profile,
         "role_contract_sha256": admission["contract_sha256"],
         "admission_receipt_id": admission["receipt_id"],
+        "admission_receipt": admission,
         "artifacts": artifacts,
         "source_commit": normalized_source_commit,
     }
@@ -1494,6 +1535,310 @@ def _validated_completion_receipt_on_board_connection(
     return receipt
 
 
+def _validated_acknowledged_completion_receipt_on_board_connection(
+    execution_key: str,
+    *,
+    stored_receipt: Mapping[str, Any],
+    board: str,
+    authority_verifier: Mapping[str, Any],
+    db_path: Optional[str | os.PathLike[str]],
+    board_conn: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Revalidate durable terminal evidence after admitted scratch cleanup."""
+    row, intent, payload = _load_execution(
+        execution_key, authority_verifier=authority_verifier, db_path=db_path
+    )
+    if board != row["board"] or stored_receipt.get("execution_key") != execution_key:
+        raise ExecutionError(
+            "EXECUTION_COMPLETION_DRIFT",
+            "stored completion receipt does not match execution authority",
+        )
+    _validate_board_arm_receipt(board_conn, intent=intent, payload=payload)
+    _validate_arm_events(
+        board_conn,
+        execution_key=execution_key,
+        expected_statuses={
+            intent["task_map"][task["id"]]: _expected_armed_status(task)
+            for task in materializer._topological_tasks(payload["plan"])
+        },
+    )
+    _validate_bound_graph(
+        board_conn,
+        intent=intent,
+        payload=payload,
+        allowed_statuses={"done"},
+        authorized=True,
+    )
+    stored_results = stored_receipt.get("task_results")
+    if not isinstance(stored_results, Mapping):
+        raise ExecutionError(
+            "EXECUTION_COMPLETION_DRIFT", "stored completion task results are malformed"
+        )
+    aggregate_sha256 = _digest(stored_receipt)
+    for task in materializer._topological_tasks(payload["plan"]):
+        task_id = intent["task_map"][task["id"]]
+        result = stored_results.get(task["id"])
+        if not isinstance(result, Mapping) or result.get("task_id") != task_id:
+            raise ExecutionError(
+                "EXECUTION_COMPLETION_DRIFT", "stored task result identity has drifted"
+            )
+        task_row = board_conn.execute(
+            "SELECT status, result, completed_at FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task_row is None or any(
+            result.get(field) != task_row[field]
+            for field in ("status", "result", "completed_at")
+        ):
+            raise ExecutionError(
+                "EXECUTION_COMPLETION_DRIFT", "terminal task result has drifted"
+            )
+        stage = result.get("stage_receipt")
+        expected_contract = payload["frozen_profiles"][task["assignee"]]
+        if (
+            not isinstance(stage, Mapping)
+            or stage.get("task_id") != task_id
+            or stage.get("profile") != task["assignee"]
+            or stage.get("role_contract_sha256") != expected_contract["sha256"]
+            or not isinstance(stage.get("run_id"), int)
+            or not isinstance(stage.get("admission_receipt_id"), str)
+            or not isinstance(stage.get("admission_receipt"), Mapping)
+            or stage.get("source_commit") is not None
+        ):
+            raise ExecutionError(
+                "EXECUTION_COMPLETION_DRIFT", "stored stage receipt has drifted"
+            )
+        run_row = board_conn.execute(
+            "SELECT profile, status, outcome, ended_at, metadata FROM task_runs "
+            "WHERE id = ? AND task_id = ?",
+            (stage["run_id"], task_id),
+        ).fetchone()
+        admitted_rows = board_conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'role_contract_admitted' ORDER BY id",
+            (task_id, stage["run_id"]),
+        ).fetchall()
+        try:
+            run_metadata = json.loads(run_row["metadata"] or "{}") if run_row else {}
+            admitted = run_metadata["role_contract_admission"]
+            admitted_event = json.loads(admitted_rows[0]["payload"])
+            expected_admission = dict(stage["admission_receipt"])
+            computed_admission_id = _computed_admission_receipt_id(expected_admission)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, IndexError) as exc:
+            raise ExecutionError(
+                "EXECUTION_COMPLETION_DRIFT", "terminal run admission is missing"
+            ) from exc
+        if (
+            run_row["profile"] != task["assignee"]
+            or run_row["status"] != "done"
+            or run_row["outcome"] != "completed"
+            or run_row["ended_at"] is None
+            or len(admitted_rows) != 1
+            or admitted != expected_admission
+            or admitted_event != expected_admission
+            or expected_admission.get("receipt_id") != computed_admission_id
+            or stage["admission_receipt_id"] != computed_admission_id
+            or expected_admission.get("task_id") != task_id
+            or expected_admission.get("run_id") != stage["run_id"]
+            or expected_admission.get("profile") != task["assignee"]
+            or expected_admission.get("schema") != expected_contract.get("schema")
+            or expected_admission.get("version") != expected_contract.get("version")
+            or expected_admission.get("contract_sha256") != expected_contract.get("sha256")
+        ):
+            raise ExecutionError(
+                "EXECUTION_COMPLETION_DRIFT", "terminal run admission has drifted"
+            )
+        artifacts = stage.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise ExecutionError(
+                "EXECUTION_COMPLETION_DRIFT", "durable stage artifacts are missing"
+            )
+        seen_filenames: set[str] = set()
+        for artifact in artifacts:
+            if not isinstance(artifact, Mapping):
+                raise ExecutionError(
+                    "EXECUTION_COMPLETION_DRIFT", "durable stage artifact is malformed"
+                )
+            filename = str(artifact.get("filename") or "")
+            if not filename or filename in seen_filenames:
+                raise ExecutionError(
+                    "EXECUTION_COMPLETION_DRIFT", "durable stage artifact identity is ambiguous"
+                )
+            seen_filenames.add(filename)
+            attachments = board_conn.execute(
+                "SELECT stored_path, size, sha256 FROM task_attachments "
+                "WHERE task_id = ? AND filename = ? "
+                "AND uploaded_by = 'kanban_complete' ORDER BY id",
+                (task_id, filename),
+            ).fetchall()
+            if len(attachments) != 1:
+                raise ExecutionError(
+                    "EXECUTION_ARTIFACT_MISSING", "durable stage attachment is ambiguous"
+                )
+            attachment = attachments[0]
+            observed_sha, observed_size = _sha256_regular_file(
+                Path(attachment["stored_path"])
+            )
+            if (
+                artifact.get("size") != observed_size
+                or artifact.get("sha256") != observed_sha
+                or artifact.get("source_run_id") != stage["run_id"]
+                or artifact.get("artifact_role") != "kanban-attachment"
+                or attachment["size"] != observed_size
+                or attachment["sha256"] != observed_sha
+            ):
+                raise ExecutionError(
+                    "EXECUTION_ARTIFACT_DRIFT", "durable stage attachment has drifted"
+                )
+        expected_ack = {
+            "schema": "verified-pipeline/terminal-custody-ack/v1",
+            "execution_key": execution_key,
+            "task_id": task_id,
+            "run_id": stage["run_id"],
+            "stage_receipt_sha256": _digest(stage),
+            "aggregate_receipt_sha256": aggregate_sha256,
+        }
+        ack_rows = board_conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id",
+            (task_id, _TERMINAL_ACK_KIND),
+        ).fetchall()
+        if len(ack_rows) != 1:
+            raise ExecutionError(
+                "EXECUTION_TERMINAL_ACK_DRIFT",
+                "terminal custody acknowledgement is missing or duplicated",
+            )
+        try:
+            observed_ack = json.loads(ack_rows[0]["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ExecutionError(
+                "EXECUTION_TERMINAL_ACK_DRIFT",
+                "terminal acknowledgement is malformed",
+            ) from exc
+        if observed_ack != expected_ack:
+            raise ExecutionError(
+                "EXECUTION_TERMINAL_ACK_DRIFT", "terminal acknowledgement has drifted"
+            )
+    expected_receipt = {
+        "schema": EXECUTION_CONTROLLER_ID,
+        "execution_key": execution_key,
+        "run_id": row["run_id"],
+        "plan_sha256": row["plan_sha256"],
+        "status": COMPLETION_STATUS,
+        "final_task_id": intent["task_map"][payload["plan"]["final_task_id"]],
+        "task_results": dict(stored_results),
+        "source_candidate": stored_receipt.get("source_candidate"),
+        "boundary": "release review required; no merge, deploy, or release authority",
+    }
+    if expected_receipt != stored_receipt:
+        raise ExecutionError(
+            "EXECUTION_COMPLETION_DRIFT", "stored aggregate receipt has drifted"
+        )
+    return expected_receipt
+
+
+_TERMINAL_ACK_KIND = "verified_pipeline_terminal_acknowledged"
+
+
+def _has_complete_terminal_ack_set(
+    board_conn: sqlite3.Connection, receipt: Mapping[str, Any]
+) -> bool:
+    results = receipt.get("task_results")
+    if not isinstance(results, Mapping) or not results:
+        raise ExecutionError(
+            "EXECUTION_COMPLETION_DRIFT", "stored completion task results are malformed"
+        )
+    counts: list[int] = []
+    for result in results.values():
+        if not isinstance(result, Mapping) or not isinstance(result.get("task_id"), str):
+            raise ExecutionError(
+                "EXECUTION_COMPLETION_DRIFT", "stored task result identity has drifted"
+            )
+        count = board_conn.execute(
+            "SELECT COUNT(*) AS count FROM task_events WHERE task_id = ? AND kind = ?",
+            (result["task_id"], _TERMINAL_ACK_KIND),
+        ).fetchone()["count"]
+        counts.append(int(count))
+    if all(count == 0 for count in counts):
+        return False
+    if all(count == 1 for count in counts):
+        return True
+    raise ExecutionError(
+        "EXECUTION_TERMINAL_ACK_DRIFT",
+        "terminal custody acknowledgement set is partial or duplicated",
+    )
+
+
+def _acknowledge_terminal_custody(
+    board_conn: sqlite3.Connection,
+    *,
+    receipt: Mapping[str, Any],
+) -> list[str]:
+    """Bind terminal stage receipts to the durable aggregate before cleanup."""
+    from hermes_cli import kanban_db
+
+    aggregate_sha256 = _digest(receipt)
+    acknowledged: list[str] = []
+    for result in receipt["task_results"].values():
+        stage_receipt = result["stage_receipt"]
+        task_id = stage_receipt["task_id"]
+        payload = {
+            "schema": "verified-pipeline/terminal-custody-ack/v1",
+            "execution_key": receipt["execution_key"],
+            "task_id": task_id,
+            "run_id": stage_receipt["run_id"],
+            "stage_receipt_sha256": _digest(stage_receipt),
+            "aggregate_receipt_sha256": aggregate_sha256,
+        }
+        rows = board_conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY id",
+            (task_id, _TERMINAL_ACK_KIND),
+        ).fetchall()
+        if len(rows) > 1:
+            raise ExecutionError(
+                "EXECUTION_TERMINAL_ACK_DRIFT",
+                "more than one terminal-custody acknowledgement exists",
+            )
+        if rows:
+            try:
+                existing = json.loads(rows[0]["payload"] or "{}")
+            except json.JSONDecodeError as exc:
+                raise ExecutionError(
+                    "EXECUTION_TERMINAL_ACK_DRIFT",
+                    "terminal-custody acknowledgement is malformed",
+                ) from exc
+            if existing != payload:
+                raise ExecutionError(
+                    "EXECUTION_TERMINAL_ACK_DRIFT",
+                    "terminal-custody acknowledgement does not match aggregate custody",
+                )
+        else:
+            kanban_db._append_event(
+                board_conn,
+                task_id,
+                _TERMINAL_ACK_KIND,
+                payload,
+                run_id=int(stage_receipt["run_id"]),
+            )
+        acknowledged.append(task_id)
+    return acknowledged
+
+
+def _finalize_terminal_custody(
+    receipt: Mapping[str, Any], *, kanban_db_path: str | os.PathLike[str]
+) -> None:
+    """Acknowledge immutable terminal evidence, then converge workspace cleanup."""
+    from hermes_cli import kanban_db
+
+    board_conn = kanban_db.connect(db_path=Path(kanban_db_path))
+    try:
+        with kanban_db.write_txn(board_conn):
+            task_ids = _acknowledge_terminal_custody(board_conn, receipt=receipt)
+        for task_id in task_ids:
+            kanban_db._cleanup_workspace(board_conn, task_id)
+    finally:
+        board_conn.close()
+
+
 def record_execution_completion(
     execution_key: str,
     *,
@@ -1506,20 +1851,81 @@ def record_execution_completion(
     init_execution_schema(db_path)
     from hermes_cli import kanban_db
 
+    receipt_conn = controller.connect(db_path)
+    try:
+        stored_row = receipt_conn.execute(
+            "SELECT payload_json FROM execution_completion_receipts "
+            "WHERE execution_key = ?",
+            (execution_key,),
+        ).fetchone()
+    finally:
+        receipt_conn.close()
+    stored_receipt: Optional[dict[str, Any]] = None
+    if stored_row is not None:
+        try:
+            stored_receipt = json.loads(stored_row["payload_json"])
+        except json.JSONDecodeError as exc:
+            raise ExecutionError(
+                "EXECUTION_COMPLETION_DRIFT", "stored completion receipt is malformed"
+            ) from exc
+
     board_conn = kanban_db.connect(db_path=Path(kanban_db_path))
     _init_execution_board_schema(board_conn)
     try:
         with kanban_db.write_txn(board_conn):
-            receipt = _validated_completion_receipt_on_board_connection(
-                execution_key,
-                board=board,
-                authority_verifier=authority_verifier,
-                db_path=db_path,
-                board_conn=board_conn,
-            )
+            if stored_receipt is None:
+                replay_conn = controller.connect(db_path)
+                try:
+                    replay_row = replay_conn.execute(
+                        "SELECT payload_json FROM execution_completion_receipts "
+                        "WHERE execution_key = ?",
+                        (execution_key,),
+                    ).fetchone()
+                finally:
+                    replay_conn.close()
+                if replay_row is not None:
+                    try:
+                        stored_receipt = json.loads(replay_row["payload_json"])
+                    except json.JSONDecodeError as exc:
+                        raise ExecutionError(
+                            "EXECUTION_COMPLETION_DRIFT",
+                            "stored completion receipt is malformed",
+                        ) from exc
+            if stored_receipt is None:
+                receipt = _validated_completion_receipt_on_board_connection(
+                    execution_key,
+                    board=board,
+                    authority_verifier=authority_verifier,
+                    db_path=db_path,
+                    board_conn=board_conn,
+                )
+            else:
+                if _has_complete_terminal_ack_set(board_conn, stored_receipt):
+                    receipt = _validated_acknowledged_completion_receipt_on_board_connection(
+                        execution_key,
+                        stored_receipt=stored_receipt,
+                        board=board,
+                        authority_verifier=authority_verifier,
+                        db_path=db_path,
+                        board_conn=board_conn,
+                    )
+                else:
+                    receipt = _validated_completion_receipt_on_board_connection(
+                        execution_key,
+                        board=board,
+                        authority_verifier=authority_verifier,
+                        db_path=db_path,
+                        board_conn=board_conn,
+                    )
+                    if not hmac.compare_digest(_canonical(receipt), _canonical(stored_receipt)):
+                        raise ExecutionError(
+                            "EXECUTION_COMPLETION_DRIFT",
+                            "stored completion receipt conflicts with live terminal evidence",
+                        )
     finally:
         board_conn.close()
     conn = controller.connect(db_path)
+    replayed = False
     try:
         with controller._write_txn(conn):
             existing = conn.execute(
@@ -1533,19 +1939,22 @@ def record_execution_completion(
                         "EXECUTION_COMPLETION_DRIFT",
                         "existing completion receipt has different immutable bytes",
                     )
-                return {**receipt, "replayed": True}
-            conn.execute(
-                "INSERT INTO execution_completion_receipts "
-                "(execution_key, run_id, plan_sha256, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    execution_key,
-                    receipt["run_id"],
-                    receipt["plan_sha256"],
-                    _canonical(receipt),
-                    controller._now(),
-                ),
-            )
-        return {**receipt, "replayed": False}
+                replayed = True
+            else:
+                conn.execute(
+                    "INSERT INTO execution_completion_receipts "
+                    "(execution_key, run_id, plan_sha256, payload_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        execution_key,
+                        receipt["run_id"],
+                        receipt["plan_sha256"],
+                        _canonical(receipt),
+                        controller._now(),
+                    ),
+                )
     finally:
         conn.close()
+
+    _finalize_terminal_custody(receipt, kanban_db_path=kanban_db_path)
+    return {**receipt, "replayed": replayed}

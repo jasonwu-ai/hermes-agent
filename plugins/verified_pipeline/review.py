@@ -15,6 +15,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import time
 from typing import Any, Callable, Mapping, Optional
 
 from plugins.verified_pipeline import validators
@@ -188,9 +189,7 @@ def _safe_file(path: Path, label: str) -> bytes:
             "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
             f"{label} must not be group/world-writable",
         )
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -224,23 +223,71 @@ def _safe_file(path: Path, label: str) -> bytes:
             chunks.append(chunk)
             remaining -= len(chunk)
         raw = b"".join(chunks)
+        after = os.fstat(fd)
+        try:
+            current = path.lstat()
+        except FileNotFoundError as exc:
+            raise ReviewCoordinationError(
+                "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
+                f"{label} path changed while reading",
+            ) from exc
+
+        def identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        if (
+            len(raw) != opened.st_size
+            or not stat.S_ISREG(after.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or identity(metadata) != identity(opened)
+            or identity(opened) != identity(after)
+            or identity(after) != identity(current)
+        ):
+            raise ReviewCoordinationError(
+                "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
+                f"{label} changed while reading",
+            )
+        return raw
     finally:
         os.close(fd)
-    if len(raw) != opened.st_size:
-        raise ReviewCoordinationError(
-            "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
-            f"{label} changed while reading",
-        )
-    return raw
 
 
-def _write_exact(path: Path, raw: bytes, label: str) -> None:
-    if path.exists() or path.is_symlink():
-        if _safe_file(path, label) != raw:
+def _assert_stable_exact(path: Path, raw: bytes, label: str) -> None:
+    """Converge through transient hard-link ctime changes, never byte drift."""
+    last_custody_error: Optional[ReviewCoordinationError] = None
+    for _ in range(8):
+        try:
+            observed = _safe_file(path, label)
+        except ReviewCoordinationError as exc:
+            if exc.code != "REVIEW_ARTIFACT_CUSTODY_MISMATCH":
+                raise
+            last_custody_error = exc
+            time.sleep(0.001)
+            continue
+        if observed != raw:
             raise ReviewCoordinationError(
                 "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
                 f"existing {label} bytes do not match the authoritative request",
             )
+        return
+    if last_custody_error is not None:
+        raise last_custody_error
+    raise ReviewCoordinationError(
+        "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
+        f"{label} did not reach stable custody",
+    )
+
+
+def _write_exact(path: Path, raw: bytes, label: str) -> None:
+    if path.exists() or path.is_symlink():
+        _assert_stable_exact(path, raw, label)
         return
     tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -258,11 +305,7 @@ def _write_exact(path: Path, raw: bytes, label: str) -> None:
     finally:
         if tmp.exists():
             tmp.unlink()
-    if _safe_file(path, label) != raw:
-        raise ReviewCoordinationError(
-            "REVIEW_ARTIFACT_CUSTODY_MISMATCH",
-            f"{label} bytes changed during materialization",
-        )
+    _assert_stable_exact(path, raw, label)
 
 
 def _workspace(
@@ -587,6 +630,9 @@ def _verify_terminal_run(
             "task_id": receipt["task_id"],
             "run_id": receipt["run_id"],
             "workspace_path": receipt["workspace_path"],
+            "workspace_dev": receipt["workspace_dev"],
+            "workspace_ino": receipt["workspace_ino"],
+            "workspace_mode": receipt["workspace_mode"],
             "branch_name": receipt["branch_name"],
         }
         computed_receipt_id = hashlib.sha256(
@@ -598,6 +644,20 @@ def _verify_terminal_run(
             "terminal run admission receipt is missing or malformed",
         ) from exc
     expected_workspace_text = str(expected_workspace)
+    try:
+        from hermes_cli.role_contract import verify_workspace_identity
+
+        verify_workspace_identity(
+            expected_workspace_text,
+            expected_dev=receipt.get("workspace_dev"),
+            expected_ino=receipt.get("workspace_ino"),
+            expected_mode=receipt.get("workspace_mode"),
+        )
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise ReviewCoordinationError(
+            "REVIEW_WORKSPACE_DRIFT",
+            "admitted governance workspace object changed before terminal verification",
+        ) from exc
     if (
         len(admitted_events) != 1
         or admitted_receipt != receipt

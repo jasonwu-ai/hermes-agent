@@ -6127,13 +6127,33 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """
     try:
         row = conn.execute(
-            "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
+            "SELECT workspace_kind, workspace_path, branch_name, idempotency_key "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if not row:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        semantic_key = str(row["idempotency_key"] or "")
+        verified_pipeline_task = (
+            semantic_key.startswith("verified-pipeline:")
+            and ":implementation:" in semantic_key
+        )
+        if verified_pipeline_task:
+            # Capability removal is deliberate: neither POSIX nor Windows offers
+            # a portable recursive deletion primitive conditioned on a previously
+            # admitted directory inode. Preserve the workspace rather than risk
+            # deleting a pathname replacement; terminal receipts and durable
+            # attachments remain the replay authority.
+            _cleanup_worker_tmux(conn, task_id)
+            _log.debug(
+                "Preserving verified-pipeline workspace for task %s: "
+                "automatic path-based deletion is disabled",
+                task_id,
+            )
+            _try_cleanup_parent_workspaces(conn, task_id)
+            return
         if kind not in ("scratch", "worktree") or not path:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
@@ -6272,7 +6292,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
         ).fetchall()
         for (parent_id,) in parents:
             row = conn.execute(
-                "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
+                "SELECT workspace_kind, workspace_path, branch_name, idempotency_key "
+                "FROM tasks WHERE id = ?",
                 (parent_id,),
             ).fetchone()
             if (
@@ -6280,6 +6301,17 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 or row["workspace_kind"] not in ("scratch", "worktree")
                 or not row["workspace_path"]
             ):
+                continue
+            semantic_key = str(row["idempotency_key"] or "")
+            if (
+                semantic_key.startswith("verified-pipeline:")
+                and ":implementation:" in semantic_key
+            ):
+                _log.debug(
+                    "Preserving verified-pipeline parent workspace for task %s: "
+                    "automatic path-based deletion is disabled",
+                    parent_id,
+                )
                 continue
             # Check if ALL children of this parent are terminal
             active = conn.execute(
@@ -10472,18 +10504,6 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         try:
-            _admit_worker_role_contract(conn, claimed)
-        except _WorkerRoleContractAdmissionError as exc:
-            block_task(
-                conn,
-                claimed.id,
-                reason=f"role_contract_admission: {exc}",
-                kind="capability",
-                expected_run_id=claimed.current_run_id,
-            )
-            result.auto_blocked.append(claimed.id)
-            continue
-        try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
@@ -10497,10 +10517,30 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
+        # Persist the resolved workspace path before role admission so the
+        # exact directory object is included in the hash-bound receipt.
         set_workspace_path(conn, claimed.id, str(workspace))
+        claimed.workspace_path = str(workspace)
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            assigned_branch = (
+                resolved_branch_name
+                or (claimed.branch_name or "").strip()
+                or f"wt/{claimed.id}"
+            )
+            set_branch_name(conn, claimed.id, assigned_branch)
+            claimed.branch_name = assigned_branch
+        try:
+            _admit_worker_role_contract(conn, claimed)
+        except _WorkerRoleContractAdmissionError as exc:
+            block_task(
+                conn,
+                claimed.id,
+                reason=f"role_contract_admission: {exc}",
+                kind="capability",
+                expected_run_id=claimed.current_run_id,
+            )
+            result.auto_blocked.append(claimed.id)
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -10988,7 +11028,7 @@ def _admit_worker_role_contract(
             task_id=task.id,
             run_id=task.current_run_id,
             workspace_path=(
-                str(Path(task.workspace_path).expanduser().resolve())
+                str(Path(task.workspace_path).expanduser().absolute())
                 if task.workspace_path
                 else None
             ),
@@ -11250,7 +11290,7 @@ def _default_spawn(
             task_id=task.id,
             run_id=task.current_run_id,
             workspace_path=(
-                str(Path(workspace).expanduser().resolve()) if workspace else None
+                str(Path(workspace).expanduser().absolute()) if workspace else None
             ),
             branch_name=task.branch_name,
             required=bool(task.require_role_contract),
@@ -11265,7 +11305,11 @@ def _default_spawn(
                 f"observed {observed_digest or 'none'}"
             )
     if admission is not None:
-        from hermes_cli.role_contract import verify_admission_bytes
+        from hermes_cli.role_contract import (
+            open_verified_workspace_fd,
+            verify_admission_bytes,
+            workspace_fd_path,
+        )
 
         if admission.task_id != task.id or admission.run_id != task.current_run_id:
             raise _WorkerRoleContractAdmissionError(
@@ -11319,25 +11363,53 @@ def _default_spawn(
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 
+    # Hold the admitted directory object across subprocess creation.  The child
+    # resolves cwd through the inherited fd, so a pathname swap after admission
+    # cannot redirect it into a different workspace.
+    workspace_fd: Optional[int] = None
+    spawn_cwd: Optional[str] = workspace if os.path.isdir(workspace) else None
+    if (
+        admission is not None
+        and admission.contract.workspace_only
+        and admission.workspace_path is not None
+    ):
+        try:
+            workspace_fd = open_verified_workspace_fd(admission)
+            spawn_cwd = workspace_fd_path(workspace_fd)
+        except Exception as exc:
+            if workspace_fd is not None:
+                os.close(workspace_fd)
+                workspace_fd = None
+            raise _WorkerRoleContractAdmissionError(str(exc)) from exc
+
     # Use 'a' so a re-run on unblock appends rather than overwrites.
-    log_f = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-        )
-    except FileNotFoundError:
-        log_f.close()
-        raise RuntimeError(
-            "`hermes` executable not found on PATH. "
-            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
-        )
+        log_f = open(log_path, "ab")
+        popen_kwargs: dict[str, Any] = {
+            "cwd": spawn_cwd,
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_f,
+            "stderr": subprocess.STDOUT,
+            "env": env,
+            "start_new_session": True,
+            "creationflags": subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        }
+        if workspace_fd is not None:
+            popen_kwargs["pass_fds"] = (workspace_fd,)
+        try:
+            proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
+                cmd,
+                **popen_kwargs,
+            )
+        except FileNotFoundError:
+            log_f.close()
+            raise RuntimeError(
+                "`hermes` executable not found on PATH. "
+                "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+            )
+    finally:
+        if workspace_fd is not None:
+            os.close(workspace_fd)
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's

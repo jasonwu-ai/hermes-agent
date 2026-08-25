@@ -59,6 +59,9 @@ class RoleContractAdmission:
     task_id: str
     run_id: Optional[int]
     workspace_path: Optional[str]
+    workspace_dev: Optional[int]
+    workspace_ino: Optional[int]
+    workspace_mode: Optional[int]
     branch_name: Optional[str]
     receipt_id: str
 
@@ -79,9 +82,115 @@ class RoleContractAdmission:
             "task_id": self.task_id,
             "run_id": self.run_id,
             "workspace_path": self.workspace_path,
+            "workspace_dev": self.workspace_dev,
+            "workspace_ino": self.workspace_ino,
+            "workspace_mode": self.workspace_mode,
             "branch_name": self.branch_name,
             "receipt_id": self.receipt_id,
         }
+
+
+def workspace_identity(workspace_path: str | os.PathLike[str]) -> tuple[int, int, int]:
+    """Return a stable, symlink-free directory identity for receipt binding."""
+    path = Path(workspace_path)
+    if not path.is_absolute():
+        raise RoleContractError("workspace path must be absolute for role-contract admission")
+    try:
+        before = path.lstat()
+    except FileNotFoundError as exc:
+        raise RoleContractError(f"admitted workspace is missing: {path}") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise RoleContractError(f"admitted workspace must be a real directory: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise RoleContractError(f"cannot open admitted workspace safely: {path}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        current = path.lstat()
+        before_identity = (before.st_dev, before.st_ino, before.st_mode)
+        opened_identity = (opened.st_dev, opened.st_ino, opened.st_mode)
+        current_identity = (current.st_dev, current.st_ino, current.st_mode)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or opened_identity != before_identity
+            or current_identity != opened_identity
+        ):
+            raise RoleContractError(f"admitted workspace changed while binding: {path}")
+        return opened_identity
+    except FileNotFoundError as exc:
+        raise RoleContractError(f"admitted workspace changed while binding: {path}") from exc
+    finally:
+        os.close(fd)
+
+
+def open_verified_workspace_fd(admission: RoleContractAdmission) -> int:
+    """Open the admitted directory for fd-bound subprocess cwd custody."""
+    if admission.workspace_path is None:
+        raise RoleContractError("workspace identity is missing from role-contract admission")
+    if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
+        raise RoleContractError(
+            "fd-bound workspace launch is unavailable on this platform"
+        )
+    if (
+        admission.workspace_dev is None
+        or admission.workspace_ino is None
+        or admission.workspace_mode is None
+    ):
+        raise RoleContractError("workspace identity is missing from role-contract admission")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(admission.workspace_path, flags)
+    except OSError as exc:
+        raise RoleContractError(
+            f"cannot open admitted workspace for bound launch: {admission.workspace_path}: {exc}"
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        expected = (
+            admission.workspace_dev,
+            admission.workspace_ino,
+            admission.workspace_mode,
+        )
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or (opened.st_dev, opened.st_ino, opened.st_mode) != expected
+        ):
+            raise RoleContractError(
+                "workspace object changed before fd-bound worker launch"
+            )
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def workspace_fd_path(fd: int) -> str:
+    """Return a supported pathname that resolves to an inherited directory fd."""
+    for root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        if root.is_dir():
+            return str(root / str(fd))
+    raise RoleContractError(
+        "fd-bound workspace cwd is unavailable on this platform"
+    )
+
+
+def verify_workspace_identity(
+    workspace_path: str | os.PathLike[str],
+    *,
+    expected_dev: Optional[int],
+    expected_ino: Optional[int],
+    expected_mode: Optional[int],
+) -> None:
+    """Fail closed unless a path still names the exact admitted directory object."""
+    if expected_dev is None or expected_ino is None or expected_mode is None:
+        raise RoleContractError("workspace identity is missing from role-contract admission")
+    observed = workspace_identity(workspace_path)
+    if observed != (expected_dev, expected_ino, expected_mode):
+        raise RoleContractError("workspace object changed after role-contract admission")
 
 
 def _read_exact_regular_file(path: Path) -> tuple[bytes, os.stat_result]:
@@ -290,6 +399,11 @@ def admit_role_contract(
             + ", ".join(unavailable)
         )
     effective = tuple(sorted((configured_set & requested) | set(_MANDATORY_WORKER_TOOLSETS)))
+    workspace_dev: Optional[int] = None
+    workspace_ino: Optional[int] = None
+    workspace_mode: Optional[int] = None
+    if contract.workspace_only and workspace_path is not None:
+        workspace_dev, workspace_ino, workspace_mode = workspace_identity(workspace_path)
     receipt_basis = {
         "schema": contract.schema,
         "profile": contract.profile,
@@ -304,6 +418,9 @@ def admit_role_contract(
         "task_id": task_id,
         "run_id": run_id,
         "workspace_path": workspace_path,
+        "workspace_dev": workspace_dev,
+        "workspace_ino": workspace_ino,
+        "workspace_mode": workspace_mode,
         "branch_name": branch_name,
     }
     receipt_id = hashlib.sha256(
@@ -317,6 +434,9 @@ def admit_role_contract(
         task_id=task_id,
         run_id=run_id,
         workspace_path=workspace_path,
+        workspace_dev=workspace_dev,
+        workspace_ino=workspace_ino,
+        workspace_mode=workspace_mode,
         branch_name=branch_name,
         receipt_id=receipt_id,
     )
@@ -330,4 +450,11 @@ def verify_admission_bytes(admission: RoleContractAdmission) -> None:
         raise RoleContractError(
             "role contract bytes changed after admission: "
             f"expected {admission.contract.sha256}, got {actual}"
+        )
+    if admission.contract.workspace_only and admission.workspace_path is not None:
+        verify_workspace_identity(
+            admission.workspace_path,
+            expected_dev=admission.workspace_dev,
+            expected_ino=admission.workspace_ino,
+            expected_mode=admission.workspace_mode,
         )

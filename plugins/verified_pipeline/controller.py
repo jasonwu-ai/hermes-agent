@@ -61,6 +61,24 @@ IMPLEMENTATION_ROLE_TOOL_CEILINGS = {
     "08-release": _KANBAN_STAGE_TOOLS | {"read_file", "search_files", "write_file"},
     "10-validator": _KANBAN_STAGE_TOOLS | {"read_file", "search_files"},
 }
+_GOVERNANCE_STAGE_TOOLS = {
+    "kanban_block",
+    "kanban_comment",
+    "kanban_complete",
+    "kanban_show",
+    "read_file",
+    "search_files",
+    "write_file",
+}
+GOVERNANCE_ROLE_TOOL_CEILINGS = {
+    "07-planner": _GOVERNANCE_STAGE_TOOLS,
+    "11-devils-advocate": _GOVERNANCE_STAGE_TOOLS,
+    "01-ceo": _GOVERNANCE_STAGE_TOOLS,
+}
+ROLE_TOOL_CEILINGS = {
+    **IMPLEMENTATION_ROLE_TOOL_CEILINGS,
+    **GOVERNANCE_ROLE_TOOL_CEILINGS,
+}
 VALID_ACTIONS = frozenset({"approve", "request_changes"})
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -300,20 +318,29 @@ def _validate_frozen_profiles(value: Mapping[str, Mapping[str, Any]]) -> str:
             "version": version,
             "sha256": digest,
         }
-        if name in IMPLEMENTATION_ROLE_TOOL_CEILINGS:
+        if name in ROLE_TOOL_CEILINGS:
             allowed_toolsets = sorted(
                 {str(item) for item in receipt.get("allowed_toolsets", [])}
             )
             allowed_tools = sorted({str(item) for item in receipt.get("allowed_tools", [])})
+            role_kind = (
+                "implementation"
+                if name in IMPLEMENTATION_ROLE_TOOL_CEILINGS
+                else "governance"
+            )
             if (
                 not allowed_toolsets
                 or not set(allowed_toolsets).issubset({"file", "kanban"})
-                or not set(allowed_tools).issubset(IMPLEMENTATION_ROLE_TOOL_CEILINGS[name])
+                or not set(allowed_tools).issubset(ROLE_TOOL_CEILINGS[name])
                 or receipt.get("workspace_only") is not True
             ):
                 raise PipelineControlError(
-                    "IMPLEMENTATION_PROFILE_AUTHORITY_WIDENED",
-                    f"{name} exceeds the verified implementation-role authority ceiling",
+                    (
+                        "IMPLEMENTATION_PROFILE_AUTHORITY_WIDENED"
+                        if role_kind == "implementation"
+                        else "GOVERNANCE_PROFILE_AUTHORITY_WIDENED"
+                    ),
+                    f"{name} exceeds the verified {role_kind}-role authority ceiling",
                 )
             normalized_receipt.update(
                 {
@@ -324,7 +351,11 @@ def _validate_frozen_profiles(value: Mapping[str, Mapping[str, Any]]) -> str:
             )
             if normalized_receipt != _installed_implementation_contract(name):
                 raise PipelineControlError(
-                    "IMPLEMENTATION_PROFILE_RECEIPT_MISMATCH",
+                    (
+                        "IMPLEMENTATION_PROFILE_RECEIPT_MISMATCH"
+                        if role_kind == "implementation"
+                        else "GOVERNANCE_PROFILE_RECEIPT_MISMATCH"
+                    ),
                     f"{name} frozen authority does not match its exact installed contract bytes",
                 )
         normalized[name] = normalized_receipt
@@ -650,9 +681,7 @@ def _read_custodied_file(path: Path) -> bytes:
             "ARTIFACT_CUSTODY_MISMATCH",
             "materialized specification must not be group/world-writable",
         )
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
     except OSError as exc:
@@ -686,14 +715,56 @@ def _read_custodied_file(path: Path) -> bytes:
             chunks.append(chunk)
             remaining -= len(chunk)
         raw = b"".join(chunks)
+        after = os.fstat(fd)
+        try:
+            current = path.lstat()
+        except FileNotFoundError as exc:
+            raise PipelineControlError(
+                "ARTIFACT_CUSTODY_MISMATCH",
+                "materialized specification path changed while reading",
+            ) from exc
+
+        def identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        if (
+            len(raw) != opened.st_size
+            or not stat.S_ISREG(after.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or identity(metadata) != identity(opened)
+            or identity(opened) != identity(after)
+            or identity(after) != identity(current)
+        ):
+            raise PipelineControlError(
+                "ARTIFACT_CUSTODY_MISMATCH",
+                "materialized specification changed while reading",
+            )
+        return raw
     finally:
         os.close(fd)
-    if len(raw) != opened.st_size:
-        raise PipelineControlError(
-            "ARTIFACT_CUSTODY_MISMATCH",
-            "materialized specification changed while reading",
-        )
-    return raw
+
+
+def _read_custodied_file_after_publication(path: Path) -> bytes:
+    """Wait briefly for an atomic hard-link publication to become quiescent."""
+    last_error: Optional[PipelineControlError] = None
+    for attempt in range(5):
+        try:
+            return _read_custodied_file(path)
+        except PipelineControlError as exc:
+            if exc.code != "ARTIFACT_CUSTODY_MISMATCH":
+                raise
+            last_error = exc
+            if attempt < 4:
+                time.sleep(0.005 * (attempt + 1))
+    assert last_error is not None
+    raise last_error
 
 
 def _safe_workspace(
@@ -718,7 +789,7 @@ def _safe_workspace(
         raise PipelineControlError("WORKSPACE_ESCAPE", "workspace escaped the controlled root") from exc
     artifact_path = resolved / "specification.md"
     if artifact_path.exists() or artifact_path.is_symlink():
-        existing = _read_custodied_file(artifact_path)
+        existing = _read_custodied_file_after_publication(artifact_path)
         if _sha256(existing) != artifact_sha256:
             raise PipelineControlError(
                 "ARTIFACT_CUSTODY_MISMATCH",
@@ -736,7 +807,7 @@ def _safe_workspace(
                 try:
                     os.link(tmp, artifact_path, follow_symlinks=False)
                 except FileExistsError:
-                    existing = _read_custodied_file(artifact_path)
+                    existing = _read_custodied_file_after_publication(artifact_path)
                     if _sha256(existing) != artifact_sha256:
                         raise PipelineControlError(
                             "ARTIFACT_CUSTODY_MISMATCH",
@@ -749,7 +820,7 @@ def _safe_workspace(
             if tmp.exists():
                 tmp.unlink()
             raise
-    if _sha256(_read_custodied_file(artifact_path)) != artifact_sha256:
+    if _sha256(_read_custodied_file_after_publication(artifact_path)) != artifact_sha256:
         raise PipelineControlError(
             "ARTIFACT_CUSTODY_MISMATCH",
             "artifact bytes changed during materialization",

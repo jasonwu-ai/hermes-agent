@@ -23,8 +23,23 @@ FROZEN = {
         "schema": "hermes-role-contract/v2",
         "version": "1.0.0",
         "sha256": "b" * 64,
+        "allowed_toolsets": ["file", "kanban"],
+        "allowed_tools": sorted(
+            controller.GOVERNANCE_ROLE_TOOL_CEILINGS[controller.PLANNER_PROFILE]
+        ),
+        "workspace_only": True,
     },
 }
+_REAL_INSTALLED_CONTRACT = controller._installed_implementation_contract
+
+
+@pytest.fixture(autouse=True)
+def _bind_installed_contract_inventory_to_frozen_fixture(monkeypatch):
+    monkeypatch.setattr(
+        controller,
+        "_installed_implementation_contract",
+        lambda profile: dict(FROZEN[profile]),
+    )
 ARTIFACT = b"# Exact specification\n\nBuild the bounded thing.\n"
 
 
@@ -65,6 +80,28 @@ def test_intake_rejects_unsafe_implementation_contract(tmp_path):
     assert exc.value.code == "IMPLEMENTATION_PROFILE_AUTHORITY_WIDENED"
 
 
+def test_intake_rejects_unsafe_governance_contract(tmp_path):
+    unsafe = {
+        **FROZEN,
+        controller.PLANNER_PROFILE: {
+            **FROZEN[controller.PLANNER_PROFILE],
+            "allowed_toolsets": ["file", "kanban", "terminal"],
+            "allowed_tools": ["terminal"],
+            "workspace_only": False,
+        },
+    }
+    with pytest.raises(controller.PipelineControlError) as exc:
+        controller.register_intake(
+            specification_id="unsafe-governance-contract",
+            revision=1,
+            artifact_bytes=ARTIFACT,
+            frozen_profiles=unsafe,
+            authority_ceiling=["plan"],
+            db_path=tmp_path / "control.db",
+        )
+    assert exc.value.code == "GOVERNANCE_PROFILE_AUTHORITY_WIDENED"
+
+
 def test_intake_rejects_forged_narrow_authority_for_wider_hash_bound_contract(
     tmp_path, monkeypatch
 ):
@@ -82,14 +119,16 @@ def test_intake_rejects_forged_narrow_authority_for_wider_hash_bound_contract(
     monkeypatch.setattr(
         controller,
         "_installed_implementation_contract",
-        lambda _profile: {
+        lambda profile: {
             "schema": "hermes-role-contract/v2",
             "version": "1.0.0",
             "sha256": "c" * 64,
             "allowed_toolsets": ["file", "kanban", "terminal"],
             "allowed_tools": ["read_file", "terminal"],
             "workspace_only": False,
-        },
+        }
+        if profile == "02-builder"
+        else dict(FROZEN[profile]),
     )
     with pytest.raises(controller.PipelineControlError) as exc:
         controller.register_intake(
@@ -127,6 +166,13 @@ Only the exact admitted file and Kanban tools are available.
     profile.joinpath("ROLE_CONTRACT.md").write_bytes(raw)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        controller,
+        "_installed_implementation_contract",
+        lambda profile: _REAL_INSTALLED_CONTRACT(profile)
+        if profile == "02-builder"
+        else dict(FROZEN[profile]),
+    )
     frozen = {
         **FROZEN,
         "02-builder": {

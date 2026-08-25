@@ -32,8 +32,19 @@ platform_toolsets:
     return profile
 
 
-def _write_contract(profile: Path, *, name: str = "builder", allowed=None) -> bytes:
+def _write_contract(
+    profile: Path,
+    *,
+    name: str = "builder",
+    allowed=None,
+    workspace_only: bool = False,
+) -> bytes:
     allowed = allowed or ["file", "terminal"]
+    workspace_scope = (
+        "allowed_tools:\n  - terminal\nworkspace_only: true\n"
+        if workspace_only
+        else ""
+    )
     raw = (
         "---\n"
         "schema: hermes-role-contract/v2\n"
@@ -41,6 +52,7 @@ def _write_contract(profile: Path, *, name: str = "builder", allowed=None) -> by
         "version: 1.0.0\n"
         "allowed_toolsets:\n"
         + "".join(f"  - {toolset}\n" for toolset in allowed)
+        + workspace_scope
         + "---\n"
         "# Builder authority\n"
         "May modify only the assigned workspace and must complete through Kanban.\n"
@@ -371,6 +383,48 @@ def test_contract_drift_after_admission_blocks_before_popen(board, monkeypatch):
     assert "role_contract_pre_spawn" in (runs[-1].summary or "")
 
 
+def test_workspace_replacement_after_admission_blocks_before_popen(board, monkeypatch):
+    _write_contract(_write_profile(board), workspace_only=True)
+    popen_calls = []
+
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: popen_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="workspace replacement must fail closed",
+            assignee="builder",
+            require_role_contract=True,
+        )
+
+        def replace_then_default_spawn(task, workspace, **kwargs):
+            workspace = Path(workspace)
+            displaced = workspace.with_name(f"{workspace.name}-displaced")
+            workspace.rename(displaced)
+            workspace.mkdir()
+            return kb._default_spawn(task, str(workspace), board=kwargs.get("board"))
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=replace_then_default_spawn,
+            max_in_progress=1,
+        )
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+
+    assert popen_calls == []
+    assert task is not None and task.status == "blocked"
+    assert task_id in result.auto_blocked
+    assert result.spawned == []
+    assert runs[-1].outcome == "blocked"
+    assert "role_contract_pre_spawn" in (runs[-1].summary or "")
+
+
 def test_direct_default_spawn_rejects_frozen_digest_mismatch(board, monkeypatch, tmp_path):
     _write_contract(_write_profile(board))
     popen_calls = []
@@ -410,7 +464,7 @@ def test_direct_default_spawn_rejects_frozen_digest_mismatch(board, monkeypatch,
 
 def test_default_spawn_uses_admitted_toolsets_and_receipt_env(board, monkeypatch, tmp_path):
     profile = _write_profile(board)
-    raw = _write_contract(profile)
+    raw = _write_contract(profile, workspace_only=True)
     captured = {}
 
     class FakeProc:
@@ -419,6 +473,21 @@ def test_default_spawn_uses_admitted_toolsets_and_receipt_env(board, monkeypatch
     def fake_popen(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs["env"])
+        captured["cwd"] = kwargs["cwd"]
+        captured["pass_fds"] = kwargs["pass_fds"]
+        admitted = workspace.stat()
+        displaced = workspace.with_name(f"{workspace.name}-displaced-after-open")
+        workspace.rename(displaced)
+        workspace.mkdir()
+        bound = os.stat(kwargs["cwd"])
+        replacement = workspace.stat()
+        captured["admitted_identity"] = (admitted.st_dev, admitted.st_ino, admitted.st_mode)
+        captured["bound_identity"] = (bound.st_dev, bound.st_ino, bound.st_mode)
+        captured["replacement_identity"] = (
+            replacement.st_dev,
+            replacement.st_ino,
+            replacement.st_mode,
+        )
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -453,6 +522,10 @@ def test_default_spawn_uses_admitted_toolsets_and_receipt_env(board, monkeypatch
     assert captured["env"]["HERMES_ROLE_CONTRACT_SCHEMA"] == "hermes-role-contract/v2"
     assert len(captured["env"]["HERMES_ROLE_CONTRACT_SHA256"]) == 64
     assert len(captured["env"]["HERMES_ROLE_CONTRACT_RECEIPT_ID"]) == 64
+    assert len(captured["pass_fds"]) == 1
+    assert captured["cwd"] == f"/proc/self/fd/{captured['pass_fds'][0]}"
+    assert captured["bound_identity"] == captured["admitted_identity"]
+    assert captured["replacement_identity"] != captured["admitted_identity"]
     assert task._role_contract_admission.branch_name == "review/exact-branch"
 
 
@@ -467,10 +540,18 @@ def test_default_spawn_pins_prefixed_runtime_identity(board, monkeypatch, tmp_pa
     def fake_popen(cmd, *args, **kwargs):
         captured["cmd"] = list(cmd)
         captured["env"] = dict(kwargs["env"])
+        captured["cwd"] = kwargs["cwd"]
+        captured["has_pass_fds"] = "pass_fds" in kwargs
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        "hermes_cli.role_contract.workspace_identity",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError("non-workspace-only admission must not open a directory fd")
+        ),
+    )
     workspace = tmp_path / "prefixed-work"
     workspace.mkdir()
     task = kb.Task(
@@ -498,6 +579,8 @@ def test_default_spawn_pins_prefixed_runtime_identity(board, monkeypatch, tmp_pa
     assert captured["cmd"][profile_flag + 1] == "02-builder"
     assert Path(captured["env"]["HERMES_HOME"]) == profile
     assert captured["env"]["HERMES_PROFILE"] == "02-builder"
+    assert captured["cwd"] == str(workspace)
+    assert captured["has_pass_fds"] is False
 
 
 def test_optional_card_without_contract_preserves_existing_spawn(board):
