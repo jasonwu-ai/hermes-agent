@@ -847,6 +847,8 @@ def submit_planner_completion(
                     ),
                     "output_workspace": str(da_workspace),
                 }
+                if validators.DA_REQUEST_SCHEMA == validators.CURRENT_DA_REQUEST_SCHEMA:
+                    da_request["finding_contract"] = validators.da_finding_contract()
                 validators.validate_da_request(da_request)
                 payload = _review_payload(
                     run_id=run_id,

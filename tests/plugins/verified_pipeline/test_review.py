@@ -510,7 +510,18 @@ def test_new_da_request_exposes_calibrated_score_contract(tmp_path):
     assert da_request["schema"] == validators.DA_REQUEST_SCHEMA
     assert da_request["risk_policy"]["score_base"] == 100
     assert da_request["risk_policy"]["score_floor"] == 0
+    assert da_request["finding_contract"] == validators.da_finding_contract()
+    assert da_request["finding_contract"]["fields"] == list(
+        validators.DA_FINDING_FIELDS
+    )
     assert validators.calibrated_score([], da_request["risk_policy"]) == 100
+    tampered = json.loads(json.dumps(da_request))
+    tampered["finding_contract"]["fields"].append("legacy_alias")
+    with pytest.raises(
+        validators.ArtifactValidationError,
+        match="finding_contract is not the canonical DA contract",
+    ):
+        validators.validate_da_request(tampered)
 
     custom_policy = dict(da_request["risk_policy"])
     custom_policy["score_base"] = 80
@@ -536,6 +547,53 @@ def test_new_da_request_exposes_calibrated_score_contract(tmp_path):
         match="score_floor must not exceed score_base",
     ):
         validators.validate_da_request(inverted_range)
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected_score"),
+    [
+        (validators.LEGACY_DA_REQUEST_SCHEMA, 65),
+        (validators.PREVIOUS_DA_REQUEST_SCHEMA, 10),
+    ],
+)
+def test_v1_v2_requests_and_verdicts_remain_valid(
+    tmp_path, schema, expected_score
+):
+    control_db, kanban_path, workspaces, intake, planner_id = _setup(tmp_path)
+    _advance_planner(control_db, kanban_path, workspaces, intake, planner_id)
+    da = _latest_task(kanban_path, review.DA_PROFILE)
+    request = json.loads(
+        (Path(da["workspace_path"]) / "da-request.json").read_text(encoding="utf-8")
+    )
+    request.pop("finding_contract")
+    request["schema"] = schema
+    if schema == validators.LEGACY_DA_REQUEST_SCHEMA:
+        request["risk_policy"] = {
+            key: request["risk_policy"][key]
+            for key in validators.LEGACY_RISK_POLICY_FIELDS
+        }
+    else:
+        request["risk_policy"]["score_base"] = 20
+        request["risk_policy"]["score_floor"] = 10
+    validators.validate_da_request(request)
+
+    finding = _da_finding(1)
+    verdict = {
+        "schema": validators.DA_VERDICT_SCHEMA,
+        "specification_id": request["specification_id"],
+        "plan_revision": 1,
+        "review_round": 1,
+        "verdict": "REVISE",
+        "findings": [finding],
+        "score": expected_score,
+        "most_likely_failure": "A missing rollback gate permits unsafe continuation.",
+        "most_dangerous_failure": "Unreviewed authority reaches execution.",
+        "cross_cutting_assumption": "Rollback is assumed rather than tested.",
+        "escalate_to_jason": False,
+        "decision_question": None,
+    }
+    assert validators.calibrated_score([finding], request["risk_policy"]) == expected_score
+    validators.validate_da_verdict(verdict, request=request)
 
 
 def test_straight_through_review_stops_after_ceo_approval_and_replays(

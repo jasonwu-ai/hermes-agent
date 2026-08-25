@@ -11,7 +11,8 @@ from typing import Any, Mapping
 
 PLAN_SCHEMA = "verified-plan/v1"
 LEGACY_DA_REQUEST_SCHEMA = "da-request/v1"
-CURRENT_DA_REQUEST_SCHEMA = "da-request/v2"
+PREVIOUS_DA_REQUEST_SCHEMA = "da-request/v2"
+CURRENT_DA_REQUEST_SCHEMA = "da-request/v3"
 DA_REQUEST_SCHEMA = CURRENT_DA_REQUEST_SCHEMA
 DA_VERDICT_SCHEMA = "da-verdict/v1"
 CEO_REQUEST_SCHEMA = "ceo-request/v1"
@@ -41,6 +42,25 @@ MATERIALITY_BASES = {
     "advisory_improvement",
 }
 BLOCKING_BASES = MATERIALITY_BASES - {"lifecycle_custody", "advisory_improvement"}
+DA_FINDING_FIELDS = (
+    "id",
+    "affected_task",
+    "affected_criterion",
+    "causal_sequence",
+    "hidden_assumption",
+    "early_warning",
+    "likelihood",
+    "impact",
+    "mitigation",
+    "classification",
+    "exceeds_minimum_standard",
+    "resolved",
+    "lineage",
+    "prior_finding_id",
+    "novelty_justification",
+    "confidence",
+    "materiality_basis",
+)
 LEGACY_RISK_POLICY_FIELDS = {
     "severe_risk_threshold",
     "blocking_penalty",
@@ -101,6 +121,24 @@ def _string_list(value: Any, field: str, *, nonempty: bool = False) -> list[str]
     if any(not isinstance(item, str) or not item.strip() for item in value):
         raise ArtifactValidationError(f"{field} entries must be non-empty strings")
     return value
+
+
+def da_finding_contract() -> dict[str, Any]:
+    """Return the exact task-local DA finding contract emitted to v3 workers."""
+    return {
+        "fields": list(DA_FINDING_FIELDS),
+        "classifications": sorted(CLASSIFICATIONS),
+        "lineages": sorted(LINEAGES),
+        "materiality_bases": sorted(MATERIALITY_BASES),
+        "blocking_materiality_bases": sorted(BLOCKING_BASES),
+        "integer_fields": {
+            "likelihood": {"minimum": 1, "maximum": 5},
+            "impact": {"minimum": 1, "maximum": 5},
+            "confidence": {"minimum": 1, "maximum": 5},
+        },
+        "boolean_fields": ["exceeds_minimum_standard", "resolved"],
+        "nullable_fields": ["prior_finding_id", "novelty_justification"],
+    }
 
 
 def validate_plan_request(request: Any) -> dict[str, Any]:
@@ -258,6 +296,17 @@ def validate_plan(plan: Any, *, request: Mapping[str, Any]) -> dict[str, Any]:
 def validate_da_request(request: Any) -> dict[str, Any]:
     if not isinstance(request, dict):
         raise ArtifactValidationError("DA request must be an object")
+    schema = request.get("schema")
+    if schema not in {
+        LEGACY_DA_REQUEST_SCHEMA,
+        PREVIOUS_DA_REQUEST_SCHEMA,
+        CURRENT_DA_REQUEST_SCHEMA,
+    }:
+        raise ArtifactValidationError(
+            "DA request schema must be "
+            f"{LEGACY_DA_REQUEST_SCHEMA}, {PREVIOUS_DA_REQUEST_SCHEMA}, "
+            f"or {CURRENT_DA_REQUEST_SCHEMA}"
+        )
     required = {
         "schema",
         "run_id",
@@ -275,16 +324,10 @@ def validate_da_request(request: Any) -> dict[str, Any]:
         "minimum_standard",
         "output_workspace",
     }
+    if schema == CURRENT_DA_REQUEST_SCHEMA:
+        required.add("finding_contract")
     if set(request) != required:
         raise ArtifactValidationError(f"DA request fields must be exactly {sorted(required)}")
-    if request["schema"] not in {
-        LEGACY_DA_REQUEST_SCHEMA,
-        CURRENT_DA_REQUEST_SCHEMA,
-    }:
-        raise ArtifactValidationError(
-            "DA request schema must be "
-            f"{LEGACY_DA_REQUEST_SCHEMA} or {CURRENT_DA_REQUEST_SCHEMA}"
-        )
     for field in (
         "run_id",
         "specification_id",
@@ -317,7 +360,7 @@ def validate_da_request(request: Any) -> dict[str, Any]:
     policy = request["risk_policy"]
     expected_policy_fields = (
         LEGACY_RISK_POLICY_FIELDS
-        if request["schema"] == LEGACY_DA_REQUEST_SCHEMA
+        if schema == LEGACY_DA_REQUEST_SCHEMA
         else set(DEFAULT_RISK_POLICY)
     )
     if not isinstance(policy, dict) or set(policy) != expected_policy_fields:
@@ -326,7 +369,7 @@ def validate_da_request(request: Any) -> dict[str, Any]:
         if type(policy[key]) is not int or policy[key] < 0:
             raise ArtifactValidationError(f"risk_policy.{key} must be non-negative")
     if (
-        request["schema"] == CURRENT_DA_REQUEST_SCHEMA
+        schema != LEGACY_DA_REQUEST_SCHEMA
         and policy["score_floor"] > policy["score_base"]
     ):
         raise ArtifactValidationError(
@@ -335,6 +378,9 @@ def validate_da_request(request: Any) -> dict[str, Any]:
     prior = request["prior_findings"]
     if prior != "none" and not isinstance(prior, list):
         raise ArtifactValidationError("prior_findings must be none or an array")
+    if schema == CURRENT_DA_REQUEST_SCHEMA:
+        if request["finding_contract"] != da_finding_contract():
+            raise ArtifactValidationError("finding_contract is not the canonical DA contract")
     return request
 
 
@@ -389,25 +435,7 @@ def validate_da_verdict(verdict: Any, *, request: Mapping[str, Any]) -> dict[str
     findings = verdict["findings"]
     if not isinstance(findings, list):
         raise ArtifactValidationError("findings must be an array")
-    finding_fields = {
-        "id",
-        "affected_task",
-        "affected_criterion",
-        "causal_sequence",
-        "hidden_assumption",
-        "early_warning",
-        "likelihood",
-        "impact",
-        "mitigation",
-        "classification",
-        "exceeds_minimum_standard",
-        "resolved",
-        "lineage",
-        "prior_finding_id",
-        "novelty_justification",
-        "confidence",
-        "materiality_basis",
-    }
+    finding_fields = set(DA_FINDING_FIELDS)
     blockers = 0
     severe_above = 0
     prior_ids = set()
