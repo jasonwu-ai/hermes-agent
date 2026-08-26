@@ -843,7 +843,11 @@ def submit_planner_completion(
                     "risk_policy": dict(validators.DEFAULT_RISK_POLICY),
                     "minimum_standard": (
                         "PASS requires zero unresolved blockers and zero unresolved "
-                        "severe findings with likelihood × impact >= 12."
+                        "severe findings with likelihood × impact >= 12. "
+                        "Output invariant: decision_question must be null and "
+                        "escalate_to_jason must be false unless this is a final-round "
+                        "REVISE; a final-round REVISE requires escalate_to_jason true "
+                        "and one non-empty decision_question."
                     ),
                     "output_workspace": str(da_workspace),
                 }
