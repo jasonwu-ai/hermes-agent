@@ -567,13 +567,21 @@ def _dispatch_exact_task(
     spawned = governance._task(kanban_path, task_id)
     if spawned["status"] not in {"running", "done"}:
         raise RuntimeError(f"dispatcher spawned a different task before {task_id}: {spawned['status']}")
+    runtime_worker_pid = (
+        int(spawned["worker_pid"]) if spawned.get("worker_pid") is not None else None
+    )
     deadline = time.monotonic() + timeout_seconds
     terminal = spawned
     while terminal["status"] not in {"done", "blocked", "todo", "ready"} and time.monotonic() < deadline:
         time.sleep(2)
         terminal = governance._task(kanban_path, task_id)
+        if terminal.get("worker_pid") is not None:
+            runtime_worker_pid = int(terminal["worker_pid"])
     if terminal["status"] in {"done", "blocked", "todo", "ready"}:
-        governance._drain_worker_process(terminal.get("worker_pid"))
+        # Terminal transitions clear task.worker_pid atomically.  Drain the
+        # last PID observed while the task was running before profile logs,
+        # session state, and accounting databases can be scrubbed.
+        governance._drain_worker_process(runtime_worker_pid)
     else:
         governance._terminate_worker_groups(kanban_path)
         raise TimeoutError(f"implementation task timed out without redispatch: {task_id}")
@@ -582,6 +590,7 @@ def _dispatch_exact_task(
             f"implementation task did not complete: {task_id} status={terminal['status']} "
             f"error={terminal.get('last_failure_error')}"
         )
+    terminal["runtime_worker_pid"] = runtime_worker_pid
     return terminal
 
 

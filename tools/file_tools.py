@@ -259,6 +259,55 @@ def _configured_terminal_cwd() -> str | None:
     return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
 
 
+def _docker_host_workspace_root(task_id: str = "default") -> str | None:
+    """Return the host directory mounted at ``/workspace`` for this task.
+
+    File tools execute inside the terminal backend, but session registration
+    deliberately stores the dispatcher's host workspace so Docker can mount it.
+    Keep that mount authority separate from the path namespace passed to the
+    backend: once the mount is admitted, paths under the host root must be
+    addressed as ``/workspace`` inside Docker.
+    """
+    try:
+        from tools.terminal_tool import _get_env_config, _resolve_task_host_cwd
+
+        config = _get_env_config()
+        if str(config.get("env_type") or "").lower() != "docker":
+            return None
+        host_cwd = _resolve_task_host_cwd(config, task_id)
+    except Exception:
+        return None
+    if not isinstance(host_cwd, str) or not host_cwd.strip():
+        return None
+    return os.path.normpath(os.path.abspath(os.path.expanduser(host_cwd)))
+
+
+def _translate_docker_host_workspace_path(
+    path: str,
+    task_id: str = "default",
+) -> PurePosixPath | None:
+    """Translate an admitted Docker host-workspace path to ``/workspace``.
+
+    Returns ``None`` for paths outside the exact mounted root.  The comparison
+    is lexical and normalized rather than symlink-dereferencing: Docker mounts
+    the admitted host directory, while the returned path belongs to the
+    container namespace.
+    """
+    host_root = _docker_host_workspace_root(task_id)
+    if host_root is None or not os.path.isabs(path):
+        return None
+    candidate = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+    try:
+        if os.path.commonpath((host_root, candidate)) != host_root:
+            return None
+    except ValueError:
+        return None
+    relative = os.path.relpath(candidate, host_root)
+    if relative == ".":
+        return PurePosixPath("/workspace")
+    return _normalize_without_host_deref(PurePosixPath("/workspace") / relative)
+
+
 def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     """Return a registered cwd override for the raw task id, when available.
 
@@ -347,6 +396,9 @@ def _resolve_base_dir(
     else:
         base_text = os.getcwd()
     if container_paths:
+        translated = _translate_docker_host_workspace_path(base_text, task_id)
+        if translated is not None:
+            return translated
         if not posixpath.isabs(base_text):
             base_text = posixpath.join(os.getcwd(), base_text)
         return _normalize_without_host_deref(base_text)
@@ -384,6 +436,9 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     if container_paths:
         expanded = _expand_tilde(filepath)
         if posixpath.isabs(expanded):
+            translated = _translate_docker_host_workspace_path(expanded, task_id)
+            if translated is not None:
+                return translated
             return _normalize_without_host_deref(expanded)
         resolved = _resolve_base_dir(task_id, container_paths=True) / expanded
         return _normalize_without_host_deref(resolved)
@@ -1523,14 +1578,16 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             # bypass the guard.  Valid in-container override paths (RL/benchmark
             # sandboxes that set cwd to /workspace, /root, etc.) are absolute
             # non-host paths and pass through untouched.
+            host_cwd = _resolve_task_host_cwd(config, raw_task_id)
             if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-                if cwd != config["cwd"]:
+                remapped_cwd = "/workspace" if env_type == "docker" and host_cwd else config["cwd"]
+                if cwd != remapped_cwd:
                     logger.info(
-                        "Ignoring host/relative cwd override %r for %s backend "
+                        "Remapping host/relative cwd override %r for %s backend "
                         "(won't exist in sandbox). Using %r instead.",
-                        cwd, env_type, config["cwd"],
+                        cwd, env_type, remapped_cwd,
                     )
-                cwd = config["cwd"]
+                cwd = remapped_cwd
             logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
 
             container_config = None
@@ -1575,7 +1632,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 container_config=container_config,
                 local_config=local_config,
                 task_id=task_id,
-                host_cwd=_resolve_task_host_cwd(config, raw_task_id),
+                host_cwd=host_cwd,
             )
 
             with _env_lock:

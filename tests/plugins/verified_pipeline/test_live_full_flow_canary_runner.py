@@ -716,7 +716,9 @@ def test_dispatch_exact_task_never_redispatches_while_waiting(
         [
             {"id": "task", "status": "ready", "assignee": "02-builder", "worker_pid": None},
             {"id": "task", "status": "running", "assignee": "02-builder", "worker_pid": 123},
-            {"id": "task", "status": "done", "assignee": "02-builder", "worker_pid": 123},
+            # Kanban terminal transitions clear worker_pid; the runner must
+            # retain and drain the last PID observed while running.
+            {"id": "task", "status": "done", "assignee": "02-builder", "worker_pid": None},
         ]
     )
     dispatch_calls = 0
@@ -727,7 +729,8 @@ def test_dispatch_exact_task_never_redispatches_while_waiting(
         return SimpleNamespace(spawned=1)
 
     monkeypatch.setattr(governance, "_task", lambda *args, **kwargs: next(states))
-    monkeypatch.setattr(governance, "_drain_worker_process", lambda pid: None)
+    drained: list[int | None] = []
+    monkeypatch.setattr(governance, "_drain_worker_process", drained.append)
     kanban_db = SimpleNamespace(dispatch_once=fake_dispatch, DEFAULT_BOARD="default")
     result = runner._dispatch_exact_task(
         task_id="task",
@@ -737,7 +740,9 @@ def test_dispatch_exact_task_never_redispatches_while_waiting(
         timeout_seconds=1,
     )
     assert result["status"] == "done"
+    assert result["runtime_worker_pid"] == 123
     assert dispatch_calls == 1
+    assert drained == [123]
 
 
 def test_release_review_requires_exact_machine_and_human_binding(tmp_path: Path) -> None:
