@@ -112,6 +112,70 @@ def test_completion_attachment_exposes_controller_digest(worker_env):
     )
 
 
+def test_docker_completion_alias_reaches_host_attachment_custody(
+    monkeypatch, worker_env
+):
+    from agent.tool_executor import _role_contract_tool_block
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    from tools import terminal_tool
+
+    workspace = kb.workspaces_root() / worker_env
+    workspace.mkdir(parents=True)
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(workspace), worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    artifact = workspace / "release-evidence.md"
+    artifact.write_bytes(b"release-evidence\n")
+
+    monkeypatch.setenv(
+        "HERMES_ROLE_CONTRACT_ALLOWED_TOOLS", json.dumps(["kanban_complete"])
+    )
+    monkeypatch.setenv("HERMES_ROLE_CONTRACT_WORKSPACE_ONLY", "1")
+    monkeypatch.setenv("HERMES_ROLE_CONTRACT_WORKSPACE_PATH", str(workspace))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: {
+            "env_type": "docker",
+            "docker_mount_cwd_to_workspace": True,
+            "host_cwd": None,
+        },
+    )
+    terminal_tool.register_task_env_overrides(
+        "release-session",
+        {"cwd": str(workspace), "cwd_source": "session"},
+    )
+    args = {
+        "summary": "bounded release evidence complete",
+        "artifacts": ["/workspace/release-evidence.md"],
+    }
+
+    assert _role_contract_tool_block(
+        "kanban_complete", args, task_id="release-session"
+    ) is None
+    assert json.loads(kt._handle_complete(args))["ok"] is True
+    attachments = json.loads(kt._handle_attachments({"task_id": worker_env}))[
+        "attachments"
+    ]
+    assert [(item["filename"], item["sha256"]) for item in attachments] == [
+        (
+            "release-evidence.md",
+            "b31406508be51f8f026653c3fd4257b515f29640bb2c636b15e472d34d628934",
+        )
+    ]
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

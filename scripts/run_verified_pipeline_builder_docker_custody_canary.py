@@ -53,7 +53,8 @@ sys.path.insert(0, str(source_root))
 task_id = os.environ["HERMES_KANBAN_TASK"]
 db_path = Path(os.environ["HERMES_KANBAN_DB"])
 workspace = Path(os.environ["HERMES_KANBAN_WORKSPACE"])
-profile_root = Path(os.environ["HERMES_HOME"]) / "profiles" / "02-builder"
+profile_name = os.environ["CANARY_PROFILE"]
+profile_root = Path(os.environ["HERMES_HOME"]) / "profiles" / profile_name
 profile_root.joinpath("logs").mkdir(parents=True, exist_ok=True)
 profile_root.joinpath("state").mkdir(parents=True, exist_ok=True)
 
@@ -73,6 +74,7 @@ else:
     raise RuntimeError("dispatcher did not durably bind the canary worker PID")
 
 from tools import terminal_tool
+from agent.tool_executor import _role_contract_tool_block
 from tools.file_tools import read_file_tool, write_file_tool
 from tools.kanban_tools import _handle_complete
 
@@ -96,14 +98,20 @@ if "verified-pipeline-docker-custody-canary" not in read_result:
 
 profile_root.joinpath("logs", "canary.log").write_text("before-complete\n", encoding="utf-8")
 profile_root.joinpath("state", "canary.state").write_text("before-complete\n", encoding="utf-8")
-completion = _handle_complete(
-    {
-        "task_id": task_id,
-        "summary": "Docker workspace custody canary completed",
-        "artifacts": [str(absolute_host_artifact)],
-        "metadata": {"claim": "attachment-only substrate canary"},
-    }
+completion_args = {
+    "task_id": task_id,
+    "summary": "Docker workspace custody canary completed",
+    "artifacts": ["/workspace/canary.txt"],
+    "metadata": {"claim": "attachment-only substrate canary"},
+}
+policy_block = _role_contract_tool_block(
+    "kanban_complete", completion_args, task_id=task_id,
 )
+if policy_block is not None:
+    raise RuntimeError(f"role-contract completion policy blocked: {policy_block}")
+if completion_args["artifacts"] != [str(absolute_host_artifact)]:
+    raise RuntimeError("container artifact alias did not canonicalize to host custody")
+completion = _handle_complete(completion_args)
 parsed = json.loads(completion)
 if parsed.get("ok") is not True:
     raise RuntimeError(f"kanban_complete failed: {completion}")
@@ -121,6 +129,7 @@ time.sleep(3)
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--profile", default="02-builder")
     args = parser.parse_args()
     output = args.output_dir.resolve()
     if output.exists() and any(output.iterdir()):
@@ -129,16 +138,19 @@ def main() -> int:
     output.chmod(0o700)
 
     runtime_home = output / "runtime-home"
-    workspace = output / "workspaces" / "builder-task"
+    profile_name = args.profile.strip()
+    if not profile_name or "/" in profile_name or "\\" in profile_name:
+        raise SystemExit("profile must be one plain profile name")
+    workspace = output / "workspaces" / f"{profile_name}-task"
     workspace.mkdir(parents=True, mode=0o700)
     runtime_home.mkdir(mode=0o700)
-    builder_profile = runtime_home / "profiles" / "02-builder"
-    builder_profile.mkdir(parents=True, mode=0o700)
-    builder_profile.joinpath("config.yaml").write_text(
+    target_profile = runtime_home / "profiles" / profile_name
+    target_profile.mkdir(parents=True, mode=0o700)
+    target_profile.joinpath("config.yaml").write_text(
         "toolsets:\n  - file\n  - kanban\n",
         encoding="utf-8",
     )
-    builder_profile.joinpath("config.yaml").chmod(0o600)
+    target_profile.joinpath("config.yaml").chmod(0o600)
     worker_path = output / "worker.py"
     worker_path.write_text(_worker_program(), encoding="utf-8")
     worker_path.chmod(0o600)
@@ -155,6 +167,7 @@ def main() -> int:
         "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE": "true",
         "TERMINAL_DOCKER_IMAGE": "python:3.13-slim",
         "CANARY_SOURCE_ROOT": str(SOURCE_ROOT),
+        "CANARY_PROFILE": profile_name,
         "PYTHONPATH": str(SOURCE_ROOT),
     }
     os.environ.update(env_updates)
@@ -164,6 +177,7 @@ def main() -> int:
 
     report: dict[str, Any] = {
         "schema": "verified-pipeline/builder-docker-custody-canary/v1",
+        "profile": profile_name,
         "source_tree": subprocess.run(
             ["git", "-C", str(SOURCE_ROOT), "write-tree"],
             check=True,
@@ -187,9 +201,9 @@ def main() -> int:
         try:
             task_id = kanban_db.create_task(
                 conn,
-                title="02-builder Docker workspace custody canary",
+                title=f"{profile_name} Docker workspace custody canary",
                 body="Write/read exact canary bytes and complete with the absolute host artifact path.",
-                assignee="02-builder",
+                assignee=profile_name,
                 created_by="verified-pipeline-custody-canary",
                 workspace_kind="scratch",
                 workspace_path=str(workspace),
@@ -198,7 +212,7 @@ def main() -> int:
 
             def spawn(task, claimed_workspace, board=None):
                 nonlocal child
-                if task.id != task_id or task.assignee != "02-builder":
+                if task.id != task_id or task.assignee != profile_name:
                     raise RuntimeError("dispatcher selected the wrong canary task/profile")
                 child_env = dict(os.environ)
                 child_env.update(
@@ -207,7 +221,12 @@ def main() -> int:
                         "HERMES_KANBAN_WORKSPACE": str(claimed_workspace),
                         "HERMES_KANBAN_RUN_ID": str(task.current_run_id),
                         "HERMES_KANBAN_CLAIM_LOCK": str(task.claim_lock),
-                        "HERMES_PROFILE": "02-builder",
+                        "HERMES_PROFILE": profile_name,
+                        "HERMES_ROLE_CONTRACT_ALLOWED_TOOLS": json.dumps(
+                            ["kanban_complete"]
+                        ),
+                        "HERMES_ROLE_CONTRACT_WORKSPACE_ONLY": "1",
+                        "HERMES_ROLE_CONTRACT_WORKSPACE_PATH": str(claimed_workspace),
                     }
                 )
                 child = subprocess.Popen(
@@ -256,8 +275,8 @@ def main() -> int:
             if digest != attachment.sha256:
                 raise RuntimeError("controller digest disagreed with admitted attachment digest")
 
-            profile_log = runtime_home / "profiles" / "02-builder" / "logs" / "canary.log"
-            profile_state = runtime_home / "profiles" / "02-builder" / "state" / "canary.state"
+            profile_log = runtime_home / "profiles" / profile_name / "logs" / "canary.log"
+            profile_state = runtime_home / "profiles" / profile_name / "state" / "canary.state"
             expected_profile_bytes = b"before-complete\nafter-complete\n"
             if profile_log.read_bytes() != expected_profile_bytes:
                 raise RuntimeError("profile log did not persist through worker drain")
