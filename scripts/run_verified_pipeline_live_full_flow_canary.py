@@ -36,7 +36,6 @@ CANARY_BYTES = b"verified-pipeline-canary\n"
 REQUIRED_CHECK_NAME = "All required checks pass"
 MAX_CHECK_RUNS = 1000
 PR_DISCOVERY_ATTEMPTS = 30
-RELEASE_ASSIGNEE = "05-release"
 REQUIRED_LOGICAL_TASKS = (
     "build-canary",
     "test-canary",
@@ -53,6 +52,20 @@ FORBIDDEN_AUTHORITY_TABLES = (
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _release_assignee() -> str:
+    """Resolve the one release profile from the controller's admitted role set."""
+    candidates = [
+        profile
+        for profile in governance.MANDATORY_CONTRACT_PROFILES
+        if profile.endswith("-release")
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "full-flow acceptance requires exactly one admitted release profile"
+        )
+    return candidates[0]
 
 
 def _clean_source_head() -> str:
@@ -649,6 +662,25 @@ def _release_run_authority(
     return authority
 
 
+def _release_completion_authority(
+    conn: sqlite3.Connection,
+    *,
+    terminal: dict[str, Any],
+    task_id: str,
+    assignee: str,
+) -> dict[str, Any]:
+    """Bind the terminal Release identity to its one durable worker run."""
+    if terminal.get("id") != task_id or terminal.get("assignee") != assignee:
+        raise RuntimeError(
+            "completed Release task identity did not match the designated authority"
+        )
+    return _release_run_authority(
+        conn,
+        task_id=task_id,
+        expected_profile=assignee,
+    )
+
+
 def _forbidden_authority_counts(control_db: Path) -> dict[str, int]:
     conn = sqlite3.connect(control_db)
     try:
@@ -931,16 +963,17 @@ def main() -> int:
             )
             release_task_id = projected["task_map"]["release-evidence"]
             release_row = governance._task(kanban_path, release_task_id)
-            if release_row.get("assignee") != RELEASE_ASSIGNEE:
+            release_assignee = _release_assignee()
+            if release_row.get("assignee") != release_assignee:
                 raise RuntimeError(
-                    f"release-evidence authority drifted: expected={RELEASE_ASSIGNEE} "
+                    f"release-evidence authority drifted: expected={release_assignee} "
                     f"observed={release_row.get('assignee')}"
                 )
             release_contract = _release_output_contract(
                 governance_report["run_id"],
                 handoff,
                 release_task_id=release_task_id,
-                release_assignee=RELEASE_ASSIGNEE,
+                release_assignee=release_assignee,
             )
             evidence_packet = {
                 "schema": "verified-pipeline/full-flow-release-evidence/v1",
@@ -968,12 +1001,11 @@ def main() -> int:
                 kanban_db=kanban_db,
                 timeout_seconds=args.task_timeout,
             )
-            if release_terminal.get("id") != release_task_id or release_terminal.get("assignee") != RELEASE_ASSIGNEE:
-                raise RuntimeError("completed Release task identity did not match the designated authority")
-            release_authority = _release_run_authority(
+            release_authority = _release_completion_authority(
                 conn,
+                terminal=release_terminal,
                 task_id=release_task_id,
-                expected_profile=RELEASE_ASSIGNEE,
+                assignee=release_assignee,
             )
             release_manifest = _attachment_manifest(kanban_db, conn, release_task_id)
             manifests["release-evidence"] = release_manifest

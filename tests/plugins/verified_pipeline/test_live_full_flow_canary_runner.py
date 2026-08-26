@@ -822,6 +822,71 @@ def test_dispatch_exact_task_never_redispatches_while_waiting(
     assert drained == [123]
 
 
+def test_release_assignee_comes_from_the_admitted_role_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = [
+        profile
+        for profile in governance.MANDATORY_CONTRACT_PROFILES
+        if profile.endswith("-release")
+    ]
+    assert len(expected) == 1
+    assert runner._release_assignee() == expected[0]
+
+    monkeypatch.setattr(
+        governance,
+        "MANDATORY_CONTRACT_PROFILES",
+        ("02-builder", "09-test", "06-integration"),
+    )
+    with pytest.raises(RuntimeError, match="exactly one admitted release profile"):
+        runner._release_assignee()
+
+    monkeypatch.setattr(
+        governance,
+        "MANDATORY_CONTRACT_PROFILES",
+        ("02-builder", "08-release", "10-release"),
+    )
+    with pytest.raises(RuntimeError, match="exactly one admitted release profile"):
+        runner._release_assignee()
+
+
+def test_release_completion_binds_resolved_assignee_to_run_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_authority(conn, *, task_id, expected_profile):
+        observed.update(
+            conn=conn,
+            task_id=task_id,
+            expected_profile=expected_profile,
+        )
+        return {"task_id": task_id, "profile": expected_profile}
+
+    monkeypatch.setattr(runner, "_release_run_authority", fake_authority)
+    assignee = runner._release_assignee()
+    authority = runner._release_completion_authority(
+        "connection",
+        terminal={"id": "release-task-safe", "assignee": assignee},
+        task_id="release-task-safe",
+        assignee=assignee,
+    )
+    assert authority == {"task_id": "release-task-safe", "profile": assignee}
+    assert observed == {
+        "conn": "connection",
+        "task_id": "release-task-safe",
+        "expected_profile": assignee,
+    }
+
+    with pytest.raises(RuntimeError, match="designated authority"):
+        runner._release_completion_authority(
+            "connection",
+            terminal={"id": "release-task-safe", "assignee": "other-profile"},
+            task_id="release-task-safe",
+            assignee=assignee,
+        )
+
+
 def test_release_review_requires_exact_machine_and_human_binding(tmp_path: Path) -> None:
     handoff = {
         "repository": "owner/repo",
@@ -839,7 +904,7 @@ def test_release_review_requires_exact_machine_and_human_binding(tmp_path: Path)
         "run_safe",
         handoff,
         release_task_id="release-task-safe",
-        release_assignee=runner.RELEASE_ASSIGNEE,
+        release_assignee=runner._release_assignee(),
     )
     machine = tmp_path / "final-review.json"
     human = tmp_path / "final-review.md"
@@ -851,7 +916,7 @@ def test_release_review_requires_exact_machine_and_human_binding(tmp_path: Path)
     authority = {
         "id": 7,
         "task_id": "release-task-safe",
-        "profile": runner.RELEASE_ASSIGNEE,
+        "profile": runner._release_assignee(),
         "status": "done",
         "outcome": "completed",
         "started_at": 100,
@@ -878,7 +943,7 @@ def test_release_review_requires_exact_machine_and_human_binding(tmp_path: Path)
     machine_row, human_row = runner._validate_release_review(manifest, contract, authority)
     assert machine_row["filename"] == "final-review.json"
     assert human_row["filename"] == "final-review.md"
-    assert contract["required_exact_fields"]["release_assignee"] == runner.RELEASE_ASSIGNEE
+    assert contract["required_exact_fields"]["release_assignee"] == runner._release_assignee()
 
     substituted = [dict(item, task_id="other-task") for item in manifest]
     with pytest.raises(RuntimeError, match="designated Release task"):
@@ -908,25 +973,25 @@ def test_release_run_authority_requires_one_completed_release_run() -> None:
     )
     conn.execute(
         "INSERT INTO task_runs VALUES (1, ?, ?, 'done', 'completed', 100, 200)",
-        ("release-task-safe", runner.RELEASE_ASSIGNEE),
+        ("release-task-safe", runner._release_assignee()),
     )
     authority = runner._release_run_authority(
         conn,
         task_id="release-task-safe",
-        expected_profile=runner.RELEASE_ASSIGNEE,
+        expected_profile=runner._release_assignee(),
     )
     assert authority["id"] == 1
-    assert authority["profile"] == runner.RELEASE_ASSIGNEE
+    assert authority["profile"] == runner._release_assignee()
 
     conn.execute(
         "INSERT INTO task_runs VALUES (2, ?, ?, 'done', 'completed', 201, 300)",
-        ("release-task-safe", runner.RELEASE_ASSIGNEE),
+        ("release-task-safe", runner._release_assignee()),
     )
     with pytest.raises(RuntimeError, match="exactly one Release worker run"):
         runner._release_run_authority(
             conn,
             task_id="release-task-safe",
-            expected_profile=runner.RELEASE_ASSIGNEE,
+            expected_profile=runner._release_assignee(),
         )
 
 
