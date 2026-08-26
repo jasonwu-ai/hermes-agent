@@ -17,6 +17,7 @@ def _policy(monkeypatch, workspace, *, task_id="t_governance"):
                 "kanban_comment",
                 "kanban_complete",
                 "kanban_show",
+                "kanban_attachments",
                 "patch",
                 "read_file",
                 "search_files",
@@ -44,6 +45,25 @@ def test_role_contract_blocks_unadmitted_tool_and_foreign_task(tmp_path, monkeyp
     assert "admitted board" in _role_contract_tool_block(
         "kanban_comment",
         {"task_id": "t_governance", "board": "foreign-board", "body": "poison"},
+    )
+
+
+def test_role_contract_allows_same_board_cross_task_reads_only(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _policy(monkeypatch, workspace)
+
+    assert _role_contract_tool_block(
+        "kanban_show", {"task_id": "t_parent"}
+    ) is None
+    assert _role_contract_tool_block(
+        "kanban_attachments", {"task_id": "t_parent", "board": "verified-board"}
+    ) is None
+    assert "admitted board" in _role_contract_tool_block(
+        "kanban_show", {"task_id": "t_parent", "board": "foreign-board"}
+    )
+    assert "current task" in _role_contract_tool_block(
+        "kanban_comment", {"task_id": "t_parent", "body": "mutation"}
     )
 
 

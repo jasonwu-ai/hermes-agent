@@ -203,7 +203,12 @@ def _role_contract_tool_block(function_name: str, function_args: dict) -> Option
     current_task = os.environ.get("HERMES_KANBAN_TASK")
     if function_name.startswith("kanban_") and current_task:
         requested_task = function_args.get("task_id")
-        if requested_task is not None and str(requested_task) != current_task:
+        read_only_cross_task_tools = {"kanban_show", "kanban_attachments"}
+        if (
+            requested_task is not None
+            and str(requested_task) != current_task
+            and function_name not in read_only_cross_task_tools
+        ):
             return "role-contract Kanban action is limited to the current task"
         current_board = os.environ.get("HERMES_KANBAN_BOARD")
         requested_board = function_args.get("board")
