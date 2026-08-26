@@ -58,10 +58,10 @@ Produce a validated, bounded four-stage implementation plan for a disposable tex
 ## Required plan DAG
 Use exactly these implementation profiles and no Validator:
 
-1. `02-builder` — create a disposable `canary.txt` containing exactly `verified-pipeline-canary\\n`; workspace `scratch`.
-2. `09-test` — verify exact bytes, file count, and SHA-256 receipt from Builder; depends on Builder; workspace `scratch`.
-3. `06-integration` — verify the tested candidate identity and prepare an integration receipt without external effects; depends on Test; workspace `scratch`.
-4. `08-release` — verify all receipts and produce release evidence only, explicitly stopping before merge/deploy/publish; depends on Integration; workspace `scratch`.
+1. `02-builder` — create a disposable `canary.txt` containing exactly `verified-pipeline-canary\\n`, then declare that file through `kanban_complete(artifacts=[...])`; workspace `scratch`. Builder has only file and Kanban tools, so its task MUST NOT require Builder to calculate a hash or create a separate hash receipt. The controller independently reopens the durable completion attachment and computes its SHA-256.
+2. `09-test` — use `kanban_show` plus `kanban_attachments` on the parent Builder task to verify exactly one completion attachment named `canary.txt`, size 25, and SHA-256 `28485e7e6a194d816d44d708c6903329f7c09d634ed6b6fb37942ad93aac8720`; produce an attached test receipt that records those observed attachment metadata. Test has only file and Kanban tools and MUST NOT be asked to calculate a hash; depends on Builder; workspace `scratch`.
+3. `06-integration` — use `kanban_show` plus `kanban_attachments` on the parent Test task to verify the attached test receipt identifies the same expected canary digest, then produce an attached integration receipt without external effects; depends on Test; workspace `scratch`.
+4. `08-release` — verify all controller-provided receipts and produce release evidence only, explicitly stopping before merge/deploy/publish; depends on Integration; workspace `scratch`.
 
 Use stable task ids `build-canary`, `test-canary`, `integrate-canary`, and `release-evidence`; set `release-evidence` as `final_task_id`.
 

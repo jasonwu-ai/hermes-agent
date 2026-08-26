@@ -515,8 +515,14 @@ def _attachment_manifest(kanban_db: Any, conn: sqlite3.Connection, task_id: str)
             raise RuntimeError(f"attachment task custody drifted: expected={task_id} observed={attachment.task_id}")
         path = Path(attachment.stored_path)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if attachment.sha256 != digest or attachment.size != path.stat().st_size:
+        if attachment.size != path.stat().st_size:
             raise RuntimeError(f"attachment custody drifted for task {task_id}: {attachment.filename}")
+        if attachment.sha256 is not None and attachment.sha256 != digest:
+            raise RuntimeError(f"attachment custody drifted for task {task_id}: {attachment.filename}")
+        if attachment.uploaded_by == "kanban_complete" and attachment.sha256 is None:
+            raise RuntimeError(
+                f"completion attachment lacks an admitted digest for task {task_id}: {attachment.filename}"
+            )
         manifest.append(
             {
                 "attachment_id": attachment.id,
@@ -525,6 +531,7 @@ def _attachment_manifest(kanban_db: Any, conn: sqlite3.Connection, task_id: str)
                 "stored_path": attachment.stored_path,
                 "size": attachment.size,
                 "sha256": digest,
+                "admitted_sha256": attachment.sha256,
                 "uploaded_by": attachment.uploaded_by,
                 "created_at": attachment.created_at,
             }

@@ -1324,6 +1324,7 @@ def _handle_attachments(args: dict, **kw) -> str:
                         "filename": a.filename,
                         "content_type": a.content_type,
                         "size": a.size,
+                        "sha256": a.sha256,
                         "uploaded_by": a.uploaded_by,
                         "stored_path": a.stored_path,
                         "created_at": a.created_at,
@@ -2114,7 +2115,8 @@ KANBAN_ATTACHMENTS_SCHEMA = {
     "name": "kanban_attachments",
     "description": (
         "List the files attached to a task: id, filename, content_type, "
-        "size, who uploaded it, and the absolute on-disk path you can read."
+        "size, SHA-256 when controller-admitted (otherwise null), who uploaded it, "
+        "and the absolute on-disk path you can read."
     ),
     "parameters": {
         "type": "object",

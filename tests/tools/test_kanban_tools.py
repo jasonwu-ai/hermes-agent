@@ -80,6 +80,38 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_completion_attachment_exposes_controller_digest(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = kb.workspaces_root() / worker_env
+    workspace.mkdir(parents=True)
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(workspace), worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    artifact = workspace / "canary.txt"
+    artifact.write_bytes(b"verified-pipeline-canary\n")
+
+    completed = json.loads(
+        kt._handle_complete({"summary": "canary complete", "artifacts": [str(artifact)]})
+    )
+    assert completed["ok"] is True
+
+    attachments = json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"]
+    assert len(attachments) == 1
+    assert attachments[0]["filename"] == "canary.txt"
+    assert attachments[0]["size"] == 25
+    assert attachments[0]["sha256"] == (
+        "28485e7e6a194d816d44d708c6903329f7c09d634ed6b6fb37942ad93aac8720"
+    )
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)

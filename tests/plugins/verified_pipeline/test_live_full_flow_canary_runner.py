@@ -31,6 +31,17 @@ def test_required_check_name_matches_orchestrator_workflow() -> None:
     assert f"name: {runner.REQUIRED_CHECK_NAME}" in workflow
 
 
+def test_governance_spec_respects_attachment_only_implementation_contracts() -> None:
+    specification = governance.SPECIFICATION
+    expected_digest = hashlib.sha256(runner.CANARY_BYTES).hexdigest()
+
+    assert "kanban_complete(artifacts=[...])" in specification
+    assert "MUST NOT require Builder to calculate a hash" in specification
+    assert "kanban_attachments" in specification
+    assert expected_digest in specification
+    assert "Test has only file and Kanban tools" in specification
+
+
 def test_all_check_runs_uses_filter_all_and_collects_conflict_on_second_page(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -534,11 +545,28 @@ def test_attachment_manifest_requires_matching_completion_artifact(tmp_path: Pat
         uploaded_by="kanban_complete",
         created_at=150,
     )
-    kanban_db = SimpleNamespace(list_attachments=lambda conn, task_id: [attachment])
+    controller_input = tmp_path / "github-handoff.json"
+    controller_input.write_text('{"handoff":"safe"}\n', encoding="utf-8")
+    generic_attachment = SimpleNamespace(
+        id=2,
+        task_id="t_builder",
+        filename="github-handoff.json",
+        stored_path=str(controller_input),
+        size=controller_input.stat().st_size,
+        sha256=None,
+        uploaded_by="verified-pipeline-full-flow-controller",
+        created_at=149,
+    )
+    kanban_db = SimpleNamespace(
+        list_attachments=lambda conn, task_id: [generic_attachment, attachment]
+    )
 
     manifest = runner._attachment_manifest(kanban_db, object(), "t_builder")
-    assert manifest[0]["sha256"] == digest
-    assert manifest[0]["task_id"] == "t_builder"
+    assert manifest[0]["sha256"] == hashlib.sha256(controller_input.read_bytes()).hexdigest()
+    assert manifest[0]["admitted_sha256"] is None
+    assert manifest[1]["sha256"] == digest
+    assert manifest[1]["admitted_sha256"] == digest
+    assert manifest[1]["task_id"] == "t_builder"
 
     attachment.task_id = "other-task"
     with pytest.raises(RuntimeError, match="task custody drifted"):
@@ -549,6 +577,10 @@ def test_attachment_manifest_requires_matching_completion_artifact(tmp_path: Pat
     with pytest.raises(RuntimeError, match="no durable completion attachment"):
         runner._attachment_manifest(kanban_db, object(), "t_builder")
     attachment.uploaded_by = "kanban_complete"
+    attachment.sha256 = None
+    with pytest.raises(RuntimeError, match="lacks an admitted digest"):
+        runner._attachment_manifest(kanban_db, object(), "t_builder")
+    attachment.sha256 = digest
     artifact.write_bytes(b"tampered")
     with pytest.raises(RuntimeError, match="custody drifted"):
         runner._attachment_manifest(kanban_db, object(), "t_builder")

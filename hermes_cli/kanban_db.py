@@ -1329,6 +1329,7 @@ class Attachment:
     stored_path: str
     content_type: Optional[str]
     size: int
+    sha256: Optional[str]
     uploaded_by: Optional[str]
     created_at: int
 
@@ -4294,6 +4295,7 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
             stored_path=r["stored_path"],
             content_type=r["content_type"],
             size=r["size"] or 0,
+            sha256=r["sha256"] if "sha256" in r.keys() else None,
             uploaded_by=r["uploaded_by"],
             created_at=r["created_at"],
         )
@@ -4314,6 +4316,7 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
         stored_path=r["stored_path"],
         content_type=r["content_type"],
         size=r["size"] or 0,
+        sha256=r["sha256"] if "sha256" in r.keys() else None,
         uploaded_by=r["uploaded_by"],
         created_at=r["created_at"],
     )
