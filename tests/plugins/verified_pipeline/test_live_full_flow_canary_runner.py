@@ -9,7 +9,10 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
+from hermes_cli import kanban_db
+from hermes_cli.role_contract import admit_role_contract
 from scripts import run_verified_pipeline_live_full_flow_canary as runner
 from scripts import run_verified_pipeline_live_governance_canary as governance
 
@@ -895,7 +898,17 @@ def test_snapshot_active_profiles_copies_config_auth_and_contract(
         overlay = overlays / profile
         overlay.mkdir(parents=True)
         (overlay / "ROLE_CONTRACT.md").write_text(
-            f"---\nschema: hermes-role-contract/v2\nprofile: {profile}\n---\n",
+            "---\n"
+            "schema: hermes-role-contract/v2\n"
+            f"profile: {profile}\n"
+            "version: 1.0.0\n"
+            "allowed_toolsets:\n"
+            "  - file\n"
+            "allowed_tools:\n"
+            "  - read_file\n"
+            "workspace_only: true\n"
+            "---\n"
+            "# Test role\n",
             encoding="utf-8",
         )
         if profile in governance.GOVERNANCE_PROFILES:
@@ -906,7 +919,17 @@ def test_snapshot_active_profiles_copies_config_auth_and_contract(
         overlay = overlays / profile
         overlay.mkdir(parents=True)
         (overlay / "ROLE_CONTRACT.md").write_text(
-            f"---\nschema: hermes-role-contract/v2\nprofile: {profile}\n---\n",
+            "---\n"
+            "schema: hermes-role-contract/v2\n"
+            f"profile: {profile}\n"
+            "version: 1.0.0\n"
+            "allowed_toolsets:\n"
+            "  - file\n"
+            "allowed_tools:\n"
+            "  - read_file\n"
+            "workspace_only: true\n"
+            "---\n"
+            "# Test role\n",
             encoding="utf-8",
         )
     monkeypatch.setattr(governance, "LIVE_PROFILES_ROOT", live_root)
@@ -924,3 +947,83 @@ def test_snapshot_active_profiles_copies_config_auth_and_contract(
     assert "credential_files" not in manifest
     assert manifest["profiles"]["02-builder"]["contract_sha256"]
     assert manifest["profiles"]["09-test"]["contract_only"] is True
+
+
+def test_snapshot_active_test_profile_projects_contract_toolsets_for_real_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    live_root = tmp_path / "live"
+    overlays = tmp_path / "overlays"
+    runtime = tmp_path / "runtime"
+    active = governance.GOVERNANCE_PROFILES + ("09-test",)
+    for profile in active:
+        live = live_root / profile
+        live.mkdir(parents=True)
+        live.joinpath("config.yaml").write_text(
+            "agent:\n"
+            "  disabled_toolsets:\n"
+            "    - file\n"
+            "    - web\n"
+            "platform_toolsets:\n"
+            "  cli:\n"
+            "    - terminal\n"
+            "    - no_mcp\n",
+            encoding="utf-8",
+        )
+        live.joinpath("profile.yaml").write_text(f"name: {profile}\n", encoding="utf-8")
+        overlay = overlays / profile
+        overlay.mkdir(parents=True)
+        allowed = "  - file\n  - kanban\n" if profile == "09-test" else "  - file\n"
+        overlay.joinpath("ROLE_CONTRACT.md").write_text(
+            "---\n"
+            "schema: hermes-role-contract/v2\n"
+            f"profile: {profile}\n"
+            "version: 1.0.0\n"
+            "allowed_toolsets:\n"
+            f"{allowed}"
+            "allowed_tools:\n"
+            "  - read_file\n"
+            "workspace_only: true\n"
+            "---\n"
+            "# Test role\n",
+            encoding="utf-8",
+        )
+    for profile in set(governance.MANDATORY_CONTRACT_PROFILES) - {"09-test"}:
+        overlay = overlays / profile
+        overlay.mkdir(parents=True)
+        overlay.joinpath("ROLE_CONTRACT.md").write_text(
+            "---\n"
+            "schema: hermes-role-contract/v2\n"
+            f"profile: {profile}\n"
+            "version: 1.0.0\n"
+            "allowed_toolsets:\n"
+            "  - file\n"
+            "allowed_tools:\n"
+            "  - read_file\n"
+            "workspace_only: true\n"
+            "---\n"
+            "# Test role\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(governance, "LIVE_PROFILES_ROOT", live_root)
+    monkeypatch.setattr(governance, "OVERLAYS", overlays)
+
+    governance._snapshot_profiles(runtime, active_profiles=active)
+    target = runtime / "profiles" / "09-test"
+    projected = yaml.safe_load((target / "config.yaml").read_text(encoding="utf-8"))
+    assert "file" in projected["platform_toolsets"]["cli"]
+    assert "file" not in projected["agent"]["disabled_toolsets"]
+    assert "web" in projected["agent"]["disabled_toolsets"]
+
+    configured = kanban_db._resolve_worker_cli_toolsets(str(target))
+    admission = admit_role_contract(
+        target,
+        "09-test",
+        configured or [],
+        task_id="t_real_target_profile",
+        run_id=1,
+        workspace_path=str(tmp_path),
+        required=True,
+    )
+    assert admission is not None
+    assert admission.effective_toolsets == ("file", "kanban")

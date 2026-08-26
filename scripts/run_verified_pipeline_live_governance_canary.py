@@ -22,6 +22,7 @@ import time
 from typing import Any
 
 import psutil
+import yaml
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -93,6 +94,49 @@ def _copy_file(source: Path, destination: Path) -> None:
     destination.chmod(0o600)
 
 
+def _project_contract_toolsets(profile_home: Path, profile: str) -> None:
+    """Enable the candidate contract's toolsets in one disposable profile copy.
+
+    Live profile configuration is an input to the canary, not its authority
+    source.  The source-controlled role contract defines the exact canary
+    ceiling, so the disposable projection must make that ceiling reachable
+    without mutating the live profile or enabling anything outside it.
+    """
+    from hermes_cli.role_contract import load_role_contract
+
+    config_path = profile_home / "config.yaml"
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"profile config must be a mapping: {profile}")
+    contract = load_role_contract(profile_home, profile, required=True)
+    assert contract is not None
+
+    platform_toolsets = payload.setdefault("platform_toolsets", {})
+    if not isinstance(platform_toolsets, dict):
+        raise RuntimeError(f"profile platform_toolsets must be a mapping: {profile}")
+    cli_toolsets = platform_toolsets.setdefault("cli", [])
+    if not isinstance(cli_toolsets, list) or not all(isinstance(item, str) for item in cli_toolsets):
+        raise RuntimeError(f"profile CLI toolsets must be a string list: {profile}")
+    for toolset in contract.allowed_toolsets:
+        if toolset not in cli_toolsets:
+            cli_toolsets.append(toolset)
+
+    agent = payload.setdefault("agent", {})
+    if not isinstance(agent, dict):
+        raise RuntimeError(f"profile agent config must be a mapping: {profile}")
+    disabled = agent.setdefault("disabled_toolsets", [])
+    if not isinstance(disabled, list) or not all(isinstance(item, str) for item in disabled):
+        raise RuntimeError(f"profile disabled_toolsets must be a string list: {profile}")
+    requested = set(contract.allowed_toolsets)
+    agent["disabled_toolsets"] = [item for item in disabled if item not in requested]
+
+    config_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+
+
 def _validated_credential_auth(source_home: Path) -> Path:
     if source_home.is_symlink():
         raise RuntimeError("credential source home must not be a symlink")
@@ -157,6 +201,8 @@ def _snapshot_profiles(
             _copy_file(credential_auth, target / "auth.json")
         overlay = OVERLAYS / profile
         _copy_file(overlay / "ROLE_CONTRACT.md", target / "ROLE_CONTRACT.md")
+        if profile in MANDATORY_CONTRACT_PROFILES:
+            _project_contract_toolsets(target, profile)
         overlay_skills = overlay / "skills"
         if overlay_skills.is_dir():
             shutil.copytree(overlay_skills, target / "skills")
