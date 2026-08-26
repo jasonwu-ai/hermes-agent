@@ -1,5 +1,7 @@
 import os
 import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -77,6 +79,45 @@ def test_registered_workspace_is_docker_session_mount(monkeypatch, tmp_path):
         terminal_tool.clear_task_env_overrides("session-example")
 
 
+def test_waits_for_dispatcher_to_persist_spawned_worker_pid(monkeypatch, tmp_path):
+    db_path, workspace = _claimed_worker(monkeypatch, tmp_path)
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE tasks SET worker_pid = NULL WHERE id = ?", ("t_example",))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(cli, "_KANBAN_WORKSPACE_BIND_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(cli, "_KANBAN_WORKSPACE_BIND_POLL_SECONDS", 0.01)
+    captured = {}
+    monkeypatch.setattr(
+        "tools.terminal_tool.register_task_env_overrides",
+        lambda session_id, overrides: captured.update(
+            {"session_id": session_id, "overrides": overrides}
+        ),
+    )
+
+    def persist_spawned_pid():
+        time.sleep(0.05)
+        update = sqlite3.connect(db_path)
+        update.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+            (os.getpid(), "t_example"),
+        )
+        update.commit()
+        update.close()
+
+    updater = threading.Thread(target=persist_spawned_pid)
+    updater.start()
+    try:
+        cli._register_kanban_worker_workspace("session-example")
+    finally:
+        updater.join()
+
+    assert captured == {
+        "session_id": "session-example",
+        "overrides": {"cwd": str(workspace.resolve()), "cwd_source": "session"},
+    }
+
+
 @pytest.mark.parametrize(
     ("env_key", "env_value", "column", "db_value"),
     [
@@ -99,6 +140,8 @@ def test_refuses_substituted_durable_authority(
         conn.execute(f"UPDATE tasks SET {column} = ? WHERE id = ?", (db_value, "t_example"))
         conn.commit()
         conn.close()
+    if column == "worker_pid":
+        monkeypatch.setattr(cli, "_KANBAN_WORKSPACE_BIND_TIMEOUT_SECONDS", 0.0)
     called = []
     monkeypatch.setattr(
         "tools.terminal_tool.register_task_env_overrides",

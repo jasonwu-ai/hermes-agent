@@ -4996,6 +4996,10 @@ class _VoiceInputMessage:
         return self.text
 
 
+_KANBAN_WORKSPACE_BIND_TIMEOUT_SECONDS = 2.0
+_KANBAN_WORKSPACE_BIND_POLL_SECONDS = 0.05
+
+
 def _register_kanban_worker_workspace(session_id: str) -> None:
     """Bind a durably claimed Kanban worker workspace to its CLI session.
 
@@ -5025,27 +5029,34 @@ def _register_kanban_worker_workspace(session_id: str) -> None:
         return
     try:
         import sqlite3
+        import time
 
-        conn = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        try:
-            row = conn.execute(
-                "SELECT status, assignee, workspace_path, current_run_id, "
-                "claim_lock, worker_pid FROM tasks WHERE id = ?",
-                (task_id,),
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is None or (
-            row["status"] != "running"
-            or row["assignee"] != profile
-            or str(row["current_run_id"]) != run_id
-            or row["claim_lock"] != claim_lock
-            or row["worker_pid"] != os.getpid()
-            or not row["workspace_path"]
-            or Path(row["workspace_path"]).resolve() != workspace_path.resolve()
-        ):
-            return
+        deadline = time.monotonic() + _KANBAN_WORKSPACE_BIND_TIMEOUT_SECONDS
+        while True:
+            conn = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT status, assignee, workspace_path, current_run_id, "
+                    "claim_lock, worker_pid FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is None or (
+                row["status"] != "running"
+                or row["assignee"] != profile
+                or str(row["current_run_id"]) != run_id
+                or row["claim_lock"] != claim_lock
+                or not row["workspace_path"]
+                or Path(row["workspace_path"]).resolve() != workspace_path.resolve()
+            ):
+                return
+            if row["worker_pid"] == os.getpid():
+                break
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(_KANBAN_WORKSPACE_BIND_POLL_SECONDS)
     except (OSError, sqlite3.Error, TypeError, ValueError):
         return
     from tools.terminal_tool import register_task_env_overrides
