@@ -29,6 +29,52 @@ def test_clean_source_head_rejects_dirty_tree(monkeypatch: pytest.MonkeyPatch) -
         runner._clean_source_head()
 
 
+def test_source_commit_identity_reads_exact_candidate_author(monkeypatch: pytest.MonkeyPatch) -> None:
+    head = "a" * 40
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            "Candidate Author\x00123+candidate@users.noreply.github.com\n",
+            "",
+        )
+
+    monkeypatch.setattr(runner, "_run", fake_run)
+
+    assert runner._source_commit_identity(head) == {
+        "name": "Candidate Author",
+        "email": "123+candidate@users.noreply.github.com",
+    }
+    assert calls == [
+        ["git", "-C", str(runner.SOURCE_ROOT), "show", "-s", "--format=%an%x00%ae", head]
+    ]
+
+
+@pytest.mark.parametrize(
+    "head,output",
+    [
+        ("not-a-head", "Candidate\x00candidate@example.com\n"),
+        ("a" * 40, "Candidate without separator\n"),
+        ("a" * 40, "Candidate\x00not-an-email\n"),
+    ],
+)
+def test_source_commit_identity_rejects_unbound_or_malformed_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    head: str,
+    output: str,
+) -> None:
+    monkeypatch.setattr(
+        runner,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, output, ""),
+    )
+    with pytest.raises(RuntimeError, match="source commit"):
+        runner._source_commit_identity(head)
+
+
 def test_required_check_name_matches_orchestrator_workflow() -> None:
     workflow = (runner.SOURCE_ROOT / ".github" / "workflows" / "ci.yaml").read_text(encoding="utf-8")
     assert f"name: {runner.REQUIRED_CHECK_NAME}" in workflow
@@ -290,6 +336,11 @@ def test_github_handoff_binds_exact_head_and_required_checks(
     monkeypatch.setattr(runner, "_gh_json", fake_gh)
     monkeypatch.setattr(runner, "_assert_ref_absent", lambda repository, branch: None)
     monkeypatch.setattr(runner, "_create_ref", lambda repository, branch, head_sha: None)
+    monkeypatch.setattr(
+        runner,
+        "_source_commit_identity",
+        lambda head: {"name": "Candidate", "email": "123+candidate@users.noreply.github.com"},
+    )
     cleanup_context: dict = {}
     receipt = runner._github_handoff(
         repository="owner/repo",
@@ -300,6 +351,7 @@ def test_github_handoff_binds_exact_head_and_required_checks(
         run_id="run_safe",
         timeout_seconds=1,
         cleanup_context=cleanup_context,
+        source_head="d" * 40,
     )
 
     assert receipt["head_sha"] == head_sha
@@ -310,6 +362,16 @@ def test_github_handoff_binds_exact_head_and_required_checks(
     assert receipt["required_check"]["app_id"] == 15368
     assert receipt["branch_protection"]["required_app_id"] == 15368
     assert cleanup_context["pull_request"] == 42
+    commit_payloads = [payload for args, payload in calls if "/git/commits" in " ".join(args)]
+    assert commit_payloads == [
+        {
+            "message": "test: disposable verified-pipeline acceptance run_safe",
+            "tree": "e" * 40,
+            "parents": ["a" * 40],
+            "author": {"name": "Candidate", "email": "123+candidate@users.noreply.github.com"},
+            "committer": {"name": "Candidate", "email": "123+candidate@users.noreply.github.com"},
+        }
+    ]
     flattened = "\n".join(" ".join(args) for args, _ in calls)
     assert "/labels" not in flattened
     assert "merge" not in flattened.lower()
@@ -639,6 +701,11 @@ def test_github_handoff_failure_uses_partial_cleanup_context(
     monkeypatch.setattr(runner, "_gh_json", fake_gh)
     monkeypatch.setattr(runner, "_assert_ref_absent", lambda repository, branch: None)
     monkeypatch.setattr(runner, "_create_ref", lambda repository, branch, head_sha: None)
+    monkeypatch.setattr(
+        runner,
+        "_source_commit_identity",
+        lambda head: {"name": "Candidate", "email": "123+candidate@users.noreply.github.com"},
+    )
     monkeypatch.setattr(runner, "_cleanup_github_handoff", fake_cleanup)
     context: dict = {}
     with pytest.raises(RuntimeError, match="All required checks pass failed"):
@@ -651,6 +718,7 @@ def test_github_handoff_failure_uses_partial_cleanup_context(
             run_id="run_safe",
             timeout_seconds=1,
             cleanup_context=context,
+            source_head="d" * 40,
         )
     assert cleanup_seen["ref_created"] is True
     assert cleanup_seen["pull_request"] == 42
@@ -688,6 +756,11 @@ def test_github_handoff_marks_ref_custody_before_ambiguous_post(
 
     monkeypatch.setattr(runner, "_gh_json", fake_gh)
     monkeypatch.setattr(runner, "_assert_ref_absent", lambda repository, branch: None)
+    monkeypatch.setattr(
+        runner,
+        "_source_commit_identity",
+        lambda head: {"name": "Candidate", "email": "123+candidate@users.noreply.github.com"},
+    )
 
     def ambiguous_create(repository, branch, head_sha):
         raise RuntimeError("response lost after POST")
@@ -704,6 +777,7 @@ def test_github_handoff_marks_ref_custody_before_ambiguous_post(
             run_id="run_safe",
             timeout_seconds=1,
             cleanup_context={},
+            source_head="d" * 40,
         )
     assert cleanup_seen["ref_created"] is False
     assert cleanup_seen["ref_creation_attempted"] is True

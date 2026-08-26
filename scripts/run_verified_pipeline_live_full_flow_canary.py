@@ -65,6 +65,27 @@ def _clean_source_head() -> str:
     return head
 
 
+def _source_commit_identity(source_head: str) -> dict[str, str]:
+    """Return the exact candidate author's public Git identity for canary commits."""
+    if len(source_head) != 40 or any(character not in "0123456789abcdef" for character in source_head):
+        raise RuntimeError("source commit identity requires an exact lowercase 40-hex head")
+    raw = _run(
+        ["git", "-C", str(SOURCE_ROOT), "show", "-s", "--format=%an%x00%ae", source_head]
+    ).stdout.rstrip("\n")
+    parts = raw.split("\x00")
+    if len(parts) != 2:
+        raise RuntimeError("source commit author identity is malformed")
+    name, email = parts
+    if (
+        not name
+        or not email
+        or "@" not in email
+        or any(character in name or character in email for character in ("\x00", "\r", "\n"))
+    ):
+        raise RuntimeError("source commit author identity is incomplete or unsafe")
+    return {"name": name, "email": email}
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     path.chmod(0o600)
@@ -208,6 +229,7 @@ def _github_handoff(
     run_id: str,
     timeout_seconds: int,
     cleanup_context: dict[str, Any],
+    source_head: str | None = None,
 ) -> dict[str, Any]:
     if repository.count("/") != 1 or not all(repository.split("/")):
         raise RuntimeError("GitHub repository must be owner/name")
@@ -250,6 +272,9 @@ def _github_handoff(
             raise RuntimeError(
                 "GitHub branch protection drifted from the exact strict app-bound aggregator"
             )
+        if not isinstance(source_head, str):
+            raise RuntimeError("GitHub canary commit requires an exact source head")
+        commit_identity = _source_commit_identity(source_head)
         base = _gh_json(["api", f"repos/{repository}/commits/{quote(base_ref, safe='')}"])
         base_sha = str(base.get("sha") or "").lower()
         base_tree = str(((base.get("commit") or {}).get("tree") or {}).get("sha") or "").lower()
@@ -274,6 +299,8 @@ def _github_handoff(
                 "message": f"test: disposable verified-pipeline acceptance {run_id}",
                 "tree": tree_sha,
                 "parents": [base_sha],
+                "author": dict(commit_identity),
+                "committer": dict(commit_identity),
             },
         )
         head_sha = str(commit.get("sha") or "").lower()
@@ -762,9 +789,10 @@ def main() -> int:
     report_path = output / "run-report.json"
     html_path = output / "final-review.html"
     governance_output = output / "governance"
+    source_head = _clean_source_head()
     report: dict[str, Any] = {
         "schema": "verified-pipeline/live-full-flow-acceptance/v1",
-        "source_head": _clean_source_head(),
+        "source_head": source_head,
         "started_at_epoch": int(time.time()),
         "status": "STARTING",
         "stages": [],
@@ -899,6 +927,7 @@ def main() -> int:
                 run_id=governance_report["run_id"],
                 timeout_seconds=args.github_timeout,
                 cleanup_context=cleanup_context,
+                source_head=source_head,
             )
             release_task_id = projected["task_map"]["release-evidence"]
             release_row = governance._task(kanban_path, release_task_id)
