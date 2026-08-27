@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -743,39 +744,51 @@ async def upload_task_attachment(
         candidate = dest_path.name
 
         total = 0
+        digest = hashlib.sha256()
+        admitted = False
         try:
-            with open(dest_path, "wb") as out:
-                while True:
-                    chunk = await file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > KANBAN_ATTACHMENT_MAX_BYTES:
-                        out.close()
-                        dest_path.unlink(missing_ok=True)
-                        raise HTTPException(
-                            status_code=413,
-                            detail=(
-                                f"attachment exceeds {KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit"
-                            ),
-                        )
-                    out.write(chunk)
-        except HTTPException:
-            raise
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
+            try:
+                with open(dest_path, "wb") as out:
+                    while True:
+                        chunk = await file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > KANBAN_ATTACHMENT_MAX_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=(
+                                    f"attachment exceeds {KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit"
+                                ),
+                            )
+                        out.write(chunk)
+                        digest.update(chunk)
+            except HTTPException:
+                raise
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"failed to store attachment: {exc}"
+                )
 
-        att_id = kanban_db.add_attachment(
-            conn,
-            task_id,
-            filename=candidate,
-            stored_path=str(dest_path.resolve()),
-            content_type=file.content_type,
-            size=total,
-            uploaded_by=(uploaded_by or "dashboard"),
-        )
-        att = kanban_db.get_attachment(conn, att_id)
-        return {"attachment": _attachment_dict(att) if att else None}
+            att_id = kanban_db.add_attachment(
+                conn,
+                task_id,
+                filename=candidate,
+                stored_path=str(dest_path.resolve()),
+                content_type=file.content_type,
+                size=total,
+                sha256=digest.hexdigest(),
+                uploaded_by=(uploaded_by or "dashboard"),
+            )
+            # Once the metadata transaction succeeds, the blob is admitted.
+            admitted = True
+            att = kanban_db.get_attachment(conn, att_id)
+            return {"attachment": _attachment_dict(att) if att else None}
+        finally:
+            # Covers all abnormal exits after creating the collision-resolved
+            # destination, including stream errors and cancellation.
+            if not admitted:
+                dest_path.unlink(missing_ok=True)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:

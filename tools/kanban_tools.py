@@ -28,9 +28,12 @@ through the board.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
+import stat
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -39,6 +42,11 @@ from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 
 logger = logging.getLogger(__name__)
+
+# This is a cap on the complete UTF-8 tool response, not merely the raw bytes
+# admitted as attachment content.  JSON escaping and attachment metadata can
+# otherwise make a nominal 64 KiB response materially larger.
+_KANBAN_ATTACHMENT_INLINE_TEXT_MAX_BYTES = 64 * 1024
 
 
 # ---------------------------------------------------------------------------
@@ -1315,22 +1323,107 @@ def _handle_attachments(args: dict, **kw) -> str:
             if kb.get_task(conn, tid) is None:
                 return tool_error(f"task {tid} not found")
             atts = kb.list_attachments(conn, tid)
-            return json.dumps({
+
+            def _attachment_payload(att) -> dict[str, Any]:
+                payload: dict[str, Any] = {
+                    "id": att.id,
+                    "filename": att.filename,
+                    "content_type": att.content_type,
+                    "size": att.size,
+                    "sha256": att.sha256,
+                    "uploaded_by": att.uploaded_by,
+                    "stored_path": att.stored_path,
+                    "created_at": att.created_at,
+                }
+                # A dispatcher worker is already authorized to read inputs
+                # attached to its own task.  Host-side stored paths are not
+                # readable from Docker/remote file backends, though, so expose
+                # small UTF-8 inputs inline.  Never inline cross-task reads.
+                if tid != os.environ.get("HERMES_KANBAN_TASK"):
+                    return payload
+                # Do not read a file which cannot possibly be inlined under
+                # the complete response budget.  The serialized candidate
+                # check below accounts for escaping and metadata overhead.
+                if not isinstance(att.size, int) or not (0 <= att.size <= _KANBAN_ATTACHMENT_INLINE_TEXT_MAX_BYTES):
+                    return payload
+                # Inline content is an authority-bearing controller input.
+                # Legacy/external rows without an admitted digest remain
+                # metadata-only, and malformed database values fail closed
+                # without touching their stored path.
+                admitted_digest = att.sha256
+                if (
+                    not isinstance(admitted_digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", admitted_digest) is None
+                ):
+                    return payload
+                try:
+                    # There is no safe substitute for final-component symlink
+                    # protection.  In particular, do not turn an unavailable
+                    # O_NOFOLLOW into zero and follow a replacement target.
+                    nofollow = getattr(os, "O_NOFOLLOW", None)
+                    if not isinstance(nofollow, int) or nofollow == 0:
+                        return payload
+                    flags = os.O_RDONLY | nofollow
+                    fd = os.open(att.stored_path, flags)
+                    try:
+                        def descriptor_size_is_admitted() -> bool:
+                            """Confirm this opened descriptor is a regular admitted file."""
+                            file_stat = os.fstat(fd)
+                            return stat.S_ISREG(file_stat.st_mode) and file_stat.st_size == att.size
+
+                        def read_bounded_snapshot() -> bytes | None:
+                            chunks: list[bytes] = []
+                            remaining = att.size + 1
+                            while remaining > 0:
+                                chunk = os.read(fd, min(remaining, 64 * 1024))
+                                if not chunk:
+                                    break
+                                chunks.append(chunk)
+                                remaining -= len(chunk)
+                            raw = b"".join(chunks)
+                            return raw if len(raw) == att.size else None
+
+                        # Do not re-stat the pathname or use timestamp
+                        # heuristics: this descriptor remains bound to the
+                        # object opened above even if the pathname is replaced.
+                        if not descriptor_size_is_admitted():
+                            return payload
+                        raw = read_bounded_snapshot()
+                        if raw is None or not descriptor_size_is_admitted():
+                            return payload
+                    finally:
+                        os.close(fd)
+                    digest = hashlib.sha256(raw).hexdigest()
+                    if digest != admitted_digest:
+                        return payload
+                    text = raw.decode("utf-8")
+                except (OSError, UnicodeDecodeError):
+                    return payload
+                payload["inline_text"] = text
+                payload["inline_sha256"] = digest
+                return payload
+
+            response: dict[str, Any] = {
                 "ok": True,
                 "task_id": tid,
-                "attachments": [
-                    {
-                        "id": a.id,
-                        "filename": a.filename,
-                        "content_type": a.content_type,
-                        "size": a.size,
-                        "uploaded_by": a.uploaded_by,
-                        "stored_path": a.stored_path,
-                        "created_at": a.created_at,
-                    }
-                    for a in atts
-                ],
-            })
+                "attachments": [],
+            }
+            # Build in database order so admission is deterministic.  Each
+            # candidate is measured as the final serialized UTF-8 response;
+            # if it would overflow, retain metadata only for that attachment.
+            for attachment in atts:
+                metadata = _attachment_payload(attachment)
+                candidate = {**response, "attachments": [*response["attachments"], metadata]}
+                if len(json.dumps(candidate).encode("utf-8")) > _KANBAN_ATTACHMENT_INLINE_TEXT_MAX_BYTES:
+                    metadata.pop("inline_text", None)
+                    metadata.pop("inline_sha256", None)
+                response["attachments"].append(metadata)
+            serialized = json.dumps(response)
+            if len(serialized.encode("utf-8")) > _KANBAN_ATTACHMENT_INLINE_TEXT_MAX_BYTES:
+                # Even metadata can overflow (for example, path or filename
+                # expansion).  Do not return a partial or oversized listing.
+                return tool_error("kanban_attachments response metadata exceeds 65536-byte limit")
+            return serialized
         finally:
             conn.close()
     except ValueError as e:
@@ -2114,7 +2207,10 @@ KANBAN_ATTACHMENTS_SCHEMA = {
     "name": "kanban_attachments",
     "description": (
         "List the files attached to a task: id, filename, content_type, "
-        "size, who uploaded it, and the absolute on-disk path you can read."
+        "size, SHA-256 when controller-admitted (otherwise null), who uploaded it, "
+        "and the durable host stored_path. For the current task only, UTF-8 "
+        "attachments up to 64 KiB also include inline_text and inline_sha256 so "
+        "isolated workers can read controller inputs without host-path access."
     ),
     "parameters": {
         "type": "object",

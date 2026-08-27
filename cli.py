@@ -4996,6 +4996,77 @@ class _VoiceInputMessage:
         return self.text
 
 
+_KANBAN_WORKSPACE_BIND_TIMEOUT_SECONDS = 2.0
+_KANBAN_WORKSPACE_BIND_POLL_SECONDS = 0.05
+
+
+def _register_kanban_worker_workspace(session_id: str) -> None:
+    """Bind a durably claimed Kanban worker workspace to its CLI session.
+
+    Docker per-session isolation deliberately refuses a process-global
+    ``TERMINAL_CWD`` as a fresh session's mount source.  A dispatcher-owned
+    worker is different: its task, claim, run, process, profile, database, and
+    workspace are durably bound before spawn.  Re-read that exact task row and
+    register only a complete match so file tools and host-side Kanban artifact
+    preservation operate on the same bytes.
+    """
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "").strip()
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    profile = os.environ.get("HERMES_PROFILE", "").strip()
+    db_value = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+    if (
+        not session_id
+        or not all((task_id, claim_lock, run_id, profile, db_value, workspace))
+        or not os.path.isabs(db_value)
+        or not os.path.isabs(workspace)
+    ):
+        return
+    db_path = Path(db_value)
+    workspace_path = Path(workspace)
+    if not db_path.is_file() or not workspace_path.is_dir():
+        return
+    try:
+        import sqlite3
+        import time
+
+        deadline = time.monotonic() + _KANBAN_WORKSPACE_BIND_TIMEOUT_SECONDS
+        while True:
+            conn = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    "SELECT status, assignee, workspace_path, current_run_id, "
+                    "claim_lock, worker_pid FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row is None or (
+                row["status"] != "running"
+                or row["assignee"] != profile
+                or str(row["current_run_id"]) != run_id
+                or row["claim_lock"] != claim_lock
+                or not row["workspace_path"]
+                or Path(row["workspace_path"]).resolve() != workspace_path.resolve()
+            ):
+                return
+            if row["worker_pid"] == os.getpid():
+                break
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(_KANBAN_WORKSPACE_BIND_POLL_SECONDS)
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return
+    from tools.terminal_tool import register_task_env_overrides
+
+    register_task_env_overrides(
+        session_id,
+        {"cwd": str(workspace_path.resolve()), "cwd_source": "session"},
+    )
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -5465,6 +5536,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
+        _register_kanban_worker_workspace(self.session_id)
         getattr(self, "_write_terminal_breadcrumb", lambda: None)()
         
         # History file for persistent input recall across sessions

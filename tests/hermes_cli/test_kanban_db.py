@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import os
 import sqlite3
 import subprocess
@@ -1614,3 +1615,46 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_store_attachment_bytes_persists_digest_events_collisions_and_cleans_orphans(kanban_home):
+    """Stored bytes are digest-admitted; direct legacy rows remain nullable."""
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="attachment storage", assignee="builder")
+        raw = b"durable controller input\n"
+        first_id = kb.store_attachment_bytes(conn, task_id, "handoff.json", raw, uploaded_by="controller")
+        second_id = kb.store_attachment_bytes(conn, task_id, "handoff.json", raw, uploaded_by="controller")
+        attachments = kb.list_attachments(conn, task_id)
+        assert [att.id for att in attachments] == [first_id, second_id]
+        assert [att.filename for att in attachments] == ["handoff.json", "handoff (1).json"]
+        assert [att.sha256 for att in attachments] == [hashlib.sha256(raw).hexdigest()] * 2
+        attached_events = [event for event in kb.list_events(conn, task_id) if event.kind == "attached"]
+        assert [event.payload for event in attached_events] == [
+            {"filename": "handoff.json", "size": len(raw), "by": "controller"},
+            {"filename": "handoff (1).json", "size": len(raw), "by": "controller"},
+        ]
+
+        legacy_id = kb.add_attachment(
+            conn,
+            task_id,
+            filename="legacy.txt",
+            stored_path=str(kanban_home / "legacy.txt"),
+            size=0,
+        )
+        assert kb.get_attachment(conn, legacy_id).sha256 is None
+        with pytest.raises(ValueError, match="sha256"):
+            kb.add_attachment(
+                conn,
+                task_id,
+                filename="bad.txt",
+                stored_path=str(kanban_home / "bad.txt"),
+                sha256="not-a-digest",
+            )
+
+        attachment_dir = kb.task_attachments_dir("missing-task")
+        with pytest.raises(ValueError, match="unknown task"):
+            kb.store_attachment_bytes(conn, "missing-task", "orphan.txt", b"orphan")
+        assert not (attachment_dir / "orphan.txt").exists()
+    finally:
+        conn.close()

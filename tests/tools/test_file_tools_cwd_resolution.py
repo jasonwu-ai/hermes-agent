@@ -134,6 +134,40 @@ def test_container_relative_path_keeps_container_cwd_symlink(tmp_path, monkeypat
     assert resolved != host_project / "oilsands-sim" / "README.md"
 
 
+def test_docker_registered_host_workspace_translates_to_container_mount(tmp_path, monkeypatch):
+    """Relative and host-absolute file paths address the admitted bind bytes."""
+    workspace = tmp_path / "claimed-workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: {
+            "env_type": "docker",
+            "docker_mount_cwd_to_workspace": True,
+            "host_cwd": None,
+        },
+    )
+    terminal_tool.register_task_env_overrides(
+        "builder-session",
+        {"cwd": str(workspace), "cwd_source": "session"},
+    )
+
+    assert ft._resolve_path_for_task("canary.txt", "builder-session") == PurePosixPath(
+        "/workspace/canary.txt"
+    )
+    assert ft._resolve_path_for_task(
+        str(workspace / "nested" / "canary.txt"), "builder-session"
+    ) == PurePosixPath("/workspace/nested/canary.txt")
+    assert ft._resolve_path_for_task(
+        "/opt/container-only.txt", "builder-session"
+    ) == PurePosixPath("/opt/container-only.txt")
+
+
 class _DummyDockerEnvironment:
     cwd = "/workspace"
     cwd_owner = "default"

@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import logging
 import os
+import posixpath
 import random
 import threading
 import time
@@ -186,7 +187,64 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     )
 
 
-def _role_contract_tool_block(function_name: str, function_args: dict) -> Optional[str]:
+def _canonicalize_container_completion_artifacts(
+    function_name: str,
+    function_args: dict,
+    *,
+    workspace: Path,
+    task_id: str,
+) -> None:
+    """Map Docker's admitted ``/workspace`` alias back to host custody.
+
+    File tools return paths in the backend namespace.  ``kanban_complete`` is
+    host-side, so a workspace-only worker must hand it the corresponding host
+    path before role-policy validation and durable attachment capture.  Enable
+    the mapping only when the task's real Docker mount resolver independently
+    proves that this exact admitted host workspace is mounted at ``/workspace``.
+    """
+    if function_name != "kanban_complete":
+        return
+    try:
+        from tools.file_tools import _docker_host_workspace_root
+
+        host_root_text = _docker_host_workspace_root(task_id or "default")
+        if not host_root_text or Path(host_root_text).resolve() != workspace:
+            return
+    except (OSError, ValueError):
+        return
+
+    container_root = PurePosixPath("/workspace")
+
+    def _canonicalize(value: Any) -> Any:
+        if not isinstance(value, str) or not value.startswith("/"):
+            return value
+        candidate = PurePosixPath(posixpath.normpath(value))
+        try:
+            relative = candidate.relative_to(container_root)
+        except ValueError:
+            return value
+        return str(workspace.joinpath(*relative.parts))
+
+    artifacts = function_args.get("artifacts")
+    if isinstance(artifacts, str):
+        function_args["artifacts"] = _canonicalize(artifacts)
+    elif isinstance(artifacts, (list, tuple)):
+        function_args["artifacts"] = [_canonicalize(value) for value in artifacts]
+    metadata = function_args.get("metadata")
+    if isinstance(metadata, dict):
+        nested = metadata.get("artifacts")
+        if isinstance(nested, str):
+            metadata["artifacts"] = _canonicalize(nested)
+        elif isinstance(nested, (list, tuple)):
+            metadata["artifacts"] = [_canonicalize(value) for value in nested]
+
+
+def _role_contract_tool_block(
+    function_name: str,
+    function_args: dict,
+    *,
+    task_id: str = "default",
+) -> Optional[str]:
     """Enforce receipt-pinned per-tool, task, and workspace authority."""
     raw_allowed = os.environ.get("HERMES_ROLE_CONTRACT_ALLOWED_TOOLS")
     if not raw_allowed:
@@ -203,7 +261,12 @@ def _role_contract_tool_block(function_name: str, function_args: dict) -> Option
     current_task = os.environ.get("HERMES_KANBAN_TASK")
     if function_name.startswith("kanban_") and current_task:
         requested_task = function_args.get("task_id")
-        if requested_task is not None and str(requested_task) != current_task:
+        read_only_cross_task_tools = {"kanban_show", "kanban_attachments"}
+        if (
+            requested_task is not None
+            and str(requested_task) != current_task
+            and function_name not in read_only_cross_task_tools
+        ):
             return "role-contract Kanban action is limited to the current task"
         current_board = os.environ.get("HERMES_KANBAN_BOARD")
         requested_board = function_args.get("board")
@@ -220,6 +283,12 @@ def _role_contract_tool_block(function_name: str, function_args: dict) -> Option
     if not workspace_text:
         return "workspace-only role contract has no admitted workspace"
     workspace = Path(workspace_text).expanduser().resolve()
+    _canonicalize_container_completion_artifacts(
+        function_name,
+        function_args,
+        workspace=workspace,
+        task_id=task_id,
+    )
     if function_name == "patch" and function_args.get("mode") == "patch":
         return "workspace-only role contracts do not admit multi-file patch payloads"
     path_values: list[str] = []
@@ -729,7 +798,11 @@ def _run_agent_tool_execution_middleware(
             )
 
         if block_message is None:
-            block_message = _role_contract_tool_block(function_name, final_args)
+            block_message = _role_contract_tool_block(
+                function_name,
+                final_args,
+                task_id=effective_task_id or "default",
+            )
             if block_message is not None:
                 block_error_type = "role_contract_block"
 

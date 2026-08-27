@@ -9,8 +9,10 @@ Verifies:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -78,6 +80,447 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
+
+
+def test_completion_attachment_exposes_controller_digest(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workspace = kb.workspaces_root() / worker_env
+    workspace.mkdir(parents=True)
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(workspace), worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    artifact = workspace / "canary.txt"
+    artifact.write_bytes(b"verified-pipeline-canary\n")
+
+    completed = json.loads(
+        kt._handle_complete({"summary": "canary complete", "artifacts": [str(artifact)]})
+    )
+    assert completed["ok"] is True
+
+    attachments = json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"]
+    assert len(attachments) == 1
+    assert attachments[0]["filename"] == "canary.txt"
+    assert attachments[0]["size"] == 25
+    assert attachments[0]["sha256"] == (
+        "28485e7e6a194d816d44d708c6903329f7c09d634ed6b6fb37942ad93aac8720"
+    )
+    assert attachments[0]["inline_text"] == "verified-pipeline-canary\n"
+    assert attachments[0]["inline_sha256"] == attachments[0]["sha256"]
+
+
+def test_current_task_controller_attachment_is_inlined_but_cross_task_is_metadata_only(
+    worker_env,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    raw = b'{"required_output_contract":{"machine_filename":"final-review.json"}}\n'
+    conn = kb.connect()
+    try:
+        kb.store_attachment_bytes(
+            conn,
+            worker_env,
+            "github-handoff.json",
+            raw,
+            content_type="application/json",
+            uploaded_by="verified-pipeline-controller",
+        )
+        other = kb.create_task(conn, title="other", assignee="other-worker")
+        kb.store_attachment_bytes(
+            conn,
+            other,
+            "other.json",
+            b'{"private_to_other_task":true}\n',
+            content_type="application/json",
+            uploaded_by="controller",
+        )
+    finally:
+        conn.close()
+
+    current = json.loads(kt._handle_attachments({"task_id": worker_env}))[
+        "attachments"
+    ]
+    handoff = next(item for item in current if item["filename"] == "github-handoff.json")
+    assert handoff["inline_text"] == raw.decode()
+    assert handoff["inline_sha256"] == hashlib.sha256(raw).hexdigest()
+
+    cross_task = json.loads(kt._handle_attachments({"task_id": other}))["attachments"]
+    assert len(cross_task) == 1
+    assert "inline_text" not in cross_task[0]
+    assert "inline_sha256" not in cross_task[0]
+
+
+def test_current_task_attachment_inline_budget_is_bounded_across_response(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    first = b"a" * (40 * 1024)
+    second = b"b" * (40 * 1024)
+    conn = kb.connect()
+    try:
+        for filename, raw in (("first.txt", first), ("second.txt", second)):
+            kb.store_attachment_bytes(
+                conn,
+                worker_env,
+                filename,
+                raw,
+                content_type="text/plain",
+                uploaded_by="controller",
+            )
+    finally:
+        conn.close()
+
+    rendered = kt._handle_attachments({"task_id": worker_env})
+    assert len(rendered.encode("utf-8")) <= 64 * 1024
+    attachments = json.loads(rendered)["attachments"]
+    inlined = [item for item in attachments if "inline_text" in item]
+    assert len(inlined) == 1
+    assert len(inlined[0]["inline_text"].encode()) == 40 * 1024
+
+
+@pytest.mark.parametrize(
+    ("filename", "raw", "inline"),
+    [
+        ("ascii.txt", b"a" * (64 * 1024), False),
+        ("multibyte.txt", "\u20ac".encode() * 20_000, False),
+        ("controls.txt", b"\x00\n\t" * 20_000, False),
+        ("empty.txt", b"", True),
+        ("invalid.bin", b"\xff\xfe", False),
+        ("oversized.txt", b"a" * (64 * 1024 + 1), False),
+    ],
+)
+def test_attachment_response_cap_handles_encodings_and_boundaries(
+    worker_env, filename, raw, inline
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.store_attachment_bytes(conn, worker_env, filename, raw, uploaded_by="controller")
+    finally:
+        conn.close()
+    rendered = kt._handle_attachments({"task_id": worker_env})
+    assert len(rendered.encode("utf-8")) <= 64 * 1024
+    item = json.loads(rendered)["attachments"][0]
+    assert ("inline_text" in item) is inline
+
+
+def test_attachment_response_cap_is_final_serialized_budget(worker_env):
+    """The exact non-empty boundary is admitted and its next byte is excluded."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        attachment_id = kb.store_attachment_bytes(conn, worker_env, "boundary.txt", b"", uploaded_by="controller")
+        att = kb.list_attachments(conn, worker_env)[0]
+        path = Path(att.stored_path)
+        # Keep the admitted metadata in sync while finding the complete JSON boundary.
+        low, high = 0, 64 * 1024
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            raw = b"x" * midpoint
+            path.write_bytes(raw)
+            conn.execute(
+                "UPDATE task_attachments SET size = ?, sha256 = ? WHERE id = ?",
+                (midpoint, hashlib.sha256(raw).hexdigest(), attachment_id),
+            )
+            conn.commit()
+            if "inline_text" in json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"][0]:
+                low = midpoint
+            else:
+                high = midpoint - 1
+        assert low > 0
+        path.write_bytes(b"x" * low)
+        conn.execute(
+            "UPDATE task_attachments SET size = ?, sha256 = ? WHERE id = ?",
+            (low, hashlib.sha256(b"x" * low).hexdigest(), attachment_id),
+        )
+        conn.commit()
+        admitted = kt._handle_attachments({"task_id": worker_env})
+        admitted_item = json.loads(admitted)["attachments"][0]
+        assert len(admitted.encode("utf-8")) <= 64 * 1024
+        assert admitted_item["inline_text"] == "x" * low
+        path.write_bytes(b"x" * (low + 1))
+        conn.execute(
+            "UPDATE task_attachments SET size = ?, sha256 = ? WHERE id = ?",
+            (low + 1, hashlib.sha256(b"x" * (low + 1)).hexdigest(), attachment_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    rendered = kt._handle_attachments({"task_id": worker_env})
+    assert len(rendered.encode("utf-8")) <= 64 * 1024
+    assert "inline_text" not in json.loads(rendered)["attachments"][0]
+
+
+def test_attachment_without_o_nofollow_never_opens_final_symlink(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.store_attachment_bytes(conn, worker_env, "fallback.txt", b"original!", uploaded_by="controller")
+        att = kb.list_attachments(conn, worker_env)[0]
+    finally:
+        conn.close()
+    path = Path(att.stored_path)
+    target = path.with_name("fallback-target.txt")
+    target.write_bytes(b"redirect!")
+    path.unlink()
+    path.symlink_to(target)
+    monkeypatch.delattr(os, "O_NOFOLLOW")
+
+    def target_must_not_be_opened(*args, **kwargs):
+        raise AssertionError("attachment open must fail closed without O_NOFOLLOW")
+
+    monkeypatch.setattr(os, "open", target_must_not_be_opened)
+    item = json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"][0]
+    assert "inline_text" not in item
+    assert "inline_sha256" not in item
+
+
+def test_null_digest_attachment_is_metadata_only_without_open(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        attachment_id = kb.store_attachment_bytes(conn, worker_env, "torn.txt", b"A" * 16, uploaded_by="controller")
+        conn.execute("UPDATE task_attachments SET sha256 = NULL WHERE id = ?", (attachment_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    def must_not_open(*args, **kwargs):
+        raise AssertionError("null-digest attachment must not be opened")
+
+    monkeypatch.setattr(os, "open", must_not_open)
+    item = json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"][0]
+    assert "inline_text" not in item
+    assert "inline_sha256" not in item
+
+
+def test_invalid_digest_attachment_is_metadata_only_without_open(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        attachment_id = kb.store_attachment_bytes(
+            conn, worker_env, "invalid-digest.txt", b"controller input", uploaded_by="controller"
+        )
+        conn.execute("UPDATE task_attachments SET sha256 = ? WHERE id = ?", ("invalid", attachment_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(os, "open", lambda *args: pytest.fail("invalid digest must not open"))
+    item = json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"][0]
+    assert "inline_text" not in item
+    assert "inline_sha256" not in item
+
+
+def test_stable_null_digest_attachment_is_metadata_only(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    raw = b"stable controller input\n"
+    conn = kb.connect()
+    try:
+        attachment_id = kb.store_attachment_bytes(conn, worker_env, "stable.txt", raw, uploaded_by="controller")
+        conn.execute("UPDATE task_attachments SET sha256 = NULL WHERE id = ?", (attachment_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    item = json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"][0]
+    assert "inline_text" not in item
+    assert "inline_sha256" not in item
+
+
+def test_admitted_digest_mutation_is_metadata_only(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    original = b"original!"
+    conn = kb.connect()
+    try:
+        attachment_id = kb.store_attachment_bytes(conn, worker_env, "admitted.txt", original, uploaded_by="controller")
+        conn.execute(
+            "UPDATE task_attachments SET sha256 = ? WHERE id = ?",
+            (hashlib.sha256(original).hexdigest(), attachment_id),
+        )
+        conn.commit()
+        att = kb.list_attachments(conn, worker_env)[0]
+    finally:
+        conn.close()
+    Path(att.stored_path).write_bytes(b"mutated!")
+    item = json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"][0]
+    assert "inline_text" not in item
+    assert "inline_sha256" not in item
+
+
+def test_admitted_digest_mid_read_mutation_is_metadata_only(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    original = b"A" * 16
+    replacement = b"B" * 16
+    conn = kb.connect()
+    try:
+        kb.store_attachment_bytes(conn, worker_env, "mid-read.txt", original, uploaded_by="controller")
+        att = kb.list_attachments(conn, worker_env)[0]
+    finally:
+        conn.close()
+    path = Path(att.stored_path)
+    original_read = os.read
+    mutated = False
+
+    def mutate_after_partial_read(fd, size):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            chunk = original_read(fd, min(size, 4))
+            path.write_bytes(replacement)
+            return chunk
+        return original_read(fd, size)
+
+    monkeypatch.setattr(os, "read", mutate_after_partial_read)
+    item = json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"][0]
+    assert mutated is True
+    assert "inline_text" not in item
+    assert "inline_sha256" not in item
+
+
+@pytest.mark.parametrize("column", ["content_type", "filename", "stored_path"])
+def test_attachment_long_metadata_fields_return_bounded_error(worker_env, column):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        attachment_id = kb.store_attachment_bytes(conn, worker_env, "small.txt", b"ok", uploaded_by="controller")
+        conn.execute(
+            f"UPDATE task_attachments SET {column} = ? WHERE id = ?",
+            ("x" * (64 * 1024), attachment_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    rendered = kt._handle_attachments({"task_id": worker_env})
+    assert len(rendered.encode("utf-8")) <= 64 * 1024
+    assert "error" in json.loads(rendered)
+
+
+def test_attachment_read_is_fail_closed_for_symlink_digest_and_mutation(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        kb.store_attachment_bytes(conn, worker_env, "race.txt", b"original", uploaded_by="controller")
+        att = kb.list_attachments(conn, worker_env)[0]
+    finally:
+        conn.close()
+    path = Path(att.stored_path)
+    path.unlink()
+    path.symlink_to(path.with_name("target.txt"))
+    path.with_name("target.txt").write_text("redirect", encoding="utf-8")
+    assert "inline_text" not in json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"][0]
+
+    path.unlink()
+    path.write_bytes(b"original")
+    original_read = os.read
+    replaced = False
+
+    def replace_path_after_open(fd, size):
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            path.unlink()
+            path.write_bytes(b"redirect!")
+        return original_read(fd, size)
+
+    monkeypatch.setattr(os, "read", replace_path_after_open)
+    item = json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"][0]
+    assert item["inline_text"] == "original"
+
+    path.write_bytes(b"mutated!")
+    item = json.loads(kt._handle_attachments({"task_id": worker_env}))["attachments"][0]
+    assert "inline_text" not in item
+    assert "inline_sha256" not in item
+
+
+def test_docker_completion_alias_reaches_host_attachment_custody(
+    monkeypatch, worker_env
+):
+    from agent.tool_executor import _role_contract_tool_block
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    from tools import terminal_tool
+
+    workspace = kb.workspaces_root() / worker_env
+    workspace.mkdir(parents=True)
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(workspace), worker_env),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    artifact = workspace / "release-evidence.md"
+    artifact.write_bytes(b"release-evidence\n")
+
+    monkeypatch.setenv(
+        "HERMES_ROLE_CONTRACT_ALLOWED_TOOLS", json.dumps(["kanban_complete"])
+    )
+    monkeypatch.setenv("HERMES_ROLE_CONTRACT_WORKSPACE_ONLY", "1")
+    monkeypatch.setenv("HERMES_ROLE_CONTRACT_WORKSPACE_PATH", str(workspace))
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: {
+            "env_type": "docker",
+            "docker_mount_cwd_to_workspace": True,
+            "host_cwd": None,
+        },
+    )
+    terminal_tool.register_task_env_overrides(
+        "release-session",
+        {"cwd": str(workspace), "cwd_source": "session"},
+    )
+    args = {
+        "summary": "bounded release evidence complete",
+        "artifacts": ["/workspace/release-evidence.md"],
+    }
+
+    assert _role_contract_tool_block(
+        "kanban_complete", args, task_id="release-session"
+    ) is None
+    assert json.loads(kt._handle_complete(args))["ok"] is True
+    attachments = json.loads(kt._handle_attachments({"task_id": worker_env}))[
+        "attachments"
+    ]
+    assert [(item["filename"], item["sha256"]) for item in attachments] == [
+        (
+            "release-evidence.md",
+            "b31406508be51f8f026653c3fd4257b515f29640bb2c636b15e472d34d628934",
+        )
+    ]
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):

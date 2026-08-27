@@ -1329,6 +1329,7 @@ class Attachment:
     stored_path: str
     content_type: Optional[str]
     size: int
+    sha256: Optional[str]
     uploaded_by: Optional[str]
     created_at: int
 
@@ -4220,6 +4221,7 @@ def store_attachment_bytes(
             stored_path=str(dest_path.resolve()),
             content_type=content_type,
             size=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
             uploaded_by=uploaded_by,
         )
     except Exception:
@@ -4240,18 +4242,26 @@ def add_attachment(
     stored_path: str,
     content_type: Optional[str] = None,
     size: int = 0,
+    sha256: Optional[str] = None,
     uploaded_by: Optional[str] = None,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
     The caller is responsible for writing the blob to ``stored_path``
     first (under :func:`task_attachments_dir`); this only persists the
-    metadata row and appends an ``attached`` event.
+    metadata row and appends an ``attached`` event. ``sha256`` is optional
+    for legacy/external rows, but when supplied must be a canonical SHA-256
+    hex digest. Callers that persist bytes through :func:`store_attachment_bytes`
+    always receive a digest-bound row.
     """
     if not filename or not filename.strip():
         raise ValueError("attachment filename is required")
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
+    if sha256 is not None and (
+        not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+    ):
+        raise ValueError("attachment sha256 must be a lowercase SHA-256 hex digest")
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
@@ -4260,14 +4270,15 @@ def add_attachment(
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
             "INSERT INTO task_attachments "
-            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(task_id, filename, stored_path, content_type, size, sha256, uploaded_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 filename.strip(),
                 stored_path,
                 content_type,
                 int(size),
+                sha256,
                 uploaded_by,
                 now,
             ),
@@ -4294,6 +4305,7 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
             stored_path=r["stored_path"],
             content_type=r["content_type"],
             size=r["size"] or 0,
+            sha256=r["sha256"] if "sha256" in r.keys() else None,
             uploaded_by=r["uploaded_by"],
             created_at=r["created_at"],
         )
@@ -4314,6 +4326,7 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
         stored_path=r["stored_path"],
         content_type=r["content_type"],
         size=r["size"] or 0,
+        sha256=r["sha256"] if "sha256" in r.keys() else None,
         uploaded_by=r["uploaded_by"],
         created_at=r["created_at"],
     )

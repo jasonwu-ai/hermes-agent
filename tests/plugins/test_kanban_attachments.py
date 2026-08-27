@@ -12,9 +12,11 @@ The plugin router is attached to a bare FastAPI app — same approach as
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
 import inspect
+import json
 import os
 import sys
 from pathlib import Path
@@ -31,7 +33,7 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 
-def _load_plugin_router():
+def _load_plugin_module():
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -42,7 +44,11 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    return _load_plugin_module().router
 
 
 @pytest.fixture
@@ -345,6 +351,87 @@ def test_upload_list_download_delete_roundtrip(client):
     assert client.get(
         f"/api/plugins/kanban/tasks/{task_id}/attachments"
     ).json()["attachments"] == []
+
+
+def test_dashboard_upload_is_digest_bound_and_worker_reads_only_admitted_bytes(
+    client, kanban_home, monkeypatch
+):
+    """The real multipart route supplies the worker's admitted inline input."""
+    from tools import kanban_tools as kt
+
+    task_id = _create_task_via_api(client)
+    raw = b'{"release":"approved"}\n'
+    uploaded = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("github-handoff.json", raw, "application/json")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    attachment = uploaded.json()["attachment"]
+    expected_digest = hashlib.sha256(raw).hexdigest()
+
+    conn = kb.connect()
+    try:
+        stored = kb.get_attachment(conn, attachment["id"])
+        assert stored is not None and stored.sha256 == expected_digest
+        foreign_task = _make_task(conn, "foreign")
+        kb.store_attachment_bytes(conn, foreign_task, "foreign.json", b'{"foreign":true}\n')
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    current = json.loads(kt._handle_attachments({"task_id": task_id}))["attachments"]
+    admitted = next(item for item in current if item["id"] == attachment["id"])
+    assert admitted["inline_text"] == raw.decode("utf-8")
+    assert admitted["inline_sha256"] == expected_digest
+
+    foreign = json.loads(kt._handle_attachments({"task_id": foreign_task}))["attachments"]
+    assert "inline_text" not in foreign[0]
+
+    Path(attachment["stored_path"]).write_bytes(b'{"release":"mutated"}\n')
+    mutated = json.loads(kt._handle_attachments({"task_id": task_id}))["attachments"]
+    assert "inline_text" not in next(item for item in mutated if item["id"] == attachment["id"])
+
+
+@pytest.mark.parametrize("error", [RuntimeError("stream failed"), asyncio.CancelledError()])
+def test_dashboard_upload_stream_failure_removes_partial_blob_and_metadata(
+    kanban_home, error
+):
+    class PartialThenRaises:
+        filename = "partial.txt"
+        content_type = "text/plain"
+
+        def __init__(self):
+            self.reads = 0
+
+        async def read(self, _size):
+            self.reads += 1
+            if self.reads == 1:
+                return b"partial"
+            raise error
+
+    conn = kb.connect()
+    try:
+        task_id = _make_task(conn)
+        event_count = len(kb.list_events(conn, task_id))
+    finally:
+        conn.close()
+
+    plugin = _load_plugin_module()
+    with pytest.raises(type(error)):
+        asyncio.run(
+            plugin.upload_task_attachment(
+                task_id, PartialThenRaises(), board=None, uploaded_by=None
+            )
+        )
+
+    conn = kb.connect()
+    try:
+        assert kb.list_attachments(conn, task_id) == []
+        assert len(kb.list_events(conn, task_id)) == event_count
+    finally:
+        conn.close()
+    task_dir = kb.task_attachments_dir(task_id)
+    assert not any(task_dir.iterdir())
 
 
 def test_upload_sanitizes_traversal_filename(client):

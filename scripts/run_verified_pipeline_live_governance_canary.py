@@ -22,6 +22,7 @@ import time
 from typing import Any
 
 import psutil
+import yaml
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -58,10 +59,10 @@ Produce a validated, bounded four-stage implementation plan for a disposable tex
 ## Required plan DAG
 Use exactly these implementation profiles and no Validator:
 
-1. `02-builder` — create a disposable `canary.txt` containing exactly `verified-pipeline-canary\\n`; workspace `scratch`.
-2. `09-test` — verify exact bytes, file count, and SHA-256 receipt from Builder; depends on Builder; workspace `scratch`.
-3. `06-integration` — verify the tested candidate identity and prepare an integration receipt without external effects; depends on Test; workspace `scratch`.
-4. `08-release` — verify all receipts and produce release evidence only, explicitly stopping before merge/deploy/publish; depends on Integration; workspace `scratch`.
+1. `02-builder` — create a disposable `canary.txt` containing exactly `verified-pipeline-canary\\n`, then declare that file through `kanban_complete(artifacts=[...])`; workspace `scratch`. Builder has only file and Kanban tools, so its task MUST NOT require Builder to calculate a hash or create a separate hash receipt. The controller independently reopens the durable completion attachment and computes its SHA-256.
+2. `09-test` — use `kanban_show` plus `kanban_attachments` on the parent Builder task to verify exactly one completion attachment named `canary.txt`, size 25, and SHA-256 `28485e7e6a194d816d44d708c6903329f7c09d634ed6b6fb37942ad93aac8720`; produce an attached test receipt that records those observed attachment metadata. Test has only file and Kanban tools and MUST NOT be asked to calculate a hash; depends on Builder; workspace `scratch`.
+3. `06-integration` — use `kanban_show` plus `kanban_attachments` on the parent Test task to verify the attached test receipt identifies the same expected canary digest, then produce an attached integration receipt without external effects; depends on Test; workspace `scratch`.
+4. `08-release` — verify all controller-provided receipts and produce release evidence only, explicitly stopping before merge/deploy/publish; depends on Integration; workspace `scratch`.
 
 Use stable task ids `build-canary`, `test-canary`, `integrate-canary`, and `release-evidence`; set `release-evidence` as `final_task_id`.
 
@@ -91,6 +92,49 @@ def _copy_file(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
     destination.chmod(0o600)
+
+
+def _project_contract_toolsets(profile_home: Path, profile: str) -> None:
+    """Enable the candidate contract's toolsets in one disposable profile copy.
+
+    Live profile configuration is an input to the canary, not its authority
+    source.  The source-controlled role contract defines the exact canary
+    ceiling, so the disposable projection must make that ceiling reachable
+    without mutating the live profile or enabling anything outside it.
+    """
+    from hermes_cli.role_contract import load_role_contract
+
+    config_path = profile_home / "config.yaml"
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"profile config must be a mapping: {profile}")
+    contract = load_role_contract(profile_home, profile, required=True)
+    assert contract is not None
+
+    platform_toolsets = payload.setdefault("platform_toolsets", {})
+    if not isinstance(platform_toolsets, dict):
+        raise RuntimeError(f"profile platform_toolsets must be a mapping: {profile}")
+    cli_toolsets = platform_toolsets.setdefault("cli", [])
+    if not isinstance(cli_toolsets, list) or not all(isinstance(item, str) for item in cli_toolsets):
+        raise RuntimeError(f"profile CLI toolsets must be a string list: {profile}")
+    for toolset in contract.allowed_toolsets:
+        if toolset not in cli_toolsets:
+            cli_toolsets.append(toolset)
+
+    agent = payload.setdefault("agent", {})
+    if not isinstance(agent, dict):
+        raise RuntimeError(f"profile agent config must be a mapping: {profile}")
+    disabled = agent.setdefault("disabled_toolsets", [])
+    if not isinstance(disabled, list) or not all(isinstance(item, str) for item in disabled):
+        raise RuntimeError(f"profile disabled_toolsets must be a string list: {profile}")
+    requested = set(contract.allowed_toolsets)
+    agent["disabled_toolsets"] = [item for item in disabled if item not in requested]
+
+    config_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
 
 
 def _validated_credential_auth(source_home: Path) -> Path:
@@ -133,11 +177,18 @@ def _validated_credential_auth(source_home: Path) -> Path:
 def _snapshot_profiles(
     runtime_home: Path,
     credential_auth: Path | None = None,
+    *,
+    active_profiles: tuple[str, ...] = GOVERNANCE_PROFILES,
 ) -> dict[str, Any]:
+    if not set(GOVERNANCE_PROFILES).issubset(active_profiles):
+        raise RuntimeError("active profile snapshot must include every governance profile")
+    unknown = set(active_profiles) - set(GOVERNANCE_PROFILES) - set(MANDATORY_CONTRACT_PROFILES)
+    if unknown:
+        raise RuntimeError(f"unsupported active profile snapshot: {sorted(unknown)}")
     profiles_root = runtime_home / "profiles"
     profiles_root.mkdir(parents=True, mode=0o700)
-    manifest: dict[str, Any] = {"profiles": {}, "credential_files": []}
-    for profile in GOVERNANCE_PROFILES:
+    manifest: dict[str, Any] = {"profiles": {}}
+    for profile in active_profiles:
         live = LIVE_PROFILES_ROOT / profile
         target = profiles_root / profile
         target.mkdir(mode=0o700)
@@ -148,15 +199,16 @@ def _snapshot_profiles(
                 _copy_file(source, target / name)
         if credential_auth is not None:
             _copy_file(credential_auth, target / "auth.json")
-            auth_target = str(target / "auth.json")
-            if auth_target not in manifest["credential_files"]:
-                manifest["credential_files"].append(auth_target)
         overlay = OVERLAYS / profile
         _copy_file(overlay / "ROLE_CONTRACT.md", target / "ROLE_CONTRACT.md")
-        shutil.copytree(overlay / "skills", target / "skills")
-        for path in (target / "skills").rglob("*"):
-            if path.is_file():
-                path.chmod(0o600)
+        if profile in MANDATORY_CONTRACT_PROFILES:
+            _project_contract_toolsets(target, profile)
+        overlay_skills = overlay / "skills"
+        if overlay_skills.is_dir():
+            shutil.copytree(overlay_skills, target / "skills")
+            for path in (target / "skills").rglob("*"):
+                if path.is_file():
+                    path.chmod(0o600)
         manifest["profiles"][profile] = {
             "contract_sha256": _sha256(target / "ROLE_CONTRACT.md"),
             "config_sha256": _sha256(target / "config.yaml"),
@@ -166,6 +218,8 @@ def _snapshot_profiles(
             },
         }
     for profile in MANDATORY_CONTRACT_PROFILES:
+        if profile in active_profiles:
+            continue
         source = OVERLAYS / profile / "ROLE_CONTRACT.md"
         if not source.is_file():
             raise RuntimeError(f"mandatory candidate role contract missing: {profile}")
@@ -427,11 +481,11 @@ def main() -> int:
         if args.credential_source_home is not None:
             source_home = args.credential_source_home.expanduser().absolute()
             credential_auth = _validated_credential_auth(source_home)
-            report["credential_source_sha256"] = _sha256(credential_auth)
-        report["profile_snapshot"] = _snapshot_profiles(
+        profile_snapshot = _snapshot_profiles(
             runtime_home,
             credential_auth=credential_auth,
         )
+        report["profile_snapshot"] = {"profiles": profile_snapshot["profiles"]}
         os.environ.update(
             {
                 "HERMES_HOME": str(runtime_home),

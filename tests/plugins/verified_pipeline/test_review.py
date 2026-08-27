@@ -514,6 +514,11 @@ def test_new_da_request_exposes_calibrated_score_contract(tmp_path):
     assert da_request["finding_contract"]["fields"] == list(
         validators.DA_FINDING_FIELDS
     )
+    assert "decision_question must be null" in da_request["minimum_standard"]
+    assert "unless this is a final-round REVISE" in da_request["minimum_standard"]
+    assert "final-round REVISE requires escalate_to_jason true" in da_request[
+        "minimum_standard"
+    ]
     assert validators.calibrated_score([], da_request["risk_policy"]) == 100
     tampered = json.loads(json.dumps(da_request))
     tampered["finding_contract"]["fields"].append("legacy_alias")
