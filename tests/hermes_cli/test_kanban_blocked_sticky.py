@@ -29,7 +29,11 @@ landed via #28754 / #28781 ahead of this fix.
 
 from __future__ import annotations
 
+import json
+import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -46,6 +50,141 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
+
+
+# ---------------------------------------------------------------------------
+# Create-time controller holds must be sticky
+# ---------------------------------------------------------------------------
+
+
+def test_initial_block_holds_until_explicit_unblock(kanban_home: Path) -> None:
+    """A controller can create, seal, then arm a task without a dispatch race."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="seal before arm",
+            assignee="builder",
+            initial_status="blocked",
+            idempotency_key="controller-hold-v1",
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+        assert kb.claim_task(conn, tid) is None
+
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+        assert [row["kind"] for row in events] == ["created", "blocked"]
+        hold = json.loads(events[1]["payload"])
+        assert hold == {
+            "initial": True,
+            "kind": "needs_input",
+            "reason": "created with initial_status=blocked",
+            "source_status": "ready",
+        }
+
+        # Simulate arbitrarily many dispatcher reconciliation ticks while the
+        # controller writes and validates the task-bound package.
+        for _ in range(5):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, tid).status == "blocked"
+            assert kb.claim_task(conn, tid) is None
+
+        # Explicit arm is the only transition that makes the task claimable.
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert claimed.id == tid
+        assert kb.claim_task(conn, tid) is None
+
+
+def test_initial_block_idempotent_replay_does_not_duplicate_hold(
+    kanban_home: Path,
+) -> None:
+    """A restarted supervisor recovers one held card and one hold event."""
+    with kb.connect() as conn:
+        kwargs = {
+            "title": "replay-safe held correction",
+            "assignee": "builder",
+            "initial_status": "blocked",
+            "idempotency_key": "correction:DA-R1-001:v1",
+        }
+        first = kb.create_task(conn, **kwargs)
+        replay = kb.create_task(conn, **kwargs)
+
+        assert replay == first
+        assert kb.get_task(conn, first).status == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE idempotency_key = ?",
+            (kwargs["idempotency_key"],),
+        ).fetchone()["n"] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked'",
+            (first,),
+        ).fetchone()["n"] == 1
+
+
+def test_initial_block_create_is_atomic_against_concurrent_recompute(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconciler cannot observe or promote a half-created held task."""
+    created_written = threading.Event()
+    release_create = threading.Event()
+    original_append_event = kb._append_event
+
+    def pause_after_created(conn, task_id, kind, payload=None, *, run_id=None):
+        event_id = original_append_event(
+            conn, task_id, kind, payload, run_id=run_id
+        )
+        if kind == "created":
+            created_written.set()
+            assert release_create.wait(timeout=5)
+        return event_id
+
+    monkeypatch.setattr(kb, "_append_event", pause_after_created)
+
+    def create_held() -> str:
+        with kb.connect() as conn:
+            return kb.create_task(
+                conn,
+                title="atomic held correction",
+                initial_status="blocked",
+            )
+
+    def reconcile() -> int:
+        with kb.connect() as conn:
+            return kb.recompute_ready(conn)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        create_future = pool.submit(create_held)
+        assert created_written.wait(timeout=5)
+
+        # The insert and both lifecycle events are one transaction. A reader
+        # sees the pre-create snapshot, never a visible task without its hold.
+        with sqlite3.connect(kb.kanban_db_path()) as reader:
+            assert reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+        reconcile_future = pool.submit(reconcile)
+        release_create.set()
+        tid = create_future.result(timeout=5)
+        assert reconcile_future.result(timeout=5) == 0
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.claim_task(conn, tid) is None
+        assert [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id",
+                (tid,),
+            ).fetchall()
+        ] == ["created", "blocked"]
 
 
 # ---------------------------------------------------------------------------
