@@ -3659,6 +3659,24 @@ def create_task(
                         "expected_role_contract_sha256": expected_role_contract_sha256,
                     },
                 )
+                if task_status == "blocked":
+                    # ``initial_status='blocked'`` is a controller-owned hold,
+                    # not a transient circuit-breaker state.  Persist the same
+                    # durable signal used by an explicit ``kanban_block`` call
+                    # inside the create transaction so ``recompute_ready``
+                    # cannot race package sealing and dispatch the task before
+                    # the controller explicitly arms it via ``unblock_task``.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "created with initial_status=blocked",
+                            "kind": "needs_input",
+                            "source_status": "ready",
+                            "initial": True,
+                        },
+                    )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
@@ -4736,16 +4754,17 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return True when ``task_id`` has a deliberate sticky block.
 
     A ``blocked`` status can come from two very different sources:
 
-    * **Worker- or operator-initiated** — a worker called
+    * **Controller-, worker-, or operator-initiated** — a controller created
+      the task with ``initial_status='blocked'``, a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
       ``hermes kanban block <id>``).  This is a deliberate handoff that
       should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
+      and blocked create path emit a ``"blocked"`` event row in
+      ``task_events``.
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
@@ -4815,9 +4834,9 @@ def recompute_ready(
     blocked purely by a parent dependency unblocks itself when the
     parent completes), *except* in two cases:
 
-    1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
-       ``kanban_unblock`` (#28712).
+    1. The most recent block event was a controller/worker/operator-initiated
+       blocked create or ``kanban_block`` — those stay blocked until an
+       explicit ``kanban_unblock`` (#28712).
 
     2. The task's ``consecutive_failures`` has reached the effective
        failure limit.  This prevents infinite retry loops when a task
@@ -4846,9 +4865,9 @@ def recompute_ready(
             task_id = row["id"]
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for explicit human intervention — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
+                # A controller, worker, or operator deliberately held this
+                # task — do not silently auto-recover. ``unblock_task`` is the
+                # normal arm/exit path (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
             parents = conn.execute(

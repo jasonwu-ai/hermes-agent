@@ -456,6 +456,40 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_initial_block_is_a_sticky_idempotent_hold(worker_env):
+    """The public create tool supports race-free controller seal-before-arm."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    args = {
+        "title": "held correction",
+        "assignee": "peer",
+        "initial_status": "blocked",
+        "idempotency_key": "tool-held-correction-v1",
+    }
+    first = json.loads(kt._handle_create(args))
+    replay = json.loads(kt._handle_create(args))
+
+    assert first["ok"] is True
+    assert first["status"] == "blocked"
+    assert replay["task_id"] == first["task_id"]
+    assert replay["status"] == "blocked"
+
+    conn = kb.connect()
+    try:
+        tid = first["task_id"]
+        assert kb.recompute_ready(conn) == 0
+        assert kb.claim_task(conn, tid) is None
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked'",
+            (tid,),
+        ).fetchone()["n"] == 1
+    finally:
+        conn.close()
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
