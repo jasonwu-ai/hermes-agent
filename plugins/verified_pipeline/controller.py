@@ -119,6 +119,148 @@ def _sha256(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+# This compiler deliberately has no dependency on the controller's durable
+# facilities below.  Its inputs are already-custodied bytes supplied by the
+# caller; it only produces an inert decision document.
+def _admission_json(raw: bytes) -> Any:
+    if not isinstance(raw, bytes):
+        raise TypeError("admission inputs must be bytes")
+
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate member")
+            result[key] = value
+        return result
+
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+
+
+def _admission_identifier(value: Any) -> bool:
+    return isinstance(value, str) and bool(_ID_RE.fullmatch(value))
+
+
+def _admission_positive(value: Any, *, zero_allowed: bool = False) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and (value >= 0 if zero_allowed else value > 0)
+
+
+def _admission_exact(value: Any, keys: set[str], schema: str) -> bool:
+    return isinstance(value, dict) and set(value) == keys and value.get("schema") == schema
+
+
+def _admission_emit(status: str, code: str, **fields: Any) -> bytes:
+    return json.dumps(
+        {"schema": "planner-admission-decision/v1", "status": status, "code": code, **fields},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _admission_validate_metadata(value: Mapping[str, Any]) -> str | None:
+    keys = {"authority_id", "authority_expires_at", "evaluated_at", "attempt", "attempt_budget"}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        return "CONTROLLER_METADATA_INVALID"
+    if not _admission_identifier(value["authority_id"]):
+        return "CONTROLLER_METADATA_INVALID"
+    if not _admission_positive(value["authority_expires_at"]):
+        return "CONTROLLER_METADATA_INVALID"
+    if not _admission_positive(value["evaluated_at"], zero_allowed=True):
+        return "CONTROLLER_METADATA_INVALID"
+    if not _admission_positive(value["attempt"]) or not _admission_positive(value["attempt_budget"]):
+        return "CONTROLLER_METADATA_INVALID"
+    if value["evaluated_at"] >= value["authority_expires_at"]:
+        return "AUTHORITY_EXPIRED"
+    if value["attempt"] > value["attempt_budget"]:
+        return "ATTEMPT_BUDGET_EXCEEDED"
+    return None
+
+
+def _admission_cycle(tasks: list[dict[str, Any]]) -> bool:
+    edges = {task["id"]: task["depends_on"] for task in tasks}
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> bool:
+        if node in visiting:
+            return True
+        if node in visited:
+            return False
+        visiting.add(node)
+        cyclic = any(visit(parent) for parent in edges[node])
+        visiting.remove(node)
+        visited.add(node)
+        return cyclic
+
+    return any(visit(node) for node in edges)
+
+
+def compile_admission(
+    exact_spec_bytes: bytes,
+    exact_plan_bytes: bytes,
+    exact_policy_bytes: bytes,
+    exact_schema_bytes: bytes,
+    exact_profile_inventory_bytes: bytes,
+    optional_exact_predecessor_bytes: bytes | None,
+    controller_metadata: Mapping[str, Any],
+) -> bytes:
+    """Compile exact Planner bytes to a canonical, side-effect-free DAG decision."""
+    try:
+        spec = _admission_json(exact_spec_bytes)
+        plan = _admission_json(exact_plan_bytes)
+        policy = _admission_json(exact_policy_bytes)
+        input_schema = _admission_json(exact_schema_bytes)
+        profiles = _admission_json(exact_profile_inventory_bytes)
+        predecessor = None if optional_exact_predecessor_bytes is None else _admission_json(optional_exact_predecessor_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return _admission_emit("NON_PASS", "INVALID_JSON")
+    if optional_exact_predecessor_bytes is not None and not isinstance(optional_exact_predecessor_bytes, bytes):
+        raise TypeError("optional predecessor must be bytes or None")
+    metadata_code = _admission_validate_metadata(controller_metadata)
+    if metadata_code:
+        return _admission_emit("NON_PASS", metadata_code)
+    if not _admission_exact(spec, {"schema", "specification_id", "revision"}, "planner-spec/v1") or not _admission_identifier(spec.get("specification_id")) or not _admission_positive(spec.get("revision")):
+        return _admission_emit("NON_PASS", "SPEC_INVALID")
+    expected_schemas = {"spec": "planner-spec/v1", "plan": "planner-plan/v1", "policy": "planner-policy/v1", "profiles": "profile-inventory/v1", "predecessor": "planner-predecessor/v1"}
+    if not _admission_exact(input_schema, {"schema", "accepted"}, "planner-compiler-input-schema/v1") or input_schema.get("accepted") != expected_schemas:
+        return _admission_emit("NON_PASS", "INPUT_SCHEMA_INVALID")
+    policy_keys = {"schema", "allowed_profiles", "min_timeout_seconds", "max_timeout_seconds", "required_terminal_profile"}
+    if not _admission_exact(policy, policy_keys, "planner-policy/v1") or not _admission_positive(policy.get("min_timeout_seconds")) or not _admission_positive(policy.get("max_timeout_seconds")) or policy["min_timeout_seconds"] > policy["max_timeout_seconds"] or not _admission_identifier(policy.get("required_terminal_profile")) or not isinstance(policy.get("allowed_profiles"), dict) or not policy["allowed_profiles"]:
+        return _admission_emit("NON_PASS", "POLICY_INVALID")
+    if not _admission_exact(profiles, {"schema", "profiles"}, "profile-inventory/v1") or not isinstance(profiles.get("profiles"), dict) or not profiles["profiles"]:
+        return _admission_emit("NON_PASS", "PROFILE_INVENTORY_INVALID")
+    inventory = profiles["profiles"]
+    for name, receipt in inventory.items():
+        if not _admission_identifier(name) or not isinstance(receipt, dict) or set(receipt) != {"capabilities"} or not isinstance(receipt["capabilities"], list) or not receipt["capabilities"] or any(not _admission_identifier(cap) for cap in receipt["capabilities"]) or len(set(receipt["capabilities"])) != len(receipt["capabilities"]):
+            return _admission_emit("NON_PASS", "PROFILE_INVENTORY_INVALID")
+    for name, capabilities in policy["allowed_profiles"].items():
+        if not _admission_identifier(name) or not isinstance(capabilities, list) or not capabilities or any(not _admission_identifier(cap) for cap in capabilities) or len(set(capabilities)) != len(capabilities):
+            return _admission_emit("NON_PASS", "POLICY_INVALID")
+    plan_keys = {"schema", "specification_id", "revision", "tasks"}
+    if not _admission_exact(plan, plan_keys, "planner-plan/v1") or plan.get("specification_id") != spec["specification_id"] or plan.get("revision") != spec["revision"] or not isinstance(plan.get("tasks"), list) or not plan["tasks"]:
+        return _admission_emit("NON_PASS", "PLAN_INVALID")
+    tasks = plan["tasks"]
+    task_keys = {"id", "profile", "capabilities", "timeout_seconds", "depends_on", "terminal"}
+    task_ids: set[str] = set()
+    for task in tasks:
+        if not isinstance(task, dict) or set(task) != task_keys or not _admission_identifier(task.get("id")) or task["id"] in task_ids or not _admission_identifier(task.get("profile")) or not isinstance(task["capabilities"], list) or not task["capabilities"] or any(not _admission_identifier(cap) for cap in task["capabilities"]) or len(set(task["capabilities"])) != len(task["capabilities"]) or not _admission_positive(task.get("timeout_seconds")) or not isinstance(task["depends_on"], list) or any(not _admission_identifier(dep) for dep in task["depends_on"]) or len(set(task["depends_on"])) != len(task["depends_on"]) or not isinstance(task["terminal"], bool):
+            return _admission_emit("NON_PASS", "PLAN_INVALID")
+        task_ids.add(task["id"])
+    for task in tasks:
+        if any(dep not in task_ids for dep in task["depends_on"]) or task["timeout_seconds"] < policy["min_timeout_seconds"] or task["timeout_seconds"] > policy["max_timeout_seconds"] or task["profile"] not in inventory or task["profile"] not in policy["allowed_profiles"] or not set(task["capabilities"]).issubset(inventory[task["profile"]]["capabilities"]) or not set(task["capabilities"]).issubset(policy["allowed_profiles"][task["profile"]]):
+            return _admission_emit("NON_PASS", "PLAN_INVALID")
+    if _admission_cycle(tasks):
+        return _admission_emit("NON_PASS", "PLAN_INVALID")
+    terminals = [task for task in tasks if task["terminal"]]
+    if len(terminals) != 1 or terminals[0]["profile"] != policy["required_terminal_profile"]:
+        return _admission_emit("NON_PASS", "PLAN_INVALID")
+    if predecessor is not None and (not _admission_exact(predecessor, {"schema", "disposition", "specification_id", "revision", "next_revision"}, "planner-predecessor/v1") or predecessor.get("disposition") != "REVISE" or predecessor.get("specification_id") != spec["specification_id"] or not _admission_positive(predecessor.get("revision"), zero_allowed=True) or not _admission_positive(predecessor.get("next_revision")) or predecessor["revision"] + 1 != predecessor["next_revision"] or predecessor["next_revision"] != spec["revision"]):
+        return _admission_emit("NON_PASS", "PREDECESSOR_INVALID")
+    return _admission_emit("PASS", "ADMISSION_ACCEPTED", specification_id=spec["specification_id"], revision=spec["revision"], dag={"tasks": tasks}, controller=dict(controller_metadata), input_sha256={"spec": _sha256(exact_spec_bytes), "plan": _sha256(exact_plan_bytes), "policy": _sha256(exact_policy_bytes), "schema": _sha256(exact_schema_bytes), "profiles": _sha256(exact_profile_inventory_bytes), "predecessor": None if optional_exact_predecessor_bytes is None else _sha256(optional_exact_predecessor_bytes)})
+
+
 def _installed_implementation_contract(profile: str) -> dict[str, Any]:
     """Derive authority from the exact installed, hash-bound contract bytes."""
     try:
