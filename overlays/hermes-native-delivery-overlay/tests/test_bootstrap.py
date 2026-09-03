@@ -16,7 +16,7 @@ from hermes_verified_delivery import register
 from hermes_verified_delivery.contracts import ContractError, Decision, GraphSpec, canonical_bytes
 from hermes_verified_delivery.controller import (
     AuthorityStore, Controller, InjectedCrash, MaterializationConflict,
-    NativeKanbanAdapter, ReplayConflict,
+    NativeKanbanAdapter, ReplayConflict, qualification_paths,
 )
 from hermes_verified_delivery.review import (
     ReviewEnvelope, handle_submission, load_accepted_authority, render_evidence, render_review,
@@ -264,6 +264,46 @@ def test_same_key_adoption_compares_complete_native_task_contract(qualification_
     assert [(row["id"], row["status"]) for row in rows] == [(hostile_id, "blocked")]
 
 
+@pytest.mark.parametrize(("field", "hostile_value"), [
+    ("require_role_contract", 1),
+    ("expected_role_contract_sha256", "b" * 64),
+])
+def test_same_key_adoption_rejects_each_role_contract_field(
+    qualification_root: Path, field: str, hostile_value: object,
+) -> None:
+    from hermes_cli import kanban_db as kb
+
+    target = adapter(qualification_root)
+    graph = GraphSpec.from_dict({
+        "schema": "hvd-inert-graph/v1", "run_id": "run:role-contract-precreate",
+        "approval_id": "dec_role_contract_precreate",
+        "tasks": [{"key": "planner", "title": "Plan", "assignee": "planner", "parents": []}],
+    })
+    key = "hvd:run:role-contract-precreate:planner"
+    kb.init_db(target.board_db)
+    conn = kb.connect(target.board_db)
+    try:
+        task_id = kb.create_task(
+            conn, title="Plan", body=target._task_body(graph, graph.tasks[0]), assignee="planner",
+            created_by="hermes-verified-delivery", workspace_kind="scratch", parents=[],
+            idempotency_key=key, initial_status="blocked", goal_mode=False,
+            require_role_contract=False, expected_role_contract_sha256=None, project_id="",
+        )
+        with kb.write_txn(conn):
+            conn.execute(f"UPDATE tasks SET {field}=? WHERE id=?", (hostile_value, task_id))
+    finally:
+        conn.close()
+    with pytest.raises(MaterializationConflict, match=field):
+        target.materialize(graph)
+    conn = kb.connect(target.board_db)
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    finally:
+        conn.close()
+    assert row[field] == hostile_value
+    assert target.graph_counts(graph.run_id) == {"tasks": 1, "links": 0}
+
+
 def test_archived_recorded_materialization_replays_without_replacement(
     qualification_root: Path, tmp_path: Path,
 ) -> None:
@@ -405,6 +445,46 @@ def test_plugin_validates_all_qualification_paths_before_opening_any_database(
     errors = ctx.fire("on_kanban_dispatch_tick")
     assert len(errors) == 1 and "symlink" in str(errors[0])
     assert outside.read_bytes() == before
+
+
+@pytest.mark.parametrize("alias_name", [
+    "authority.db", "authority.db-wal", "authority.db-shm",
+    "board.db", "board.db-wal", "board.db-shm",
+])
+def test_qualification_rejects_database_and_sidecar_hardlinks_before_mutation(
+    qualification_root: Path, tmp_path: Path, alias_name: str,
+) -> None:
+    outside = tmp_path / "external-inode"
+    outside.write_bytes(b"external sentinel\n")
+    os.chmod(outside, 0o640)
+    before, before_mode = outside.read_bytes(), outside.stat().st_mode & 0o777
+    os.link(outside, qualification_root / alias_name)
+    with pytest.raises(ContractError, match="hard link"):
+        qualification_paths(
+            qualification_root / "authority.db", qualification_root / "board.db", qualification_root,
+        )
+    assert outside.read_bytes() == before
+    assert outside.stat().st_mode & 0o777 == before_mode
+
+
+def test_materialization_rejects_controller_lock_hardlink_before_mutation(
+    qualification_root: Path, tmp_path: Path,
+) -> None:
+    outside = tmp_path / "external-lock-inode"
+    outside.write_bytes(b"external lock sentinel\n")
+    os.chmod(outside, 0o640)
+    before, before_mode = outside.read_bytes(), outside.stat().st_mode & 0o777
+    os.link(outside, qualification_root / ".hvd-controller.lock")
+    graph = GraphSpec.from_dict({
+        "schema": "hvd-inert-graph/v1", "run_id": "run:hardlink-lock",
+        "approval_id": "dec_hardlink_lock",
+        "tasks": [{"key": "planner", "title": "Plan", "assignee": "planner", "parents": []}],
+    })
+    with pytest.raises(ContractError, match="hard link"):
+        adapter(qualification_root).materialize(graph)
+    assert outside.read_bytes() == before
+    assert outside.stat().st_mode & 0o777 == before_mode
+    assert not (qualification_root / "board.db").exists()
 
 
 def test_review_html_is_commonmark_safe_responsive_and_truthful() -> None:

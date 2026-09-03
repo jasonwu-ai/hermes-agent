@@ -1,7 +1,7 @@
 """Single-ledger authority storage and guarded native Kanban reconciliation."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -57,13 +57,36 @@ def _qualification_root(path: Path) -> Path:
     return root
 
 
+def _owned_descriptor(path: Path, label: str, flags: int) -> int | None:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ContractError(f"{label} cannot be inspected safely without no-follow support")
+    try:
+        descriptor = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ContractError(f"{label} cannot be inspected safely without following aliases") from exc
+    try:
+        entry, opened = os.lstat(path), os.fstat(descriptor)
+        identity = (entry.st_dev, entry.st_ino) == (opened.st_dev, opened.st_ino)
+        if not identity or not stat.S_ISREG(entry.st_mode) or not stat.S_ISREG(opened.st_mode):
+            raise ContractError(f"{label} must be one stable regular file")
+        if entry.st_nlink != 1 or opened.st_nlink != 1:
+            raise ContractError(f"{label} must not be a hard link or inode alias")
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
 def _confined_database(path: Path, root: Path, label: str) -> Path:
     candidate = _absolute_without_symlinks(path, label)
     if candidate.parent != root:
         raise ContractError(f"{label} must be a direct child of qualification root")
     for item in (candidate, Path(f"{candidate}-wal"), Path(f"{candidate}-shm")):
-        if item.is_symlink() or (item.exists() and not item.is_file()):
-            raise ContractError(f"{label} and sidecars must be regular files")
+        descriptor = _owned_descriptor(item, f"{label} and sidecars", os.O_RDONLY)
+        if descriptor is not None:
+            os.close(descriptor)
     return candidate
 
 
@@ -74,8 +97,9 @@ def qualification_paths(authority_db: Path, board_db: Path, root: Path) -> tuple
     if authority_db == board_db:
         raise ContractError("authority DB and board DB must be distinct")
     lock_path = _absolute_without_symlinks(root / ".hvd-controller.lock", "controller lock")
-    if lock_path.exists() and not lock_path.is_file():
-        raise ContractError("controller lock must be a regular file")
+    descriptor = _owned_descriptor(lock_path, "controller lock", os.O_RDONLY)
+    if descriptor is not None:
+        os.close(descriptor)
     return root, authority_db, board_db
 
 
@@ -89,8 +113,7 @@ class AuthorityStore:
             if self.qualification_root else Path(path)
         )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = self._connect()
-        try:
+        with closing(self._connect()) as conn:
             conn.executescript("""
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS decisions(
@@ -107,8 +130,8 @@ class AuthorityStore:
               mapping_digest TEXT NOT NULL, mapping_payload BLOB NOT NULL
             );
             """)
-        finally:
-            conn.close()
+        if self.qualification_root:
+            _confined_database(self.path, self.qualification_root, "authority DB")
         os.chmod(self.path, 0o600)
 
     def _connect(self) -> sqlite3.Connection:
@@ -120,10 +143,8 @@ class AuthorityStore:
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
-    def record_decision(
-        self, decision: Decision, *, graph: GraphSpec | None = None,
-        failpoint: str | None = None,
-    ) -> str:
+    def record_decision(self, decision: Decision, *, graph: GraphSpec | None = None,
+                        failpoint: str | None = None) -> str:
         if decision.action == "APPROVE":
             if graph is None or graph.approval_id != decision.decision_id:
                 raise ContractError("APPROVE requires its exact inert graph")
@@ -168,15 +189,12 @@ class AuthorityStore:
             conn.close()
 
     def held_intents(self) -> tuple[tuple[Decision, GraphSpec], ...]:
-        conn = self._connect()
-        try:
+        with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT decisions.payload AS decision_payload,outbox.payload AS graph_payload "
                 "FROM outbox JOIN decisions ON decisions.id=outbox.decision_id "
                 "WHERE outbox.state='HELD' ORDER BY outbox.key"
             ).fetchall()
-        finally:
-            conn.close()
         intents = []
         for row in rows:
             decision = Decision.from_dict(json.loads(bytes(row["decision_payload"])))
@@ -187,14 +205,11 @@ class AuthorityStore:
         return tuple(intents)
 
     def materialization_for(self, graph: GraphSpec) -> dict[str, str] | None:
-        conn = self._connect()
-        try:
+        with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT graph_digest,mapping_digest,mapping_payload FROM materializations WHERE run_id=?",
                 (graph.run_id,),
             ).fetchone()
-        finally:
-            conn.close()
         if row is None:
             return None
         payload = bytes(row["mapping_payload"])
@@ -230,19 +245,13 @@ class AuthorityStore:
             conn.close()
 
     def counts(self) -> dict[str, int]:
-        conn = self._connect()
-        try:
+        with closing(self._connect()) as conn:
             return {name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
                     for name in ("decisions", "outbox", "materializations")}
-        finally:
-            conn.close()
 
     def decision_payload(self, decision_id: str) -> bytes:
-        conn = self._connect()
-        try:
+        with closing(self._connect()) as conn:
             row = conn.execute("SELECT payload FROM decisions WHERE id=?", (decision_id,)).fetchone()
-        finally:
-            conn.close()
         if row is None:
             raise KeyError(decision_id)
         return bytes(row["payload"])
@@ -258,10 +267,9 @@ def _exclusive(path: Path) -> Iterator[None]:
         local = _LOCAL_LOCKS.setdefault(str(path), threading.Lock())
     with local:
         path.parent.mkdir(parents=True, exist_ok=True)
-        flags = os.O_CREAT | os.O_RDWR
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = _owned_descriptor(path, "controller lock", os.O_CREAT | os.O_RDWR)
+        if descriptor is None:
+            raise ContractError("controller lock could not be created")
         with os.fdopen(descriptor, "a+b") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             try:
@@ -298,7 +306,8 @@ class NativeKanbanAdapter:
             "tenant": None, "idempotency_key": key, "max_runtime_seconds": None,
             "skills": None, "max_retries": None, "model_override": None,
             "provider_override": None, "reasoning_effort": None, "goal_mode": 0,
-            "goal_max_turns": None, "session_id": None,
+            "goal_max_turns": None, "require_role_contract": 0, "session_id": None,
+            "expected_role_contract_sha256": None,
         }
 
     @classmethod
@@ -328,8 +337,7 @@ class NativeKanbanAdapter:
         expected_keys = {task.key for task in graph.tasks}
         if set(mapping) != expected_keys:
             raise MaterializationConflict("recorded mapping keys do not match graph")
-        conn = kb.connect(self.board_db)
-        try:
+        with closing(kb.connect(self.board_db)) as conn:
             for task in graph.topological_tasks():
                 key = f"hvd:{graph.run_id}:{task.key}"
                 row = conn.execute("SELECT * FROM tasks WHERE id=?", (mapping[task.key],)).fetchone()
@@ -339,17 +347,15 @@ class NativeKanbanAdapter:
                 parents = {mapping[parent] for parent in task.parents}
                 if set(kb.parent_ids(conn, row["id"])) != parents:
                     raise MaterializationConflict(f"parent mismatch for {key}")
-        finally:
-            conn.close()
 
     def materialize(self, graph: GraphSpec, *, failpoint: str | None = None) -> dict[str, str]:
         from hermes_cli import kanban_db as kb
         _confined_database(self.board_db, self.root, "board DB")
         with _exclusive(self.lock_path):
+            _confined_database(self.board_db, self.root, "board DB")
             kb.init_db(self.board_db)
-            conn = kb.connect(self.board_db)
             mapping: dict[str, str] = {}
-            try:
+            with closing(kb.connect(self.board_db)) as conn:
                 with kb.write_txn(conn):
                     for index, task in enumerate(graph.topological_tasks()):
                         key = f"hvd:{graph.run_id}:{task.key}"
@@ -369,7 +375,8 @@ class NativeKanbanAdapter:
                                 conn, title=task.title, body=body, assignee=task.assignee,
                                 created_by="hermes-verified-delivery", workspace_kind="scratch",
                                 parents=parents, idempotency_key=key, initial_status="blocked",
-                                goal_mode=False, project_id="",
+                                goal_mode=False, require_role_contract=False,
+                                expected_role_contract_sha256=None, project_id="",
                             )
                         mapping[task.key] = task_id
                         actual_parents = set(kb.parent_ids(conn, task_id))
@@ -378,13 +385,10 @@ class NativeKanbanAdapter:
                         if failpoint == f"after_task_{index}":
                             raise InjectedCrash(failpoint)
                 return dict(sorted(mapping.items()))
-            finally:
-                conn.close()
 
     def graph_counts(self, run_id: str) -> dict[str, int]:
         from hermes_cli import kanban_db as kb
-        conn = kb.connect(self.board_db)
-        try:
+        with closing(kb.connect(self.board_db)) as conn:
             tasks = conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ? AND status!='archived'", (f"hvd:{run_id}:%",)
             ).fetchone()[0]
@@ -393,17 +397,14 @@ class NativeKanbanAdapter:
                 (f"hvd:{run_id}:%",),
             ).fetchone()[0]
             return {"tasks": tasks, "links": links}
-        finally:
-            conn.close()
 
 
 class Controller:
     def __init__(self, store: AuthorityStore, adapter: NativeKanbanAdapter):
         self.store, self.adapter = store, adapter
 
-    def reconcile_held(
-        self, *, now: datetime | None = None, failpoint: str | None = None,
-    ) -> tuple[dict[str, str], ...]:
+    def reconcile_held(self, *, now: datetime | None = None,
+                       failpoint: str | None = None) -> tuple[dict[str, str], ...]:
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             raise ContractError("reconciliation time must be timezone-aware")
