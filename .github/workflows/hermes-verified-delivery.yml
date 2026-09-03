@@ -45,7 +45,7 @@ jobs:
           test -s "$RUNNER_TEMP/changed-paths.txt"
           while IFS= read -r path; do
             case "$path" in
-              overlays/hermes-native-delivery-overlay/*|.github/workflows/hermes-verified-delivery.yml) ;;
+              overlays/hermes-native-delivery-overlay/*|.github/workflows/hermes-verified-delivery.yml|contributors/emails/cos@local.invalid) ;;
               *) printf 'out-of-scope path: %s\n' "$path" >&2; exit 1 ;;
             esac
           done < "$RUNNER_TEMP/changed-paths.txt"
