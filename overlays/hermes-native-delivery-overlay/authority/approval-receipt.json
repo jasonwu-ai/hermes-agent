@@ -1,0 +1,85 @@
+{
+  "schema": "hermes-local-bootstrap-approval/v1",
+  "status": "ACCEPTED_LOCAL_BOOTSTRAP_V1",
+  "source": "telegram/current_authenticated_chat",
+  "actor": "current_authenticated_user",
+  "acceptance_text": "ACCEPT LOCAL BOOTSTRAP v1 SHA256 095ced65676ee3c95f39c992f30b193437eda81acb327e6764c5c64c28388f1a",
+  "accepted_at_utc": "2026-09-03T04:54:58.262332+00:00",
+  "expires_at_utc": "2026-09-17T04:54:58.262332+00:00",
+  "specification": {
+    "path": "/home/hermes/content/specs/drafts/00-cos/hermes-native-two-gate-replacement-v1.md",
+    "bytes": 17185,
+    "sha256": "095ced65676ee3c95f39c992f30b193437eda81acb327e6764c5c64c28388f1a"
+  },
+  "authority": {
+    "name": "Local Bootstrap v1",
+    "implementer": "00-cos directly with ordinary tools",
+    "workspace": "/root/hermes-native-delivery-overlay",
+    "branch": "cos/bootstrap-v1",
+    "remote_permitted": false,
+    "cash_spend_permitted": false,
+    "repair_round_limit": 2,
+    "terminal_state": "BOOTSTRAP_EVIDENCE_READY",
+    "allowed_actions": [
+      "create one new local Git repository with no remote",
+      "record exact clean public Hermes upstream pin",
+      "implement three-module source candidate plus tests templates plugin metadata and documentation",
+      "use only secret-free fixtures and disposable local or scratch Hermes homes repositories and Kanban databases",
+      "run deterministic static race replay and desktop/mobile rendering checks",
+      "create local commits on cos/bootstrap-v1",
+      "prepare exact-head independent read-only review package",
+      "correct in-scope defects for at most two bounded rounds",
+      "produce Bootstrap Evidence Packet"
+    ],
+    "excluded_actions": [
+      "legacy-pipeline dispatch or supervision",
+      "specialist-agent code mutation or genuine operational DAG execution",
+      "remote or GitHub write repository creation push PR issue tag or publication",
+      "active Hermes checkout profile or live board modification",
+      "installation or live plugin registration",
+      "gateway service or dashboard restart",
+      "credential secret or private-repository access or change",
+      "incremental cash spend",
+      "merge release deployment activation or cutover",
+      "destructive cleanup deletion archival move profile retirement cron removal or history rewrite",
+      "failed-gate waiver unbounded repair or new-module workaround"
+    ]
+  },
+  "implementation_start": {
+    "target_existed": false,
+    "public_upstream_main": "4dac5f28af54001b899c9b6fc8ba81cb58da2f0e",
+    "installed_hermes_cli": "/root/hermes-agent-v0210-29112bef/.venv/bin/hermes",
+    "installed_hermes_version": "Hermes Agent v0.21.0 (2026.8.31); upstream 21b2095d; local 53ca9a86; 10 carried commits",
+    "target_board": {
+      "name": "agentic-pipeline-items-2-8",
+      "tasks": 0,
+      "links": 0,
+      "runs": 0
+    }
+  },
+  "protected_profile_config_sha256": {
+    ".retired-06-drift": "d078a8cac6ec95a8b7774c112587e14ce08b98366e5a61be98f03f63c7d1e079",
+    "00-cos": "25f45977995d60e5c28b494bed7c81600254309cc69590fa8e4a90bafea0de83",
+    "01-ceo": "1c34323ba2896e8a8986836b5e3add6c12fcee1ef034a58c8c72e25b8099ecef",
+    "02-builder": "e939b4d52357a890b4c2870fcc557df224fb2e12883b49a51808a88379640186",
+    "03-researcher": "8673a829537d963d7ee17df84830776bd46aff0fa6741cd269f10069a6063177",
+    "04-editor": "287eb6ee0794f5b20d77e0c92eff1df3615598e7f4e48a8b5dcd594e0440b4f6",
+    "05-growth": "feb3b14f9bb31cc2dc249370663d8df9b6abfb064b359876e45a06a4a107841b",
+    "06-integration": "5811f294c0baa1961e67e0b73495caa9e470a757c9853042a369621c309741c9",
+    "07-planner": "890dc1adbac688bffa107a1398fd353fa5457ad753f8fa464b8f1c6a9805a255",
+    "08-auditor": "b0e0c1c1b2b63ea7b29ef822af5e941a310819c03faf45688dc2ae7a93c7114d",
+    "08-release": "d3f2b3f8f85eb2f4b10a33846d0d4a275974982665d537062a603c2e2412e31c",
+    "09-test": "74b6ba6a0b1be55677db505e8f037e4aa5cfa002dd18334daa7962e6d11f43ee",
+    "10-validator": "bb9a2206c10f0d6f5e824e44da2b2c0ed4e17660a2a7177e21db094164d5e5d9",
+    "11-devils-advocate": "09a8fcd856cb7507f42987433a4162f54067ce385d4a868511048857b9a504b5",
+    "12-counsel": "e401ba4031cea16ed35b3fdc99ceca5e2e885be3d9736f9af81c52397985bd99",
+    "k3-frontend": "1681662239a06cd7595728cc538831c0fba5d01fa6b9b084360292b1aeabdfda"
+  },
+  "authority_notes": [
+    "The accepted North Star bytes remain unchanged.",
+    "The earlier Items 2-8 draft is superseded only for this accepted Local Bootstrap v1 scope.",
+    "The existing M0 candidate remains evidence and is not the implementation base.",
+    "A local deterministic bootstrap does not prove production-grade confinement.",
+    "No specialist agent may modify code or a real or private repository until the confinement seam is independently proven."
+  ]
+}

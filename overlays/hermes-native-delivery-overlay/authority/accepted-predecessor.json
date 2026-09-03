@@ -1,0 +1,10 @@
+{
+  "schema": "hvd-accepted-predecessor/v1",
+  "decision": "ACCEPT_LOCAL_BOOTSTRAP_V1",
+  "spec_sha256": "095ced65676ee3c95f39c992f30b193437eda81acb327e6764c5c64c28388f1a",
+  "approval_receipt_sha256": "ffa8912d67189e6971488d39dcdcc26da52a2040c6020b1d9eb6d82eed65fb58",
+  "accepted_at": "2026-09-03T04:54:58Z",
+  "expires_at": "2026-09-17T04:54:58Z",
+  "authority": "LOCAL_BOOTSTRAP_V1_ONLY",
+  "live_effects": false
+}
