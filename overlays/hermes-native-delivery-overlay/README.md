@@ -9,7 +9,7 @@ This subtree implements the bounded Local Bootstrap v1 accepted for specificatio
 - Destination: `https://github.com/jasonwu-ai/hermes-agent.git`, branch `fleet/main`.
 - Exact integration parent: `772dae7a3db33b635be3d00c7e42feba4e17c7f4`, tree `dffea5701ca15422d8030bed1396a08157eb16c5`.
 - Repaired-source provenance: commit `5b60517c7e6a2e7df6b9eee1da0df60122fa9a4d`, tree `140bba967e392c3a793c10bd273d701fbe278686`.
-- Production modules and plugin registration are byte-identical to that repaired source; repository-specific provenance and CI are metadata around those bytes.
+- Production modules and plugin registration started from that repaired source. `controller.py` additionally converts inaccessible path components into a fail-closed contract rejection, covering unprivileged CI/runtime users.
 - The repository-level workflow `.github/workflows/hermes-verified-delivery.yml` qualifies this subtree against the exact target checkout and refuses an unexpected parent or out-of-scope path.
 
 ## Safety model

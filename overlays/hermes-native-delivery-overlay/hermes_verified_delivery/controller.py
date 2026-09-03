@@ -38,6 +38,10 @@ def _absolute_without_symlinks(path: Path, label: str) -> Path:
             mode = os.lstat(current).st_mode
         except FileNotFoundError:
             continue
+        except OSError as exc:
+            raise ContractError(
+                f"{label} cannot be inspected safely within qualification root confinement"
+            ) from exc
         if stat.S_ISLNK(mode):
             raise ContractError(f"{label} must not traverse a symlink")
     return raw

@@ -39,8 +39,8 @@ jobs:
         run: |
           set -euo pipefail
           expected_base=772dae7a3db33b635be3d00c7e42feba4e17c7f4
-          test "$(git show -s --format=%P HEAD | wc -w)" -eq 1
-          test "$(git rev-parse HEAD^)" = "$expected_base"
+          git merge-base --is-ancestor "$expected_base" HEAD
+          test -z "$(git rev-list --min-parents=2 "$expected_base..HEAD")"
           git diff --name-only "$expected_base" HEAD > "$RUNNER_TEMP/changed-paths.txt"
           test -s "$RUNNER_TEMP/changed-paths.txt"
           while IFS= read -r path; do

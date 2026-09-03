@@ -470,6 +470,22 @@ def test_live_board_path_is_rejected(qualification_root: Path) -> None:
         NativeKanbanAdapter(Path("/", "root", ".hermes", "kanban.db"), qualification_root)
 
 
+def test_uninspectable_path_component_fails_closed(
+    qualification_root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = os.lstat
+    denied = Path("/", "permission-denied")
+
+    def guarded(path):
+        if Path(path) == denied:
+            raise PermissionError("synthetic access denial")
+        return original(path)
+
+    monkeypatch.setattr(os, "lstat", guarded)
+    with pytest.raises(ContractError, match="cannot be inspected safely"):
+        NativeKanbanAdapter(denied / "board.db", qualification_root)
+
+
 def test_source_has_no_actuator_cron_network_or_second_store() -> None:
     production = sorted((ROOT / "hermes_verified_delivery").glob("*.py"))
     nonblank = sum(1 for p in production for line in p.read_text().splitlines() if line.strip())
