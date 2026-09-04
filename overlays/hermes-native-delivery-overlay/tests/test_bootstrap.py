@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import threading
 
 import pytest
 
@@ -485,6 +486,78 @@ def test_materialization_rejects_controller_lock_hardlink_before_mutation(
     assert outside.read_bytes() == before
     assert outside.stat().st_mode & 0o777 == before_mode
     assert not (qualification_root / "board.db").exists()
+
+
+def _qualification_decision(nonce: str) -> Decision:
+    return Decision.from_dict({
+        "schema": "hvd-decision/v1", "spec_id": "qualified-race", "revision": 1,
+        "spec_sha256": SPEC_SHA, "actor": AUTHORITY.actor, "action": "APPROVE",
+        "nonce": nonce, "replay_key": f"qualified:{nonce}",
+        "issued_at": "2026-09-03T04:54:58Z", "expires_at": "2026-09-17T04:54:58Z",
+        "allowed_actions": ["scratch"], "exclusions": ["live"], "feedback": None,
+    })
+
+
+def _qualification_graph(item: Decision) -> GraphSpec:
+    return GraphSpec.from_dict({
+        "schema": "hvd-inert-graph/v1", "run_id": f"run:{item.nonce}",
+        "approval_id": item.decision_id,
+        "tasks": [{"key": "planner", "title": "Plan", "assignee": "planner", "parents": []}],
+    })
+
+
+@pytest.mark.parametrize("database", ["authority.db", "board.db"])
+def test_primary_name_substitution_between_probe_and_descriptor_open_is_rejected(
+    qualification_root: Path, monkeypatch: pytest.MonkeyPatch, database: str,
+) -> None:
+    import hermes_verified_delivery.controller as ctl
+
+    target_path, attacker_path = qualification_root / database, qualification_root / f"attacker-{database}"
+    good, hostile = _qualification_decision(f"good-{database}"), _qualification_decision(f"hostile-{database}")
+    if database == "authority.db":
+        target, attacker = (
+            AuthorityStore(target_path, qualification_root=qualification_root),
+            AuthorityStore(attacker_path, qualification_root=qualification_root),
+        )
+        attacker.record_decision(hostile, graph=_qualification_graph(hostile))
+        operation = target.held_intents
+    else:
+        target, attacker = adapter(qualification_root), NativeKanbanAdapter(attacker_path, qualification_root)
+        target.materialize(_qualification_graph(good))
+        attacker.materialize(_qualification_graph(hostile))
+        operation = lambda: target.graph_counts(hostile.nonce)
+    real, state = ctl._owned_descriptor, {"opens": 0, "swapped": False}
+
+    def racing(path, label, flags, *, bound_to=None):
+        if Path(path) == target_path:
+            state["opens"] += 1
+            if state["opens"] == 2:
+                target_path.rename(qualification_root / f"original-{database}")
+                attacker_path.rename(target_path)
+                state["swapped"] = True
+        return real(path, label, flags, bound_to=bound_to)
+
+    monkeypatch.setattr(ctl, "_owned_descriptor", racing)
+    with pytest.raises(ContractError, match="replaced while bound"):
+        operation()
+    assert state["swapped"]
+
+
+def test_concurrent_qualified_authority_writes_are_serialized(qualification_root: Path) -> None:
+    path = qualification_root / "authority.db"
+    stores = [AuthorityStore(path, qualification_root=qualification_root) for _ in range(2)]
+    items = [_qualification_decision(f"concurrent-{index}") for index in range(2)]
+    start = threading.Barrier(2)
+
+    def write(pair):
+        store, item = pair
+        start.wait(timeout=10)
+        return store.record_decision(item, graph=_qualification_graph(item))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        returned = list(pool.map(write, zip(stores, items, strict=True)))
+    assert set(returned) == {item.decision_id for item in items}
+    assert stores[0].counts() == {"decisions": 2, "outbox": 2, "materializations": 0}
 
 
 def test_qualification_database_operations_are_memory_only_and_descriptor_persisted(

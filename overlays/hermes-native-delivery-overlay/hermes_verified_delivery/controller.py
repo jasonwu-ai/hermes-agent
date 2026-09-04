@@ -85,11 +85,11 @@ def _probe(path: Path, label: str, *, bound_to: int | None = None) -> None:
         os.close(descriptor)
 
 
-def _confined_database(path: Path, root: Path, label: str) -> Path:
+def _confined_database(path: Path, root: Path, label: str, *, bound_to: int | None = None) -> Path:
     candidate = _absolute_without_symlinks(path, label)
     if candidate.parent != root:
         raise ContractError(f"{label} must be a direct child of qualification root")
-    _probe(candidate, label)
+    _probe(candidate, label, bound_to=bound_to)
     for suffix in ("-wal", "-shm", "-journal"):
         sidecar = Path(f"{candidate}{suffix}")
         descriptor = _owned_descriptor(sidecar, f"{label} sidecars", os.O_RDONLY)
@@ -131,8 +131,11 @@ def _persist_image(path: Path, root: Path, label: str, payload: bytes) -> None:
 
 @contextmanager
 def _confined_image(path: Path, root: Path, label: str, *, write: bool = False) -> Iterator[sqlite3.Connection]:
-    path = _confined_database(path, root, label)
+    path = _absolute_without_symlinks(path, label)
+    if path.parent != root:
+        raise ContractError(f"{label} must be a direct child of qualification root")
     source = _owned_descriptor(path, label, os.O_RDONLY)
+    _confined_database(path, root, label, bound_to=source)
     conn = sqlite3.connect(":memory:", isolation_level=None)
     try:
         if source is not None and os.fstat(source).st_size:
@@ -165,14 +168,11 @@ class AuthorityStore:
         self.path = _confined_database(path, self.qualification_root, "authority DB") if self.qualification_root else Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection(write=True) as conn:
-            journal = "MEMORY" if self.qualification_root else "WAL"
             conn.executescript(f"""
-            PRAGMA journal_mode={journal};
-            CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY, replay_key TEXT NOT NULL UNIQUE,
-              digest TEXT NOT NULL, payload BLOB NOT NULL, action TEXT NOT NULL);
+            PRAGMA journal_mode={'MEMORY' if self.qualification_root else 'WAL'};
+            CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY, replay_key TEXT NOT NULL UNIQUE, digest TEXT NOT NULL, payload BLOB NOT NULL, action TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(key TEXT PRIMARY KEY, decision_id TEXT NOT NULL UNIQUE,
-              state TEXT NOT NULL CHECK(state='HELD'), payload BLOB NOT NULL,
-              FOREIGN KEY(decision_id) REFERENCES decisions(id));
+              state TEXT NOT NULL CHECK(state='HELD'), payload BLOB NOT NULL, FOREIGN KEY(decision_id) REFERENCES decisions(id));
             CREATE TABLE IF NOT EXISTS materializations(run_id TEXT PRIMARY KEY, graph_digest TEXT NOT NULL,
               mapping_digest TEXT NOT NULL, mapping_payload BLOB NOT NULL);
             """)
@@ -182,7 +182,7 @@ class AuthorityStore:
     @contextmanager
     def _connection(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
         if self.qualification_root:
-            with _confined_image(self.path, self.qualification_root, "authority DB", write=write) as conn:
+            with _exclusive(self.qualification_root / ".hvd-controller.lock"), _confined_image(self.path, self.qualification_root, "authority DB", write=write) as conn:
                 conn.execute("PRAGMA foreign_keys=ON")
                 yield conn
         else:
