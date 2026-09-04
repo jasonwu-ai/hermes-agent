@@ -487,72 +487,72 @@ def test_materialization_rejects_controller_lock_hardlink_before_mutation(
     assert not (qualification_root / "board.db").exists()
 
 
-def _external_sqlite(path: Path) -> tuple[bytes, int]:
-    conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE sentinel(value TEXT)")
-    conn.execute("INSERT INTO sentinel VALUES ('before')")
-    conn.commit()
-    conn.close()
-    os.chmod(path, 0o640)
-    return path.read_bytes(), path.stat().st_mode & 0o777
-
-
-def _swap_on_open(monkeypatch: pytest.MonkeyPatch, target: Path, outside: Path) -> dict[str, bool]:
-    """Relink ``target`` to ``outside`` at the exact moment SQLite is asked to open it."""
+def test_qualification_database_operations_are_memory_only_and_descriptor_persisted(
+    qualification_root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import hermes_verified_delivery.controller as ctl
 
-    real_connect, state = ctl.sqlite3.connect, {"swapped": False}
+    real_connect, opened = ctl.sqlite3.connect, []
 
-    def racing_connect(database, *args, **kwargs):
-        if Path(database) == target and not state["swapped"]:
-            target.unlink(missing_ok=True)
-            os.link(outside, target)
-            state["swapped"] = True
+    def guarded_connect(database, *args, **kwargs):
+        opened.append(str(database))
+        assert database == ":memory:"
         return real_connect(database, *args, **kwargs)
 
-    monkeypatch.setattr(ctl.sqlite3, "connect", racing_connect)
-    return state
+    def forbidden_chmod(*_args, **_kwargs):
+        raise AssertionError("qualification persistence must set mode through its descriptor")
 
-
-# Either message is a valid pre-mutation rejection: a relink leaves two names on the
-# outside inode (hard-link check), a rename-over leaves one (bound-identity check).
-SWAP_REJECTED = "hard link or inode alias|replaced while bound"
-
-
-def test_authority_open_rejects_inode_swap_before_any_write(
-    qualification_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    outside = tmp_path / "outside-authority.db"
-    before, before_mode = _external_sqlite(outside)
-    state = _swap_on_open(monkeypatch, qualification_root / "authority.db", outside)
-    with pytest.raises(ContractError, match=SWAP_REJECTED):
-        AuthorityStore(qualification_root / "authority.db", qualification_root=qualification_root)
-    assert state["swapped"]
-    assert outside.read_bytes() == before
-    assert outside.stat().st_mode & 0o777 == before_mode
-
-
-def test_board_open_rejects_inode_swap_before_any_write(
-    qualification_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    outside = tmp_path / "outside-board.db"
-    before, before_mode = _external_sqlite(outside)
+    monkeypatch.setattr(ctl.sqlite3, "connect", guarded_connect)
+    monkeypatch.setattr(ctl.os, "chmod", forbidden_chmod)
+    store = AuthorityStore(qualification_root / "authority.db", qualification_root=qualification_root)
     target = adapter(qualification_root)
     graph = GraphSpec.from_dict({
-        "schema": "hvd-inert-graph/v1", "run_id": "run:board-swap", "approval_id": "dec_board_swap",
+        "schema": "hvd-inert-graph/v1", "run_id": "run:memory-only", "approval_id": "dec_memory_only",
         "tasks": [{"key": "planner", "title": "Plan", "assignee": "planner", "parents": []}],
     })
-    state = _swap_on_open(monkeypatch, target.board_db, outside)
-    with pytest.raises(ContractError, match=SWAP_REJECTED):
-        target.materialize(graph)
-    assert state["swapped"]
+    target.materialize(graph)
+    assert store.counts() == {"decisions": 0, "outbox": 0, "materializations": 0}
+    assert target.graph_counts(graph.run_id) == {"tasks": 1, "links": 0}
+    assert opened and set(opened) == {":memory:"}
+    for name in ("authority.db", "board.db"):
+        assert (qualification_root / name).stat().st_mode & 0o777 == 0o600
+        assert not any((qualification_root / f"{name}{suffix}").exists() for suffix in ("-wal", "-shm", "-journal"))
+
+
+@pytest.mark.parametrize("database", ["authority.db", "board.db"])
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_late_auxiliary_name_substitution_is_rejected_without_outside_change(
+    qualification_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    database: str, suffix: str,
+) -> None:
+    import hermes_verified_delivery.controller as ctl
+
+    outside = tmp_path / f"outside-{database}{suffix}"
+    outside.write_bytes(b"external sidecar sentinel\n")
+    os.chmod(outside, 0o640)
+    before, before_mode = outside.read_bytes(), outside.stat().st_mode & 0o777
+    real_replace, state = ctl.os.replace, {"injected": False}
+
+    def racing_replace(source, destination, *args, **kwargs):
+        if Path(destination) == qualification_root / database and not state["injected"]:
+            os.link(outside, qualification_root / f"{database}{suffix}")
+            state["injected"] = True
+        return real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(ctl.os, "replace", racing_replace)
+    with pytest.raises(ContractError, match="sidecars"):
+        if database == "authority.db":
+            AuthorityStore(qualification_root / database, qualification_root=qualification_root)
+        else:
+            target = adapter(qualification_root)
+            graph = GraphSpec.from_dict({
+                "schema": "hvd-inert-graph/v1", "run_id": f"run:{suffix}", "approval_id": f"dec_{suffix}",
+                "tasks": [{"key": "planner", "title": "Plan", "assignee": "planner", "parents": []}],
+            })
+            target.materialize(graph)
+    assert state["injected"]
     assert outside.read_bytes() == before
     assert outside.stat().st_mode & 0o777 == before_mode
-    conn = sqlite3.connect(outside)
-    try:
-        assert [r[0] for r in conn.execute("SELECT name FROM sqlite_master")] == ["sentinel"]
-    finally:
-        conn.close()
 
 
 def test_board_opens_never_delegate_to_pathname_initialisation(qualification_root: Path, monkeypatch) -> None:
