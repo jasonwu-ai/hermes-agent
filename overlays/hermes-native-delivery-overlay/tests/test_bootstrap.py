@@ -487,6 +487,92 @@ def test_materialization_rejects_controller_lock_hardlink_before_mutation(
     assert not (qualification_root / "board.db").exists()
 
 
+def _external_sqlite(path: Path) -> tuple[bytes, int]:
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE sentinel(value TEXT)")
+    conn.execute("INSERT INTO sentinel VALUES ('before')")
+    conn.commit()
+    conn.close()
+    os.chmod(path, 0o640)
+    return path.read_bytes(), path.stat().st_mode & 0o777
+
+
+def _swap_on_open(monkeypatch: pytest.MonkeyPatch, target: Path, outside: Path) -> dict[str, bool]:
+    """Relink ``target`` to ``outside`` at the exact moment SQLite is asked to open it."""
+    import hermes_verified_delivery.controller as ctl
+
+    real_connect, state = ctl.sqlite3.connect, {"swapped": False}
+
+    def racing_connect(database, *args, **kwargs):
+        if Path(database) == target and not state["swapped"]:
+            target.unlink(missing_ok=True)
+            os.link(outside, target)
+            state["swapped"] = True
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(ctl.sqlite3, "connect", racing_connect)
+    return state
+
+
+# Either message is a valid pre-mutation rejection: a relink leaves two names on the
+# outside inode (hard-link check), a rename-over leaves one (bound-identity check).
+SWAP_REJECTED = "hard link or inode alias|replaced while bound"
+
+
+def test_authority_open_rejects_inode_swap_before_any_write(
+    qualification_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside-authority.db"
+    before, before_mode = _external_sqlite(outside)
+    state = _swap_on_open(monkeypatch, qualification_root / "authority.db", outside)
+    with pytest.raises(ContractError, match=SWAP_REJECTED):
+        AuthorityStore(qualification_root / "authority.db", qualification_root=qualification_root)
+    assert state["swapped"]
+    assert outside.read_bytes() == before
+    assert outside.stat().st_mode & 0o777 == before_mode
+
+
+def test_board_open_rejects_inode_swap_before_any_write(
+    qualification_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside = tmp_path / "outside-board.db"
+    before, before_mode = _external_sqlite(outside)
+    target = adapter(qualification_root)
+    graph = GraphSpec.from_dict({
+        "schema": "hvd-inert-graph/v1", "run_id": "run:board-swap", "approval_id": "dec_board_swap",
+        "tasks": [{"key": "planner", "title": "Plan", "assignee": "planner", "parents": []}],
+    })
+    state = _swap_on_open(monkeypatch, target.board_db, outside)
+    with pytest.raises(ContractError, match=SWAP_REJECTED):
+        target.materialize(graph)
+    assert state["swapped"]
+    assert outside.read_bytes() == before
+    assert outside.stat().st_mode & 0o777 == before_mode
+    conn = sqlite3.connect(outside)
+    try:
+        assert [r[0] for r in conn.execute("SELECT name FROM sqlite_master")] == ["sentinel"]
+    finally:
+        conn.close()
+
+
+def test_board_opens_never_delegate_to_pathname_initialisation(qualification_root: Path, monkeypatch) -> None:
+    from hermes_cli import kanban_db as kb
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("board must be opened on the verified inode, not re-resolved by pathname")
+
+    monkeypatch.setattr(kb, "init_db", forbidden)
+    monkeypatch.setattr(kb, "connect", forbidden)
+    target = adapter(qualification_root)
+    graph = GraphSpec.from_dict({
+        "schema": "hvd-inert-graph/v1", "run_id": "run:bound-only", "approval_id": "dec_bound_only",
+        "tasks": [{"key": "planner", "title": "Plan", "assignee": "planner", "parents": []}],
+    })
+    mapping = target.materialize(graph)
+    assert target.graph_counts(graph.run_id) == {"tasks": 1, "links": 0}
+    target.verify_recorded_mapping(graph, mapping)
+
+
 def test_review_html_is_commonmark_safe_responsive_and_truthful() -> None:
     html = render_review(
         "# Spec\n\n<script>alert(1)</script>\n\n![tracking](https://example.invalid/pixel.png)\n\n**Bounded.**",

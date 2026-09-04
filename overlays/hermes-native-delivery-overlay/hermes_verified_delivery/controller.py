@@ -57,7 +57,7 @@ def _qualification_root(path: Path) -> Path:
     return root
 
 
-def _owned_descriptor(path: Path, label: str, flags: int) -> int | None:
+def _owned_descriptor(path: Path, label: str, flags: int, *, bound_to: int | None = None) -> int | None:
     if not hasattr(os, "O_NOFOLLOW"):
         raise ContractError(f"{label} cannot be inspected safely without no-follow support")
     try:
@@ -68,26 +68,57 @@ def _owned_descriptor(path: Path, label: str, flags: int) -> int | None:
         raise ContractError(f"{label} cannot be inspected safely without following aliases") from exc
     try:
         entry, opened = os.lstat(path), os.fstat(descriptor)
-        identity = (entry.st_dev, entry.st_ino) == (opened.st_dev, opened.st_ino)
-        if not identity or not stat.S_ISREG(entry.st_mode) or not stat.S_ISREG(opened.st_mode):
+        aliased = (entry.st_dev, entry.st_ino) != (opened.st_dev, opened.st_ino)
+        if aliased or not stat.S_ISREG(entry.st_mode) or not stat.S_ISREG(opened.st_mode):
             raise ContractError(f"{label} must be one stable regular file")
         if entry.st_nlink != 1 or opened.st_nlink != 1:
             raise ContractError(f"{label} must not be a hard link or inode alias")
+        if bound_to is not None and not os.path.sameopenfile(bound_to, descriptor):
+            raise ContractError(f"{label} was replaced while bound")
     except Exception:
         os.close(descriptor)
         raise
     return descriptor
 
 
-def _confined_database(path: Path, root: Path, label: str) -> Path:
+def _probe(path: Path, label: str, *, bound_to: int | None = None) -> None:
+    descriptor = _owned_descriptor(path, label, os.O_RDONLY, bound_to=bound_to)
+    if descriptor is not None:
+        os.close(descriptor)
+
+
+def _confined_database(path: Path, root: Path, label: str, *, bound_to: int | None = None) -> Path:
     candidate = _absolute_without_symlinks(path, label)
     if candidate.parent != root:
         raise ContractError(f"{label} must be a direct child of qualification root")
-    for item in (candidate, Path(f"{candidate}-wal"), Path(f"{candidate}-shm")):
-        descriptor = _owned_descriptor(item, f"{label} and sidecars", os.O_RDONLY)
-        if descriptor is not None:
-            os.close(descriptor)
+    _probe(candidate, f"{label} and sidecars", bound_to=bound_to)
+    _probe(Path(f"{candidate}-wal"), f"{label} and sidecars")
+    _probe(Path(f"{candidate}-shm"), f"{label} and sidecars")
     return candidate
+
+
+def _created_descriptor(path: Path, label: str) -> int:
+    descriptor = _owned_descriptor(path, label, os.O_CREAT | os.O_RDWR)
+    if descriptor is None:
+        raise ContractError(f"{label} could not be created")
+    return descriptor
+
+
+def _bound_sqlite(path: Path, root: Path, label: str) -> sqlite3.Connection:
+    """Open SQLite while holding the verified inode, so the pathname cannot be swapped underneath."""
+    held = _created_descriptor(_confined_database(path, root, label), label)
+    try:
+        _confined_database(path, root, label, bound_to=held)
+        conn = sqlite3.connect(path, timeout=30, isolation_level=None)
+        try:
+            _confined_database(path, root, label, bound_to=held)
+        except Exception:
+            conn.close()
+            raise
+    finally:
+        os.close(held)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def qualification_paths(authority_db: Path, board_db: Path, root: Path) -> tuple[Path, Path, Path]:
@@ -96,10 +127,7 @@ def qualification_paths(authority_db: Path, board_db: Path, root: Path) -> tuple
     board_db = _confined_database(board_db, root, "board DB")
     if authority_db == board_db:
         raise ContractError("authority DB and board DB must be distinct")
-    lock_path = _absolute_without_symlinks(root / ".hvd-controller.lock", "controller lock")
-    descriptor = _owned_descriptor(lock_path, "controller lock", os.O_RDONLY)
-    if descriptor is not None:
-        os.close(descriptor)
+    _probe(_absolute_without_symlinks(root / ".hvd-controller.lock", "controller lock"), "controller lock")
     return root, authority_db, board_db
 
 
@@ -108,40 +136,43 @@ class AuthorityStore:
 
     def __init__(self, path: Path, *, qualification_root: Path | None = None):
         self.qualification_root = _qualification_root(qualification_root) if qualification_root else None
-        self.path = (
-            _confined_database(path, self.qualification_root, "authority DB")
-            if self.qualification_root else Path(path)
-        )
+        self.path = _confined_database(path, self.qualification_root, "authority DB") if self.qualification_root else Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn:
             conn.executescript("""
             PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS decisions(
-              id TEXT PRIMARY KEY, replay_key TEXT NOT NULL UNIQUE,
-              digest TEXT NOT NULL, payload BLOB NOT NULL, action TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS outbox(
-              key TEXT PRIMARY KEY, decision_id TEXT NOT NULL UNIQUE,
+            CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY, replay_key TEXT NOT NULL UNIQUE,
+              digest TEXT NOT NULL, payload BLOB NOT NULL, action TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS outbox(key TEXT PRIMARY KEY, decision_id TEXT NOT NULL UNIQUE,
               state TEXT NOT NULL CHECK(state='HELD'), payload BLOB NOT NULL,
-              FOREIGN KEY(decision_id) REFERENCES decisions(id)
-            );
-            CREATE TABLE IF NOT EXISTS materializations(
-              run_id TEXT PRIMARY KEY, graph_digest TEXT NOT NULL,
-              mapping_digest TEXT NOT NULL, mapping_payload BLOB NOT NULL
-            );
+              FOREIGN KEY(decision_id) REFERENCES decisions(id));
+            CREATE TABLE IF NOT EXISTS materializations(run_id TEXT PRIMARY KEY, graph_digest TEXT NOT NULL,
+              mapping_digest TEXT NOT NULL, mapping_payload BLOB NOT NULL);
             """)
-        if self.qualification_root:
-            _confined_database(self.path, self.qualification_root, "authority DB")
         os.chmod(self.path, 0o600)
 
     def _connect(self) -> sqlite3.Connection:
         if self.qualification_root:
-            _confined_database(self.path, self.qualification_root, "authority DB")
-        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        conn.row_factory = sqlite3.Row
+            conn = _bound_sqlite(self.path, self.qualification_root, "authority DB")
+        else:
+            conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+            conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
+
+    @contextmanager
+    def _write(self) -> Iterator[sqlite3.Connection]:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def record_decision(self, decision: Decision, *, graph: GraphSpec | None = None,
                         failpoint: str | None = None) -> str:
@@ -152,9 +183,7 @@ class AuthorityStore:
             raise ContractError("only APPROVE may carry a graph intent")
         payload = canonical_bytes(decision.to_dict())
         outbox_payload = canonical_bytes(graph.to_dict()) if graph else None
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._write() as conn:
             existing = conn.execute(
                 "SELECT id,digest FROM decisions WHERE replay_key=?", (decision.replay_key,)
             ).fetchone()
@@ -165,7 +194,6 @@ class AuthorityStore:
                     row = conn.execute("SELECT payload FROM outbox WHERE decision_id=?", (decision.decision_id,)).fetchone()
                     if row is None or bytes(row["payload"]) != outbox_payload:
                         raise ReplayConflict("decision replay carries different projection bytes")
-                conn.commit()
                 return decision.decision_id
             conn.execute(
                 "INSERT INTO decisions(id,replay_key,digest,payload,action) VALUES(?,?,?,?,?)",
@@ -180,13 +208,7 @@ class AuthorityStore:
                 )
             if failpoint == "after_outbox":
                 raise InjectedCrash(failpoint)
-            conn.commit()
-            return decision.decision_id
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        return decision.decision_id
 
     def held_intents(self) -> tuple[tuple[Decision, GraphSpec], ...]:
         with closing(self._connect()) as conn:
@@ -223,9 +245,7 @@ class AuthorityStore:
     def record_materialization(self, graph: GraphSpec, mapping: dict[str, str]) -> None:
         body = canonical_bytes(mapping)
         digest = sha256_hex(body)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._write() as conn:
             row = conn.execute(
                 "SELECT graph_digest,mapping_digest FROM materializations WHERE run_id=?", (graph.run_id,)
             ).fetchone()
@@ -237,12 +257,6 @@ class AuthorityStore:
                     "INSERT INTO materializations(run_id,graph_digest,mapping_digest,mapping_payload) VALUES(?,?,?,?)",
                     (graph.run_id, graph.digest, digest, body),
                 )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     def counts(self) -> dict[str, int]:
         with closing(self._connect()) as conn:
@@ -267,10 +281,7 @@ def _exclusive(path: Path) -> Iterator[None]:
         local = _LOCAL_LOCKS.setdefault(str(path), threading.Lock())
     with local:
         path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = _owned_descriptor(path, "controller lock", os.O_CREAT | os.O_RDWR)
-        if descriptor is None:
-            raise ContractError("controller lock could not be created")
-        with os.fdopen(descriptor, "a+b") as handle:
+        with os.fdopen(_created_descriptor(path, "controller lock"), "a+b") as handle:
             fcntl.flock(handle, fcntl.LOCK_EX)
             try:
                 yield
@@ -332,71 +343,66 @@ class NativeKanbanAdapter:
         if mismatched:
             raise MaterializationConflict(f"contract mismatch for {key}: {sorted(set(mismatched))}")
 
+    def _board(self) -> sqlite3.Connection:
+        """Open the board on the verified inode, then apply the native schema to it."""
+        from hermes_cli import kanban_db as kb
+        conn = _bound_sqlite(self.board_db, self.root, "board DB")
+        try:
+            conn.executescript(f"PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;{kb.SCHEMA_SQL}")
+            kb._migrate_add_optional_columns(conn)
+        except Exception:
+            conn.close()
+            raise
+        return conn
+
     def verify_recorded_mapping(self, graph: GraphSpec, mapping: dict[str, str]) -> None:
         from hermes_cli import kanban_db as kb
-        expected_keys = {task.key for task in graph.tasks}
-        if set(mapping) != expected_keys:
+        if set(mapping) != {task.key for task in graph.tasks}:
             raise MaterializationConflict("recorded mapping keys do not match graph")
-        with closing(kb.connect(self.board_db)) as conn:
+        with closing(self._board()) as conn:
             for task in graph.topological_tasks():
                 key = f"hvd:{graph.run_id}:{task.key}"
                 row = conn.execute("SELECT * FROM tasks WHERE id=?", (mapping[task.key],)).fetchone()
                 if row is None:
                     raise MaterializationConflict(f"recorded task missing for {key}")
                 self._assert_task_contract(kb, row, graph, task, key, allow_archived=True)
-                parents = {mapping[parent] for parent in task.parents}
-                if set(kb.parent_ids(conn, row["id"])) != parents:
+                if set(kb.parent_ids(conn, row["id"])) != {mapping[parent] for parent in task.parents}:
                     raise MaterializationConflict(f"parent mismatch for {key}")
 
     def materialize(self, graph: GraphSpec, *, failpoint: str | None = None) -> dict[str, str]:
         from hermes_cli import kanban_db as kb
-        _confined_database(self.board_db, self.root, "board DB")
-        with _exclusive(self.lock_path):
-            _confined_database(self.board_db, self.root, "board DB")
-            kb.init_db(self.board_db)
-            mapping: dict[str, str] = {}
-            with closing(kb.connect(self.board_db)) as conn:
-                with kb.write_txn(conn):
-                    for index, task in enumerate(graph.topological_tasks()):
-                        key = f"hvd:{graph.run_id}:{task.key}"
-                        rows = conn.execute(
-                            "SELECT * FROM tasks WHERE idempotency_key=? ORDER BY id", (key,)
-                        ).fetchall()
-                        if len(rows) > 1:
-                            raise MaterializationConflict(f"duplicate semantic key {key}")
-                        parents = [mapping[p] for p in task.parents]
-                        body = self._task_body(graph, task)
-                        if rows:
-                            row = rows[0]
-                            self._assert_task_contract(kb, row, graph, task, key)
-                            task_id = row["id"]
-                        else:
-                            task_id = kb.create_task(
-                                conn, title=task.title, body=body, assignee=task.assignee,
-                                created_by="hermes-verified-delivery", workspace_kind="scratch",
-                                parents=parents, idempotency_key=key, initial_status="blocked",
-                                goal_mode=False, require_role_contract=False,
-                                expected_role_contract_sha256=None, project_id="",
-                            )
-                        mapping[task.key] = task_id
-                        actual_parents = set(kb.parent_ids(conn, task_id))
-                        if actual_parents != set(parents):
-                            raise MaterializationConflict(f"parent mismatch for {key}")
-                        if failpoint == f"after_task_{index}":
-                            raise InjectedCrash(failpoint)
-                return dict(sorted(mapping.items()))
+        mapping: dict[str, str] = {}
+        with _exclusive(self.lock_path), closing(self._board()) as conn, kb.write_txn(conn):
+            for index, task in enumerate(graph.topological_tasks()):
+                key = f"hvd:{graph.run_id}:{task.key}"
+                rows = conn.execute("SELECT * FROM tasks WHERE idempotency_key=? ORDER BY id", (key,)).fetchall()
+                if len(rows) > 1:
+                    raise MaterializationConflict(f"duplicate semantic key {key}")
+                parents = [mapping[p] for p in task.parents]
+                if rows:
+                    self._assert_task_contract(kb, rows[0], graph, task, key)
+                    task_id = rows[0]["id"]
+                else:
+                    task_id = kb.create_task(
+                        conn, title=task.title, body=self._task_body(graph, task), assignee=task.assignee,
+                        created_by="hermes-verified-delivery", workspace_kind="scratch",
+                        parents=parents, idempotency_key=key, initial_status="blocked",
+                        goal_mode=False, require_role_contract=False,
+                        expected_role_contract_sha256=None, project_id="",
+                    )
+                mapping[task.key] = task_id
+                if set(kb.parent_ids(conn, task_id)) != set(parents):
+                    raise MaterializationConflict(f"parent mismatch for {key}")
+                if failpoint == f"after_task_{index}":
+                    raise InjectedCrash(failpoint)
+            return dict(sorted(mapping.items()))
 
     def graph_counts(self, run_id: str) -> dict[str, int]:
-        from hermes_cli import kanban_db as kb
-        with closing(kb.connect(self.board_db)) as conn:
-            tasks = conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ? AND status!='archived'", (f"hvd:{run_id}:%",)
-            ).fetchone()[0]
-            links = conn.execute(
-                "SELECT COUNT(*) FROM task_links WHERE parent_id IN (SELECT id FROM tasks WHERE idempotency_key LIKE ?)",
-                (f"hvd:{run_id}:%",),
-            ).fetchone()[0]
-            return {"tasks": tasks, "links": links}
+        prefix = (f"hvd:{run_id}:%",)
+        with closing(self._board()) as conn:
+            tasks = "SELECT COUNT(*) FROM tasks WHERE idempotency_key LIKE ? AND status!='archived'"
+            links = "SELECT COUNT(*) FROM task_links WHERE parent_id IN (SELECT id FROM tasks WHERE idempotency_key LIKE ?)"
+            return {"tasks": conn.execute(tasks, prefix).fetchone()[0], "links": conn.execute(links, prefix).fetchone()[0]}
 
 
 class Controller:
