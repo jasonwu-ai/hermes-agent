@@ -1,0 +1,12 @@
+repository=https://github.com/NousResearch/hermes-agent.git
+package_version=0.21.0
+commit=4dac5f28af54001b899c9b6fc8ba81cb58da2f0e
+tree=c56219b510aa8a37a0023a682cc0392e5bc8bba6
+observed_at=2026-09-03T04:54:58Z
+source=git-ls-remote-refs-heads-main
+integration_repository=https://github.com/jasonwu-ai/hermes-agent.git
+integration_base_branch=fleet/main
+integration_base_commit=772dae7a3db33b635be3d00c7e42feba4e17c7f4
+integration_base_tree=dffea5701ca15422d8030bed1396a08157eb16c5
+source_repair_commit=5b60517c7e6a2e7df6b9eee1da0df60122fa9a4d
+source_repair_tree=140bba967e392c3a793c10bd273d701fbe278686

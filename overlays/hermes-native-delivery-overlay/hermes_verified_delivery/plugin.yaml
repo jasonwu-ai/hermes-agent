@@ -1,0 +1,14 @@
+manifest_version: 2
+api_version: 2
+name: hermes-verified-delivery
+version: 0.1.0
+description: Qualification-only two-gate delivery controller
+kind: standalone
+platforms:
+  - linux
+  - macos
+provides_hooks:
+  - kanban_task_completed
+  - kanban_task_blocked
+  - on_kanban_task_updated
+  - on_kanban_dispatch_tick

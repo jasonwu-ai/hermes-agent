@@ -1,0 +1,98 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out overlay
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pinned qualification dependencies
+        run: >-
+          python -m pip install
+          pytest==9.1.1
+          ruff==0.15.22
+          markdown-it-py==4.2.0
+          PyYAML==6.0.2
+
+      - name: Fetch pinned official Hermes 0.21.0 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream="$RUNNER_TEMP/hermes-upstream"
+          git init -q "$upstream"
+          git -C "$upstream" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$upstream" fetch -q --depth=1 origin 4dac5f28af54001b899c9b6fc8ba81cb58da2f0e
+          git -C "$upstream" checkout -q --detach FETCH_HEAD
+          test "$(git -C "$upstream" rev-parse HEAD)" = "4dac5f28af54001b899c9b6fc8ba81cb58da2f0e"
+          test "$(git -C "$upstream" rev-parse 'HEAD^{tree}')" = "c56219b510aa8a37a0023a682cc0392e5bc8bba6"
+          UPSTREAM="$upstream" python - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+
+          upstream = Path(os.environ["UPSTREAM"])
+          with (upstream / "pyproject.toml").open("rb") as handle:
+              assert tomllib.load(handle)["project"]["version"] == "0.21.0"
+          PY
+          printf 'HVD_UPSTREAM=%s\n' "$upstream" >> "$GITHUB_ENV"
+
+      - name: Verify pinned identity file
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fx 'repository=https://github.com/NousResearch/hermes-agent.git' UPSTREAM_PIN
+          grep -Fx 'package_version=0.21.0' UPSTREAM_PIN
+          grep -Fx 'commit=4dac5f28af54001b899c9b6fc8ba81cb58da2f0e' UPSTREAM_PIN
+          grep -Fx 'tree=c56219b510aa8a37a0023a682cc0392e5bc8bba6' UPSTREAM_PIN
+
+      - name: Ruff
+        run: python -m ruff check hermes_verified_delivery tests
+
+      - name: Compile source without bytecode writes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          paths = sorted(Path("hermes_verified_delivery").glob("*.py")) + sorted(Path("tests").glob("*.py"))
+          for path in paths:
+              compile(path.read_text(), str(path), "exec")
+          print(f"compiled={len(paths)}")
+          PY
+
+      - name: Candidate tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest -p no:cacheprovider -o 'addopts=' -q --disable-warnings tests
+
+      - name: Official Hermes 0.21.0 lifecycle-hook tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        shell: bash
+        run: |
+          PYTHONPATH="$GITHUB_WORKSPACE:$HVD_UPSTREAM" \
+            python -m pytest -p no:cacheprovider -o 'addopts=' -q --disable-warnings \
+            "$HVD_UPSTREAM/tests/hermes_cli/test_kanban_lifecycle_hooks.py" \
+            "$HVD_UPSTREAM/tests/hermes_cli/test_kanban_task_updated_hook.py"

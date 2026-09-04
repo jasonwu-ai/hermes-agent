@@ -1,0 +1,95 @@
+name: Hermes verified delivery overlay
+
+on:
+  pull_request:
+    branches:
+      - fleet/main
+    paths:
+      - overlays/hermes-native-delivery-overlay/**
+      - .github/workflows/hermes-verified-delivery.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hvd-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the exact review head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Verify target-based topology and bounded paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_base=772dae7a3db33b635be3d00c7e42feba4e17c7f4
+          git merge-base --is-ancestor "$expected_base" HEAD
+          test -z "$(git rev-list --min-parents=2 "$expected_base..HEAD")"
+          git diff --name-only "$expected_base" HEAD > "$RUNNER_TEMP/changed-paths.txt"
+          test -s "$RUNNER_TEMP/changed-paths.txt"
+          while IFS= read -r path; do
+            case "$path" in
+              overlays/hermes-native-delivery-overlay/*|.github/workflows/hermes-verified-delivery.yml|contributors/emails/cos@local.invalid) ;;
+              *) printf 'out-of-scope path: %s\n' "$path" >&2; exit 1 ;;
+            esac
+          done < "$RUNNER_TEMP/changed-paths.txt"
+
+      - name: Install pinned qualification dependencies
+        run: >-
+          python -m pip install
+          pytest==9.1.1
+          ruff==0.15.22
+          markdown-it-py==4.2.0
+          PyYAML==6.0.2
+
+      - name: Ruff
+        working-directory: overlays/hermes-native-delivery-overlay
+        run: python -m ruff check hermes_verified_delivery tests
+
+      - name: Compile source without bytecode writes
+        working-directory: overlays/hermes-native-delivery-overlay
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          paths = sorted(Path("hermes_verified_delivery").glob("*.py")) + sorted(Path("tests").glob("*.py"))
+          for path in paths:
+              compile(path.read_text(), str(path), "exec")
+          print(f"compiled={len(paths)}")
+          PY
+
+      - name: Candidate tests against target repository
+        working-directory: overlays/hermes-native-delivery-overlay
+        env:
+          HVD_UPSTREAM: ${{ github.workspace }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest -p no:cacheprovider -o 'addopts=' -q --disable-warnings tests
+
+      - name: Target Hermes lifecycle-hook tests
+        working-directory: overlays/hermes-native-delivery-overlay
+        env:
+          HVD_UPSTREAM: ${{ github.workspace }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        shell: bash
+        run: |
+          PYTHONPATH="$PWD:$HVD_UPSTREAM" \
+            python -m pytest -p no:cacheprovider -o 'addopts=' -q --disable-warnings \
+            "$HVD_UPSTREAM/tests/hermes_cli/test_kanban_lifecycle_hooks.py" \
+            "$HVD_UPSTREAM/tests/hermes_cli/test_kanban_task_updated_hook.py"
